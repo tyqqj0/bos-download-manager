@@ -226,10 +226,29 @@ function app() {
                 if (gb > 0) return `${gb.toFixed(1)}G`;
                 return '0';
             };
-            if (t.status === 'done') return t.downloaded_gb > 0 ? fmt(t.downloaded_gb) : (t.size_gb > 0 ? fmt(t.size_gb) : '-');
-            if (t.size_gb > 0) return `${fmt(t.downloaded_gb || 0)}/${fmt(t.size_gb)}`;
-            if (t.downloaded_gb > 0) return `${fmt(t.downloaded_gb)}/?`;
+            const dl = t.downloaded_gb || 0;
+            const total = t.size_gb || 0;
+            if (t.status === 'done') {
+                if (dl > 0) return fmt(dl);
+                if (total > 0) return fmt(total);
+                return 'done';
+            }
+            if (dl > 0 && total > 0) {
+                if (dl > total) return fmt(dl);
+                return `${fmt(dl)}/${fmt(total)}`;
+            }
+            if (dl > 0) return `${fmt(dl)}/?`;
+            if (total > 0) return `0/${fmt(total)}`;
             return '-';
+        },
+
+        taskProgress(t) {
+            if (t.status === 'done') return 100;
+            const dl = t.downloaded_gb || 0;
+            const total = t.size_gb || 0;
+            if (total <= 0) return 0;
+            if (dl >= total) return 100;
+            return Math.round((dl / total) * 100);
         },
 
         extractRepo(cmdLine) {
@@ -240,6 +259,17 @@ function app() {
                 }
             }
             return cmdLine.slice(0, 40);
+        },
+
+        getSpeed(serverKey) {
+            return (this.dashboard.speeds || {})[serverKey] || 0;
+        },
+
+        formatSpeed(mbps) {
+            if (mbps <= 0) return '';
+            if (mbps >= 1024) return `${(mbps/1024).toFixed(1)} GB/s`;
+            if (mbps >= 1) return `${mbps.toFixed(1)} MB/s`;
+            return `${(mbps*1024).toFixed(0)} KB/s`;
         },
 
         timeAgo(isoStr) {

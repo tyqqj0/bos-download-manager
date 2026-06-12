@@ -95,9 +95,10 @@
                         <div class="flex items-center gap-2 mb-1">
                             <span class="w-2 h-2 rounded-full" :class="srv.worker_alive ? 'bg-green-400' : 'bg-red-400'"></span>
                             <span class="font-medium text-sm" x-text="key"></span>
+                            <span class="text-xs text-cyan-400 ml-auto" x-show="getSpeed(key) > 0" x-text="formatSpeed(getSpeed(key))"></span>
                         </div>
-                        <div class="text-xs text-gray-400 truncate" x-text="srv.current_task ? extractRepo(srv.current_task) : 'idle'"></div>
-                        <div class="text-xs text-gray-500" x-text="`queue: ${srv.queue_depth}`"></div>
+                        <div class="text-xs text-gray-400 truncate" x-text="srv.current_task ? extractRepo(srv.current_task) : (srv.active_tasks?.length ? 'working...' : 'idle')"></div>
+                        <div class="text-xs text-gray-500" x-text="`${srv.active_tasks?.length || 0} tasks`"></div>
                     </div>
                 </template>
             </div>
@@ -177,9 +178,10 @@
                                 <td class="px-4 py-2 text-gray-400" x-text="t.server || '-'"></td>
                                 <td class="px-4 py-2">
                                     <div class="flex items-center gap-2">
-                                        <div class="w-20 bg-gray-700 rounded-full h-2" x-show="t.size_gb > 0">
-                                            <div class="bg-blue-500 h-2 rounded-full progress-bar"
-                                                 :style="`width: ${Math.min(100, (t.downloaded_gb / t.size_gb) * 100)}%`"></div>
+                                        <div class="w-20 bg-gray-700 rounded-full h-2">
+                                            <div class="h-2 rounded-full progress-bar"
+                                                 :class="t.status === 'done' ? 'bg-green-500' : 'bg-blue-500'"
+                                                 :style="`width: ${taskProgress(t)}%`"></div>
                                         </div>
                                         <span class="text-xs text-gray-400" x-text="formatSize(t)"></span>
                                     </div>
@@ -234,11 +236,15 @@
                             </div>
                             <div class="flex justify-between">
                                 <span class="text-gray-400">Current</span>
-                                <span class="text-gray-200 truncate max-w-[200px]" x-text="srv.current_task ? extractRepo(srv.current_task) : 'idle'"></span>
+                                <span class="text-gray-200 truncate max-w-[200px]" x-text="srv.current_task ? extractRepo(srv.current_task) : (srv.active_tasks?.length ? 'working...' : 'idle')"></span>
                             </div>
                             <div class="flex justify-between">
-                                <span class="text-gray-400">Queue</span>
-                                <span x-text="`${srv.queue_depth} pending`"></span>
+                                <span class="text-gray-400">Active</span>
+                                <span x-text="`${srv.active_tasks?.length || 0} tasks`"></span>
+                            </div>
+                            <div class="flex justify-between" x-show="srv.queue_depth > 0">
+                                <span class="text-gray-400">Queued</span>
+                                <span x-text="`${srv.queue_depth} in queue.txt`"></span>
                             </div>
                         </div>
                         <!-- Active tasks for this server -->

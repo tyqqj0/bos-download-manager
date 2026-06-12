@@ -220,9 +220,17 @@ async def background_scheduler():
             server_data = await loop.run_in_executor(_executor, _build_server_status, state)
             cache.set_servers(server_data)
 
+            # Compute per-server download speeds from size changes
+            server_sizes = {}
+            for t in state.tasks:
+                if t.status in ("downloading", "dispatched") and t.server and t.downloaded_gb > 0:
+                    server_sizes[t.server] = server_sizes.get(t.server, 0) + t.downloaded_gb
+            cache.update_speeds(server_sizes)
+
             # Update dashboard cache
             dashboard_data = _build_dashboard(state)
             dashboard_data["servers"] = server_data
+            dashboard_data["speeds"] = cache.get_speeds()
             cache.set_dashboard(dashboard_data)
 
             # Update tasks cache
