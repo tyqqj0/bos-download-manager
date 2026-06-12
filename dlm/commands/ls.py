@@ -15,12 +15,32 @@ SORT_KEYS = ["name", "status", "server", "size", "category"]
 @click.option("--priority", default=None, help="按优先级筛选")
 @click.option("--sort", "sort_by", type=click.Choice(SORT_KEYS), default="name", help="排序字段")
 @click.option("--reverse", "reverse_sort", is_flag=True, help="倒序排列")
+@click.option("--size", "check_size", is_flag=True, help="实时查询 BOS 获取真实下载大小")
 @click.option("--all", "show_all", is_flag=True, help="包含 skipped/needs-auth")
 @click.option("--format", "fmt", type=click.Choice(["table", "json", "csv"]), default="table")
-def ls_cmd(status, server, category, priority, sort_by, reverse_sort, show_all, fmt):
+def ls_cmd(status, server, category, priority, sort_by, reverse_sort, check_size, show_all, fmt):
     """列出下载任务。"""
     mgr = StateManager.create()
     state = mgr.load()
+
+    # Real-time size check via BOS API
+    if check_size:
+        click.echo("正在查询 BOS 真实大小...")
+        from ..core.size import fetch_sizes
+        from ..core.config import load_config
+        from ..core.bos import create_bos_client
+
+        config = load_config()
+        bos = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
+        sizes = fetch_sizes(bos, state.tasks)
+        updated = 0
+        for task in state.tasks:
+            if task.id in sizes:
+                task.downloaded_gb = sizes[task.id]
+                updated += 1
+        if updated:
+            mgr.save(state)
+            click.echo(f"已更新 {updated} 个任务的真实大小。\n")
 
     tasks = state.tasks
 
@@ -50,9 +70,9 @@ def ls_cmd(status, server, category, priority, sort_by, reverse_sort, show_all, 
         return
 
     if fmt == "csv":
-        click.echo("id,name,repo_id,source,category,size_gb,status,server,priority")
+        click.echo("id,name,repo_id,source,category,size_gb,downloaded_gb,status,server,priority")
         for t in tasks:
-            click.echo(f"{t.id},{t.name},{t.repo_id},{t.source},{t.category},{t.size_gb},{t.status},{t.server or '-'},{t.priority}")
+            click.echo(f"{t.id},{t.name},{t.repo_id},{t.source},{t.category},{t.size_gb},{t.downloaded_gb},{t.status},{t.server or '-'},{t.priority}")
         return
 
     # Table format
@@ -72,12 +92,34 @@ def _sort_tasks(tasks, sort_by, reverse):
         key = lambda t: (t.server or "ZZZ")
     elif sort_by == "size":
         key = lambda t: t.size_gb
-        reverse = not reverse  # default large first
+        reverse = not reverse
     elif sort_by == "category":
         key = lambda t: t.category
     else:
         key = lambda t: t.name.lower()
     return sorted(tasks, key=key, reverse=reverse)
+
+
+def _format_size(task) -> str:
+    """Format size column: downloaded/total or ~total."""
+    if task.downloaded_gb > 0:
+        dl = _human_size(task.downloaded_gb)
+        if task.size_gb > 0:
+            total = _human_size(task.size_gb)
+            return f"{dl}/{total}"
+        return dl
+    if task.size_gb > 0:
+        return f"~{_human_size(task.size_gb)}"
+    return "-"
+
+
+def _human_size(gb: float) -> str:
+    """Format GB value concisely."""
+    if gb >= 1000:
+        return f"{gb / 1000:.1f}T"
+    if gb >= 10:
+        return f"{gb:.0f}G"
+    return f"{gb:.1f}G"
 
 
 def _print_table(tasks):
@@ -87,16 +129,16 @@ def _print_table(tasks):
         "queued": "○", "failed": "✗", "skipped": "⏸", "needs-auth": "🔒",
     }
 
-    header = f"{'ID':<16} {'名称':<24} {'状态':<5} {'服务器':<4} {'大小':<8} {'分类':<12} {'来源':<4}"
+    header = f"{'ID':<16} {'名称':<24} {'状态':<5} {'服务器':<4} {'大小':<12} {'分类':<12} {'来源':<4}"
     click.echo(header)
     click.echo("─" * len(header))
 
     for t in tasks:
         s = sym.get(t.status, "?")
-        size_str = f"{t.size_gb:.1f}G" if t.size_gb else "-"
+        size_str = _format_size(t)
         name_display = t.name[:22] if len(t.name) > 22 else t.name
         click.echo(
-            f"{t.id:<16} {name_display:<24} {s:<5} {t.server or '-':<4} {size_str:<8} {t.category:<12} {t.source:<4}"
+            f"{t.id:<16} {name_display:<24} {s:<5} {t.server or '-':<4} {size_str:<12} {t.category:<12} {t.source:<4}"
         )
 
     click.echo("")
@@ -107,6 +149,14 @@ def _print_table(tasks):
         by_status[t.status] = by_status.get(t.status, 0) + 1
     parts = [f"{v} {k}" for k, v in sorted(by_status.items())]
     click.echo(f"共 {total} 个任务: {', '.join(parts)}")
+
+    # Total size
+    total_dl = sum(t.downloaded_gb for t in tasks)
+    total_est = sum(t.size_gb for t in tasks)
+    if total_dl > 0:
+        click.echo(f"总量: {_human_size(total_dl)} 已下载 / {_human_size(total_est)} 预估")
+    else:
+        click.echo(f"总量: {_human_size(total_est)} 预估 (用 --size 获取真实大小)")
 
     # Legend
     click.echo(f"图例: ✓ done  ↓ downloading  → dispatched  ○ queued  ✗ failed")

@@ -29,6 +29,7 @@ class Task:
     category: str
     bos_path: str
     size_gb: float = 0.0
+    downloaded_gb: float = 0.0
     status: str = "queued"
     server: Optional[str] = None
     priority: str = "P1"

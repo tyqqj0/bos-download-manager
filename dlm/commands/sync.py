@@ -81,8 +81,21 @@ def sync_cmd(server_filter, update):
         click.echo(f"  {task.name} [{task.server}]: {task.status} → {new_status}{err_str}")
 
     if update:
+        # Update download sizes via BOS API
+        from ..core.size import fetch_sizes
+        from ..core.config import load_config
+        from ..core.bos import create_bos_client
+
+        click.echo("更新下载大小...")
+        config = load_config()
+        bos = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
+        sizes = fetch_sizes(bos, state.tasks)
+        for task in state.tasks:
+            if task.id in sizes:
+                task.downloaded_gb = sizes[task.id]
+
         mgr.save(state)
-        click.echo(f"\n✓ 已更新 state.json")
+        click.echo(f"✓ 已更新 state.json (含 {len(sizes)} 个大小)")
 
         # Lightweight health check: restart dead workers
         from ..core.health import check_and_restart_workers

@@ -11,3 +11,18 @@ def create_bos_client(ak: str, sk: str, endpoint: str) -> BosClient:
         endpoint=endpoint,
     )
     return BosClient(config)
+
+
+def get_prefix_size(client: BosClient, bucket: str, prefix: str) -> int:
+    """Sum total bytes of all objects under a prefix (paginated)."""
+    total = 0
+    marker = ""
+    while True:
+        response = client.list_objects(bucket, prefix=prefix, marker=marker, max_keys=1000)
+        if response.contents:
+            for obj in response.contents:
+                total += obj.size
+        if not response.is_truncated:
+            break
+        marker = response.next_marker
+    return total
