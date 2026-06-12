@@ -68,11 +68,15 @@ def build_download_cmd(
     return cmd
 
 
-def derive_bos_path(category: str, name: str, dtype: str = "dataset") -> str:
-    """Derive the BOS target path from category and name."""
+def derive_bos_path(category: str, repo_id: str, dtype: str = "dataset") -> str:
+    """Derive the BOS target path from category and repo_id.
+
+    Uses repo_id's last component (after /) to match download.sh's DIR_NAME logic.
+    """
+    dir_name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
     if dtype == "model":
-        return f"{name}/"
-    return f"{category}/{name}/"
+        return f"{dir_name}/"
+    return f"{category}/{dir_name}/"
 
 
 def _is_hf_url(s: str) -> bool:

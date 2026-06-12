@@ -81,6 +81,18 @@ def sync_cmd(server_filter, update):
         click.echo(f"  {task.name} [{task.server}]: {task.status} → {new_status}{err_str}")
 
     if update:
+        # Fix bos_path for tasks where it doesn't match repo_id
+        from ..core.parser import derive_bos_path
+        path_fixes = 0
+        for task in state.tasks:
+            if task.repo_id and task.category:
+                correct = derive_bos_path(task.category, task.repo_id, task.type)
+                if task.bos_path != correct:
+                    task.bos_path = correct
+                    path_fixes += 1
+        if path_fixes:
+            click.echo(f"修正 {path_fixes} 个 bos_path")
+
         # Update download sizes via BOS API
         from ..core.size import fetch_sizes
         from ..core.config import load_config

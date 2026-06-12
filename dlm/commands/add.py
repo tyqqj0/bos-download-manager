@@ -62,7 +62,7 @@ def add_cmd(url_or_repo, category, dtype, server, priority, name, include, size,
             raise SystemExit(1)
 
     # Create task
-    bos_path = derive_bos_path(category, task_name, parsed["type"])
+    bos_path = derive_bos_path(category, repo_id, parsed["type"])
     task = Task(
         id=state.next_task_id(),
         name=task_name,
