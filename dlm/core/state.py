@@ -41,7 +41,8 @@ class StateManager:
             data = json.loads(response.data.read())
             state = State.from_dict(data)
         except Exception as e:
-            if "NoSuchKey" in str(e) or "404" in str(e):
+            err_msg = str(e)
+            if "NoSuchKey" in err_msg or "404" in err_msg or "does not exist" in err_msg:
                 state = self._initial_state()
             else:
                 raise RuntimeError(f"Failed to read state from BOS: {e}") from e
