@@ -80,6 +80,26 @@ dlm server remove S2     # 移除
 | `~/.dlm/servers.yaml` | 主控机本地 | 服务器注册（不入 git） |
 | BOS `state.json` | 云端 | 任务状态（唯一真相源） |
 
+## Web Dashboard
+
+```bash
+# 安装 web 依赖
+pip install -e ".[web]"
+
+# 启动（前台）
+dlm web --host 0.0.0.0 --port 8080
+
+# 后台常驻
+tmux new-session -d -s dlm-web "dlm web --host 0.0.0.0 --port 8080"
+```
+
+访问 `http://<server-ip>:8080`，功能：
+- 实时仪表盘：总进度、服务器状态、最近活动
+- 任务管理：筛选/排序/重试/跳过/批量操作
+- 添加任务：粘贴 HF URL 自动解析+派发
+- 后台自动同步：60s sync、5min 刷新大小、30s 服务器状态
+- API 文档：`http://<server-ip>:8080/docs`
+
 ## 设计原则
 
 - **BOS state.json 是唯一真相源** — 任何机器运行 `dlm ls` 看到的都一样

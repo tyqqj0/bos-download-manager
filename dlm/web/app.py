@@ -1,0 +1,51 @@
+"""FastAPI application factory."""
+
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+
+from .scheduler import background_scheduler
+
+logger = logging.getLogger("dlm.web")
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting background scheduler...")
+    task = asyncio.create_task(background_scheduler())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="DLM Dashboard",
+        description="Dataset Download Manager — Web UI",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+
+    from .routes.dashboard import router as dashboard_router
+    from .routes.tasks import router as tasks_router
+    from .routes.servers import router as servers_router
+    from .routes.actions import router as actions_router
+
+    app.include_router(dashboard_router, prefix="/api")
+    app.include_router(tasks_router, prefix="/api")
+    app.include_router(servers_router, prefix="/api")
+    app.include_router(actions_router, prefix="/api")
+
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+
+    return app
