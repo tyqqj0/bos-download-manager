@@ -51,9 +51,13 @@ def fetch_sizes(bos_client, tasks, max_workers=10, verbose=False) -> dict[str, f
 def fetch_hf_total_sizes(tasks, hf_token=None, max_workers=6) -> dict[str, float]:
     """Query HuggingFace API for total repo sizes (parallel).
 
-    Only checks HF-source tasks. Returns {task_id: total_gb}.
+    Only checks HF-source tasks that don't already have a size_gb.
+    Returns {task_id: total_gb}.
     """
-    eligible = [t for t in tasks if t.source == "hf" and t.repo_id]
+    eligible = [
+        t for t in tasks
+        if t.source == "hf" and t.repo_id and t.size_gb == 0
+    ]
 
     if not eligible:
         return {}
@@ -84,16 +88,22 @@ def _get_task_size(bos_client, bos_path: str) -> int:
 
 
 def _get_hf_repo_size(repo_id: str, repo_type: str, token: str = None) -> int:
-    """Get total size of a HuggingFace repo via list_repo_tree."""
+    """Get total size of a HuggingFace repo via list_repo_tree.
+    Caps at 10000 files to avoid hanging on huge repos.
+    """
     from huggingface_hub import HfApi
 
     api = HfApi(token=token)
     hf_type = "dataset" if repo_type == "dataset" else "model"
     total = 0
+    count = 0
     try:
         for item in api.list_repo_tree(repo_id, repo_type=hf_type, recursive=True):
             if hasattr(item, "size") and item.size:
                 total += item.size
+            count += 1
+            if count >= 10000:
+                break
     except Exception:
         pass
     return total
