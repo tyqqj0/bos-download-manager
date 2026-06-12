@@ -6,17 +6,18 @@ from dotenv import load_dotenv
 
 
 def _find_env_file() -> Path:
-    """Search upward for .env file."""
+    """Search for .env file. Priority: ~/.dlm/.env > upward from CWD."""
+    # Primary: ~/.dlm/.env (works from any directory)
+    dlm_env = Path.home() / ".dlm" / ".env"
+    if dlm_env.exists():
+        return dlm_env
+    # Secondary: search upward from CWD
     current = Path.cwd()
     for _ in range(6):
         if (current / ".env").exists():
             return current / ".env"
         current = current.parent
-    # Fallback: home dir
-    home_env = Path.home() / ".dlm" / ".env"
-    if home_env.exists():
-        return home_env
-    return Path.cwd() / ".env"
+    return dlm_env  # default path for error message
 
 
 def load_config() -> dict:
