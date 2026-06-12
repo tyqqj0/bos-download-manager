@@ -36,6 +36,7 @@ from .commands.verify import verify_cmd
 from .commands.server import server_cmd
 from .commands.migrate import migrate_cmd
 from .commands.init_cmd import init_cmd
+from .commands.doctor import doctor_cmd
 
 cli.add_command(add_cmd)
 cli.add_command(ls_cmd)
@@ -47,6 +48,7 @@ cli.add_command(verify_cmd)
 cli.add_command(server_cmd)
 cli.add_command(migrate_cmd)
 cli.add_command(init_cmd)
+cli.add_command(doctor_cmd)
 
 
 if __name__ == "__main__":

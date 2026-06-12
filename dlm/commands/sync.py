@@ -83,5 +83,11 @@ def sync_cmd(server_filter, update):
     if update:
         mgr.save(state)
         click.echo(f"\n✓ 已更新 state.json")
+
+        # Lightweight health check: restart dead workers
+        from ..core.health import check_and_restart_workers
+        restarted = check_and_restart_workers(state.servers)
+        if restarted:
+            click.echo(f"⚠ 已重启 {len(restarted)} 个 worker: {', '.join(restarted)}")
     else:
         click.echo(f"\n使用 --update 写入变更。")
