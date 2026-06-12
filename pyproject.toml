@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dlm"
+version = "0.1.0"
+description = "Dataset download manager CLI — multi-server orchestration with BOS-backed state"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.0",
+    "python-dotenv>=1.0",
+    "bce-python-sdk>=0.9",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+dlm = "dlm.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dlm*"]
