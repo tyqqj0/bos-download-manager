@@ -25,22 +25,34 @@ def ls_cmd(status, server, category, priority, sort_by, reverse_sort, check_size
 
     # Real-time size check via BOS API
     if check_size:
-        click.echo("正在查询 BOS 真实大小...")
-        from ..core.size import fetch_sizes
+        click.echo("正在查询真实大小...")
+        from ..core.size import fetch_sizes, fetch_hf_total_sizes
         from ..core.config import load_config
         from ..core.bos import create_bos_client
 
         config = load_config()
         bos = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
-        sizes = fetch_sizes(bos, state.tasks)
+
+        # Downloaded sizes from BOS
+        sizes = fetch_sizes(bos, state.tasks, verbose=True)
         updated = 0
         for task in state.tasks:
             if task.id in sizes:
                 task.downloaded_gb = sizes[task.id]
                 updated += 1
-        if updated:
+
+        # Total sizes from HuggingFace
+        hf_token = config.get("HF_TOKEN", "")
+        hf_sizes = fetch_hf_total_sizes(state.tasks, hf_token=hf_token or None)
+        hf_updated = 0
+        for task in state.tasks:
+            if task.id in hf_sizes and hf_sizes[task.id] > 0:
+                task.size_gb = hf_sizes[task.id]
+                hf_updated += 1
+
+        if updated or hf_updated:
             mgr.save(state)
-            click.echo(f"已更新 {updated} 个任务的真实大小。\n")
+            click.echo(f"已更新: {updated} 个下载大小, {hf_updated} 个总大小\n")
 
     tasks = state.tasks
 
@@ -105,6 +117,8 @@ def _format_size(task) -> str:
     if task.downloaded_gb > 0:
         dl = _human_size(task.downloaded_gb)
         if task.size_gb > 0:
+            if task.status == "done" or abs(task.downloaded_gb - task.size_gb) / max(task.size_gb, 1) < 0.05:
+                return dl
             total = _human_size(task.size_gb)
             return f"{dl}/{total}"
         return dl

@@ -23,14 +23,16 @@ S1 已部署好，连上即可使用：
 # 查看所有服务器状态（当前任务、队列深度）
 dlm status
 
-# 列出所有下载任务
+# 列出所有下载任务（按名称排序）
 dlm ls
 
-# 只看正在下载的
-dlm ls --status downloading
+# 查看真实下载大小（BOS API 查询，约 5 秒）
+dlm ls --size
 
-# 只看某台服务器
+# 按状态/服务器/分类筛选
+dlm ls --status downloading
 dlm ls --server S3
+dlm ls --sort size --reverse
 ```
 
 ## 添加新下载任务
