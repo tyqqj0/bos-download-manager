@@ -1,5 +1,6 @@
 """State manager: read/write state.json from BOS."""
 
+import io
 import json
 import os
 import platform
@@ -56,7 +57,7 @@ class StateManager:
         state.meta["version"] = state.meta.get("version", 0) + 1
 
         data = json.dumps(state.to_dict(), ensure_ascii=False, indent=2).encode("utf-8")
-        self._bos.put_object(META_BUCKET, STATE_KEY, data,
+        self._bos.put_object(META_BUCKET, STATE_KEY, io.BytesIO(data),
                              content_length=len(data),
                              content_type="application/json")
         self._write_cache(state)

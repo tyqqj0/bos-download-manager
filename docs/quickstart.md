@@ -78,6 +78,16 @@ dlm server test --all    # 测试连通性
 dlm server setup S2      # 重启某台的 worker
 ```
 
+## 健康检查
+
+```bash
+dlm doctor               # 检查 worker + 检测卡住任务，自动重启死掉的 worker
+dlm doctor --apply       # 额外：自动重试所有卡住（>24h 无进展）的任务
+dlm doctor --dry         # 只看报告不做任何修复
+```
+
+**断点续传**：retry 不会从头下载。HuggingFace CLI 内置断点续传，重试时会跳过已完成的文件，只续传中断的部分。
+
 ## 文件位置（S1 上）
 
 ```
@@ -122,7 +132,14 @@ dlm ls        # 完整列表
 
 ```bash
 dlm sync --update    # 先同步最新状态
-dlm retry <name>     # 重试
+dlm retry <name>     # 重试（自动断点续传，不会重头下载）
+```
+
+### "下载卡住了很久没动静"
+
+```bash
+dlm doctor           # 检查哪些任务卡住
+dlm doctor --apply   # 自动重试所有卡住的任务
 ```
 
 ### "想看实时刷新"
