@@ -16,15 +16,16 @@ SORT_KEYS = ["name", "status", "server", "size", "category"]
 @click.option("--sort", "sort_by", type=click.Choice(SORT_KEYS), default="name", help="排序字段")
 @click.option("--reverse", "reverse_sort", is_flag=True, help="倒序排列")
 @click.option("--size", "check_size", is_flag=True, help="实时查询 BOS 获取真实下载大小")
+@click.option("--refresh", "refresh_total", is_flag=True, help="强制刷新所有 HF 总大小（含已有值的）")
 @click.option("--all", "show_all", is_flag=True, help="包含 skipped/needs-auth")
 @click.option("--format", "fmt", type=click.Choice(["table", "json", "csv"]), default="table")
-def ls_cmd(status, server, category, priority, sort_by, reverse_sort, check_size, show_all, fmt):
+def ls_cmd(status, server, category, priority, sort_by, reverse_sort, check_size, refresh_total, show_all, fmt):
     """列出下载任务。"""
     mgr = StateManager.create()
     state = mgr.load()
 
     # Real-time size check via BOS API
-    if check_size:
+    if check_size or refresh_total:
         click.echo("正在查询真实大小...")
         from ..core.size import fetch_sizes, fetch_hf_total_sizes
         from ..core.config import load_config
@@ -43,7 +44,7 @@ def ls_cmd(status, server, category, priority, sort_by, reverse_sort, check_size
 
         # Total sizes from HuggingFace
         hf_token = config.get("HF_TOKEN", "")
-        hf_sizes = fetch_hf_total_sizes(state.tasks, hf_token=hf_token or None)
+        hf_sizes = fetch_hf_total_sizes(state.tasks, hf_token=hf_token or None, force=refresh_total)
         hf_updated = 0
         for task in state.tasks:
             if task.id in hf_sizes and hf_sizes[task.id] > 0:
@@ -113,17 +114,15 @@ def _sort_tasks(tasks, sort_by, reverse):
 
 
 def _format_size(task) -> str:
-    """Format size column: downloaded/total or ~total."""
-    if task.downloaded_gb > 0:
-        dl = _human_size(task.downloaded_gb)
-        if task.size_gb > 0:
-            if task.status == "done" or abs(task.downloaded_gb - task.size_gb) / max(task.size_gb, 1) < 0.05:
-                return dl
-            total = _human_size(task.size_gb)
-            return f"{dl}/{total}"
-        return dl
+    """Format size column: always show downloaded/total when possible."""
+    dl = _human_size(task.downloaded_gb) if task.downloaded_gb > 0 else "0"
     if task.size_gb > 0:
-        return f"~{_human_size(task.size_gb)}"
+        total = _human_size(task.size_gb)
+        if task.status == "done" and task.downloaded_gb > 0:
+            return _human_size(task.downloaded_gb)
+        return f"{dl}/{total}"
+    if task.downloaded_gb > 0:
+        return f"{dl}/?"
     return "-"
 
 

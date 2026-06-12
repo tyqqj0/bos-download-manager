@@ -48,15 +48,15 @@ def fetch_sizes(bos_client, tasks, max_workers=10, verbose=False) -> dict[str, f
     return results
 
 
-def fetch_hf_total_sizes(tasks, hf_token=None, max_workers=6) -> dict[str, float]:
+def fetch_hf_total_sizes(tasks, hf_token=None, max_workers=6, force=False) -> dict[str, float]:
     """Query HuggingFace API for total repo sizes (parallel).
 
-    Only checks HF-source tasks that don't already have a size_gb.
+    Only checks HF-source tasks. With force=False, skips tasks that already have size_gb.
     Returns {task_id: total_gb}.
     """
     eligible = [
         t for t in tasks
-        if t.source == "hf" and t.repo_id and t.size_gb == 0
+        if t.source == "hf" and t.repo_id and (force or t.size_gb == 0)
     ]
 
     if not eligible:
