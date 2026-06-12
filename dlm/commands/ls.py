@@ -5,15 +5,19 @@ import click
 from ..core.state import StateManager
 from ..constants import STATUSES, CATEGORIES
 
+SORT_KEYS = ["name", "status", "server", "size", "category"]
+
 
 @click.command("ls")
 @click.option("--status", type=click.Choice(STATUSES), default=None, help="按状态筛选")
 @click.option("--server", default=None, help="按服务器筛选")
 @click.option("--category", type=click.Choice(CATEGORIES), default=None, help="按分类筛选")
 @click.option("--priority", default=None, help="按优先级筛选")
+@click.option("--sort", "sort_by", type=click.Choice(SORT_KEYS), default="name", help="排序字段")
+@click.option("--reverse", "reverse_sort", is_flag=True, help="倒序排列")
 @click.option("--all", "show_all", is_flag=True, help="包含 skipped/needs-auth")
 @click.option("--format", "fmt", type=click.Choice(["table", "json", "csv"]), default="table")
-def ls_cmd(status, server, category, priority, show_all, fmt):
+def ls_cmd(status, server, category, priority, sort_by, reverse_sort, show_all, fmt):
     """列出下载任务。"""
     mgr = StateManager.create()
     state = mgr.load()
@@ -36,6 +40,9 @@ def ls_cmd(status, server, category, priority, show_all, fmt):
         click.echo("无匹配任务。")
         return
 
+    # Sort
+    tasks = _sort_tasks(tasks, sort_by, reverse_sort)
+
     if fmt == "json":
         import json
         from dataclasses import asdict
@@ -52,9 +59,29 @@ def ls_cmd(status, server, category, priority, show_all, fmt):
     _print_table(tasks)
 
 
+STATUS_ORDER = {"downloading": 0, "dispatched": 1, "queued": 2, "failed": 3, "done": 4, "skipped": 5, "needs-auth": 6}
+
+
+def _sort_tasks(tasks, sort_by, reverse):
+    """Sort tasks by the given key."""
+    if sort_by == "name":
+        key = lambda t: t.name.lower()
+    elif sort_by == "status":
+        key = lambda t: STATUS_ORDER.get(t.status, 9)
+    elif sort_by == "server":
+        key = lambda t: (t.server or "ZZZ")
+    elif sort_by == "size":
+        key = lambda t: t.size_gb
+        reverse = not reverse  # default large first
+    elif sort_by == "category":
+        key = lambda t: t.category
+    else:
+        key = lambda t: t.name.lower()
+    return sorted(tasks, key=key, reverse=reverse)
+
+
 def _print_table(tasks):
     """Print tasks as a formatted table."""
-    # Status symbols
     sym = {
         "done": "✓", "downloading": "↓", "dispatched": "→",
         "queued": "○", "failed": "✗", "skipped": "⏸", "needs-auth": "🔒",
@@ -80,3 +107,6 @@ def _print_table(tasks):
         by_status[t.status] = by_status.get(t.status, 0) + 1
     parts = [f"{v} {k}" for k, v in sorted(by_status.items())]
     click.echo(f"共 {total} 个任务: {', '.join(parts)}")
+
+    # Legend
+    click.echo(f"图例: ✓ done  ↓ downloading  → dispatched  ○ queued  ✗ failed")
