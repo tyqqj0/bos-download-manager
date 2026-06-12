@@ -116,10 +116,14 @@ def _sort_tasks(tasks, sort_by, reverse):
 def _format_size(task) -> str:
     """Format size column: always show downloaded/total when possible."""
     dl = _human_size(task.downloaded_gb) if task.downloaded_gb > 0 else "0"
+    if task.status == "done":
+        if task.downloaded_gb > 0:
+            return _human_size(task.downloaded_gb)
+        if task.size_gb > 0:
+            return _human_size(task.size_gb)
+        return "-"
     if task.size_gb > 0:
         total = _human_size(task.size_gb)
-        if task.status == "done" and task.downloaded_gb > 0:
-            return _human_size(task.downloaded_gb)
         return f"{dl}/{total}"
     if task.downloaded_gb > 0:
         return f"{dl}/?"
