@@ -20,6 +20,8 @@ class DLMCache:
         self._prev_sizes: dict = {}
         self._prev_sizes_time: float = 0.0
         self._speeds: dict = {}
+        self._prev_task_progress: dict = {}
+        self._task_speeds: dict = {}
 
     def set_dashboard(self, data: dict):
         with self._lock:
@@ -72,6 +74,28 @@ class DLMCache:
     def get_speeds(self) -> dict:
         with self._lock:
             return dict(self._speeds)
+
+    def update_task_speed(self, repo_id: str, timestamp: int, total_bytes: int):
+        """Compute per-task speed from progress file data."""
+        with self._lock:
+            prev = self._prev_task_progress.get(repo_id)
+            if prev:
+                dt = timestamp - prev[0]
+                if dt >= 20:
+                    delta = total_bytes - prev[1]
+                    self._task_speeds[repo_id] = max(0.0, (delta / dt) / (1024 * 1024))
+                    self._prev_task_progress[repo_id] = (timestamp, total_bytes)
+            else:
+                self._prev_task_progress[repo_id] = (timestamp, total_bytes)
+
+    def get_task_speeds(self) -> dict:
+        with self._lock:
+            return dict(self._task_speeds)
+
+    def clear_task_speed(self, repo_id: str):
+        with self._lock:
+            self._task_speeds.pop(repo_id, None)
+            self._prev_task_progress.pop(repo_id, None)
 
 
 cache = DLMCache()

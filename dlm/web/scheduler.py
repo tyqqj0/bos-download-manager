@@ -71,7 +71,9 @@ def _build_server_status(state) -> dict:
         "tmux has-session -t worker 2>/dev/null && echo WORKER_ALIVE || echo WORKER_DEAD; "
         "cat ~/code/auwomo-tools/current.txt 2>/dev/null || echo ''; "
         "echo '---QUEUE---'; "
-        "wc -l < ~/code/auwomo-tools/queue.txt 2>/dev/null || echo 0"
+        "wc -l < ~/code/auwomo-tools/queue.txt 2>/dev/null || echo 0; "
+        "echo '---PROGRESS---'; "
+        "cat /tmp/dlm-progress 2>/dev/null || echo ''"
     )
     results = ssh_parallel(srv_models, status_cmd, timeout=10) if srv_models else {}
 
@@ -92,6 +94,16 @@ def _build_server_status(state) -> dict:
         if cfg.local:
             entry["worker_alive"] = True
             entry["ssh_ok"] = True
+            try:
+                with open("/tmp/dlm-progress") as f:
+                    parts = f.read().strip().split(None, 3)
+                    if len(parts) >= 4:
+                        ts = int(parts[0])
+                        total_bytes = int(parts[1])
+                        repo_id = parts[3]
+                        cache.update_task_speed(repo_id, ts, total_bytes)
+            except (OSError, ValueError):
+                pass
         elif not cfg.enabled:
             entry["ssh_ok"] = False
         else:
@@ -100,17 +112,30 @@ def _build_server_status(state) -> dict:
             if ok:
                 lines = out.split("\n")
                 entry["worker_alive"] = "WORKER_ALIVE" in (lines[0] if lines else "")
-                in_queue = False
+                section = "current"
                 for line in lines[1:]:
                     if "---QUEUE---" in line:
-                        in_queue = True
+                        section = "queue"
                         continue
-                    if in_queue:
+                    if "---PROGRESS---" in line:
+                        section = "progress"
+                        continue
+                    if section == "queue":
                         try:
                             entry["queue_depth"] = int(line.strip())
                         except ValueError:
                             pass
-                    elif line.strip():
+                    elif section == "progress":
+                        parts = line.strip().split(None, 3)
+                        if len(parts) >= 4:
+                            try:
+                                ts = int(parts[0])
+                                total_bytes = int(parts[1])
+                                repo_id = parts[3]
+                                cache.update_task_speed(repo_id, ts, total_bytes)
+                            except (ValueError, IndexError):
+                                pass
+                    elif section == "current" and line.strip():
                         entry["current_task"] = line.strip()
 
         active = state.active_tasks_for_server(key)
@@ -122,7 +147,7 @@ def _build_server_status(state) -> dict:
 
 def _run_sync(state, mgr) -> int:
     """Run sync logic: parse worker logs, update task statuses. Returns change count."""
-    from ..core.ssh import ssh_recent_log, ssh_check_current
+    from ..core.ssh import ssh_check_current, ssh_server
     from ..core.models import _now
 
     changes = 0
@@ -131,7 +156,8 @@ def _run_sync(state, mgr) -> int:
             continue
 
         try:
-            log_text = ssh_recent_log(srv, lines=100)
+            log_cmd = f"grep -E 'DONE:|FAILED' {srv.path}/queue.log 2>/dev/null | tail -200"
+            log_text, _ = ssh_server(srv, log_cmd, timeout=10)
             current = ssh_check_current(srv)
         except Exception:
             continue
@@ -231,6 +257,7 @@ async def background_scheduler():
             dashboard_data = _build_dashboard(state)
             dashboard_data["servers"] = server_data
             dashboard_data["speeds"] = cache.get_speeds()
+            dashboard_data["task_speeds"] = cache.get_task_speeds()
             cache.set_dashboard(dashboard_data)
 
             # Update tasks cache

@@ -15,6 +15,11 @@ function app() {
         lastSync: '',
         toast: { show: false, message: '', type: 'success' },
         addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', no_dispatch: false, parsed: null, error: '' },
+        serverQueues: {},
+        originalQueues: {},
+        queueDirty: {},
+        expandedServer: '',
+        sortableInstances: {},
 
         async init() {
             await this.fetchDashboard();
@@ -265,6 +270,11 @@ function app() {
             return (this.dashboard.speeds || {})[serverKey] || 0;
         },
 
+        getTaskSpeed(task) {
+            if (task.status !== 'downloading') return 0;
+            return (this.dashboard.task_speeds || {})[task.repo_id] || 0;
+        },
+
         formatSpeed(mbps) {
             if (mbps <= 0) return '';
             if (mbps >= 1024) return `${(mbps/1024).toFixed(1)} GB/s`;
@@ -279,6 +289,77 @@ function app() {
             if (diff < 3600) return `${Math.round(diff/60)}m ago`;
             if (diff < 86400) return `${Math.round(diff/3600)}h ago`;
             return `${Math.round(diff/86400)}d ago`;
+        },
+
+        async toggleServer(key) {
+            if (this.expandedServer === key) {
+                this.expandedServer = '';
+                return;
+            }
+            this.expandedServer = key;
+            await this.fetchQueue(key);
+        },
+
+        async fetchQueue(key) {
+            try {
+                const res = await fetch(`/api/servers/${key}/queue`);
+                const data = await res.json();
+                this.serverQueues[key] = data.queue || [];
+                this.originalQueues[key] = JSON.parse(JSON.stringify(data.queue || []));
+                this.queueDirty[key] = false;
+            } catch (e) {
+                this.serverQueues[key] = [];
+                console.error('Queue fetch error:', e);
+            }
+        },
+
+        initSortable(el, key) {
+            if (this.sortableInstances[key]) {
+                this.sortableInstances[key].destroy();
+            }
+            const self = this;
+            this.sortableInstances[key] = new Sortable(el, {
+                handle: '.drag-handle',
+                animation: 150,
+                ghostClass: 'opacity-30',
+                chosenClass: 'border-blue-500',
+                onEnd() {
+                    const items = el.querySelectorAll('[data-line]');
+                    const newOrder = Array.from(items).map(item => item.dataset.line);
+                    self.serverQueues[key] = newOrder.map(line => {
+                        return self.serverQueues[key].find(q => q.line === line) || {line, repo_id: '', display: line.slice(0, 40)};
+                    });
+                    self.queueDirty[key] = true;
+                },
+            });
+        },
+
+        async saveQueueOrder(key) {
+            const lines = (this.serverQueues[key] || []).map(q => q.line);
+            try {
+                const res = await fetch(`/api/servers/${key}/queue`, {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ order: lines })
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    this.serverQueues[key] = data.queue || [];
+                    this.originalQueues[key] = JSON.parse(JSON.stringify(data.queue || []));
+                    this.queueDirty[key] = false;
+                    this.showToast('Queue reordered', 'success');
+                } else {
+                    const data = await res.json();
+                    this.showToast(data.detail || 'Reorder failed', 'error');
+                }
+            } catch (e) {
+                this.showToast('Reorder failed', 'error');
+            }
+        },
+
+        cancelQueueReorder(key) {
+            this.serverQueues[key] = JSON.parse(JSON.stringify(this.originalQueues[key] || []));
+            this.queueDirty[key] = false;
         },
 
         showToast(message, type = 'success') {
