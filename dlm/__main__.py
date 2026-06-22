@@ -1,4 +1,4 @@
-﻿"""DLM CLI entry point: python -m dlm"""
+"""DLM CLI entry point: python -m cli.dlm"""
 
 from .cli import cli
 

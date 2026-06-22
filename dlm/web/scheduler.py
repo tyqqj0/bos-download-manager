@@ -1,7 +1,6 @@
 """Background scheduler — auto sync, size refresh, server status polling."""
 
 import asyncio
-import re
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -32,13 +31,36 @@ def _load_servers_config():
 def _build_dashboard(state) -> dict:
     tasks = state.tasks
     by_status = {}
+    countable_statuses = {"queued", "dispatched", "downloading", "done", "failed"}
     total_downloaded = 0.0
     total_estimated = 0.0
 
     for t in tasks:
         by_status[t.status] = by_status.get(t.status, 0) + 1
-        total_downloaded += t.downloaded_gb
-        total_estimated += t.size_gb
+        if t.status in countable_statuses:
+            total_downloaded += t.downloaded_gb
+            if t.size_gb > 0:
+                total_estimated += t.size_gb
+
+    active = [t for t in tasks if t.status == "downloading"]
+    aggregate_speed = sum(t.speed_mbps for t in active)
+    active_downloads = [
+        {
+            "id": t.id, "name": t.name, "server": t.server,
+            "progress_pct": t.progress_pct, "downloaded_gb": t.downloaded_gb,
+            "size_gb": t.size_gb, "speed_mbps": t.speed_mbps,
+            "eta_seconds": t.eta_seconds, "phase": t.phase,
+        }
+        for t in active
+    ]
+
+    queue_next = [
+        {"name": t.name, "server": t.server, "size_gb": t.size_gb}
+        for t in sorted(
+            [t for t in tasks if t.status == "dispatched"],
+            key=lambda t: t.priority or "P3",
+        )[:5]
+    ]
 
     recent = sorted(
         [t for t in tasks if t.status in ("done", "failed") and t.completed_at],
@@ -51,6 +73,9 @@ def _build_dashboard(state) -> dict:
         "by_status": by_status,
         "total_downloaded_tb": round(total_downloaded / 1000, 2),
         "total_estimated_tb": round(total_estimated / 1000, 2),
+        "aggregate_speed_mbps": round(aggregate_speed, 1),
+        "active_downloads": active_downloads,
+        "queue_next": queue_next,
         "recent_activity": [asdict(t) for t in recent],
         "updated_at": time.time(),
     }
@@ -58,142 +83,95 @@ def _build_dashboard(state) -> dict:
 
 def _build_server_status(state) -> dict:
     from ..core.servers import load_servers
-    from ..core.ssh import ssh_parallel
-    from ..core.models import Server
+    from datetime import datetime, timezone
 
     server_cfgs = load_servers()
-    srv_models = [
-        Server(key=k, host=c.host, user=c.user, path=c.path, enabled=c.enabled)
-        for k, c in server_cfgs.items() if c.enabled and not c.local
-    ]
-
-    status_cmd = (
-        "tmux has-session -t worker 2>/dev/null && echo WORKER_ALIVE || echo WORKER_DEAD; "
-        "cat ~/code/auwomo-tools/current.txt 2>/dev/null || echo ''; "
-        "echo '---QUEUE---'; "
-        "wc -l < ~/code/auwomo-tools/queue.txt 2>/dev/null || echo 0; "
-        "echo '---PROGRESS---'; "
-        "cat /tmp/dlm-progress 2>/dev/null || echo ''"
-    )
-    results = ssh_parallel(srv_models, status_cmd, timeout=10) if srv_models else {}
+    heartbeats = state.worker_heartbeats
+    now = datetime.now(timezone.utc)
 
     servers = {}
     for key, cfg in server_cfgs.items():
+        hb = heartbeats.get(key, {})
+        alive_at = hb.get("alive_at", "")
+
+        is_alive = False
+        age_s = None
+        if alive_at:
+            try:
+                age_s = (now - datetime.fromisoformat(alive_at)).total_seconds()
+                is_alive = age_s < 180
+            except (ValueError, TypeError):
+                pass
+
+        queue_depth = sum(1 for t in state.tasks if t.server == key and t.status == "dispatched")
+        active = [t for t in state.tasks if t.server == key and t.status in ("downloading", "dispatched")]
+
         entry = {
             "key": key,
             "host": cfg.host,
             "enabled": cfg.enabled,
             "local": cfg.local,
-            "worker_alive": False,
-            "current_task": "",
-            "queue_depth": 0,
-            "active_tasks": [],
-            "ssh_ok": True,
+            "worker_alive": is_alive,
+            "current_task": hb.get("current_task", ""),
+            "queue_depth": queue_depth,
+            "active_tasks": [{"id": t.id, "name": t.name, "status": t.status} for t in active],
+            "ssh_ok": is_alive or cfg.local,
+            "disk_free_gb": hb.get("disk_free_gb", 0),
+            "pid": hb.get("pid"),
+            "alive_at": alive_at,
         }
-
-        if cfg.local:
-            entry["worker_alive"] = True
-            entry["ssh_ok"] = True
-            try:
-                with open("/tmp/dlm-progress") as f:
-                    parts = f.read().strip().split(None, 3)
-                    if len(parts) >= 4:
-                        ts = int(parts[0])
-                        total_bytes = int(parts[1])
-                        repo_id = parts[3]
-                        cache.update_task_speed(repo_id, ts, total_bytes)
-            except (OSError, ValueError):
-                pass
-        elif not cfg.enabled:
-            entry["ssh_ok"] = False
-        else:
-            out, ok = results.get(key, ("", False))
-            entry["ssh_ok"] = ok
-            if ok:
-                lines = out.split("\n")
-                entry["worker_alive"] = "WORKER_ALIVE" in (lines[0] if lines else "")
-                section = "current"
-                for line in lines[1:]:
-                    if "---QUEUE---" in line:
-                        section = "queue"
-                        continue
-                    if "---PROGRESS---" in line:
-                        section = "progress"
-                        continue
-                    if section == "queue":
-                        try:
-                            entry["queue_depth"] = int(line.strip())
-                        except ValueError:
-                            pass
-                    elif section == "progress":
-                        parts = line.strip().split(None, 3)
-                        if len(parts) >= 4:
-                            try:
-                                ts = int(parts[0])
-                                total_bytes = int(parts[1])
-                                repo_id = parts[3]
-                                cache.update_task_speed(repo_id, ts, total_bytes)
-                            except (ValueError, IndexError):
-                                pass
-                    elif section == "current" and line.strip():
-                        entry["current_task"] = line.strip()
-
-        active = state.active_tasks_for_server(key)
-        entry["active_tasks"] = [{"id": t.id, "name": t.name, "status": t.status} for t in active]
         servers[key] = entry
 
     return servers
 
 
+def _build_alerts(state, servers: dict) -> list:
+    """Generate alerts from current state."""
+    from datetime import datetime, timezone
+    alerts = []
+    now = datetime.now(timezone.utc)
+
+    for key, srv in servers.items():
+        if srv.get("local"):
+            continue
+        if not srv.get("worker_alive") and srv.get("enabled", True):
+            alive_at = srv.get("alive_at", "")
+            duration_min = 0
+            if alive_at:
+                try:
+                    duration_min = int((now - datetime.fromisoformat(alive_at)).total_seconds() / 60)
+                except (ValueError, TypeError):
+                    pass
+            alerts.append({
+                "type": "worker_offline",
+                "server": key,
+                "duration_min": duration_min,
+            })
+
+    for t in state.tasks:
+        if t.status == "failed" and t.retry_count >= 3:
+            alerts.append({
+                "type": "task_failed_repeat",
+                "task": t.name,
+                "count": t.retry_count,
+                "error": t.error_class or t.error or "",
+            })
+
+    for key, srv in servers.items():
+        if srv.get("worker_alive") and srv.get("disk_free_gb", 999) < 20:
+            alerts.append({
+                "type": "disk_low",
+                "server": key,
+                "free_gb": srv["disk_free_gb"],
+            })
+
+    return alerts
+
+
 def _run_sync(state, mgr) -> int:
-    """Run sync logic: parse worker logs, update task statuses. Returns change count."""
-    from ..core.ssh import ssh_check_current, ssh_server
-    from ..core.models import _now
-
-    changes = 0
-    for key, srv in state.servers.items():
-        if not srv.enabled:
-            continue
-
-        try:
-            log_cmd = f"grep -E 'DONE:|FAILED' {srv.path}/queue.log 2>/dev/null | tail -200"
-            log_text, _ = ssh_server(srv, log_cmd, timeout=10)
-            current = ssh_check_current(srv)
-        except Exception:
-            continue
-
-        done_repos = set()
-        failed_repos = {}
-        for line in log_text.splitlines():
-            m_done = re.search(r"DONE: .+/(download(?:-modelscope)?\.sh)\s+(\S+)", line)
-            m_fail = re.search(r"FAILED \(exit (\d+)\): .+/(download(?:-modelscope)?\.sh)\s+(\S+)", line)
-            if m_done:
-                done_repos.add(m_done.group(2))
-            if m_fail:
-                failed_repos[m_fail.group(3)] = f"exit {m_fail.group(1)}"
-
-        for task in state.tasks:
-            if task.server != key:
-                continue
-            if task.status in ("done", "skipped", "needs-auth"):
-                continue
-
-            if task.repo_id in done_repos and task.status != "done":
-                task.status = "done"
-                task.completed_at = _now()
-                changes += 1
-            elif task.repo_id in failed_repos and task.status != "failed":
-                task.status = "failed"
-                task.error = failed_repos[task.repo_id]
-                changes += 1
-            elif current and task.repo_id in current and task.status != "downloading":
-                task.status = "downloading"
-                changes += 1
-
-    if changes:
-        mgr.save(state)
-
-    return changes
+    """Sync is now a no-op: the daemon updates BOS state directly.
+    Kept as a hook for future reconciliation logic."""
+    return 0
 
 
 def _refresh_sizes(state, mgr):
@@ -205,13 +183,17 @@ def _refresh_sizes(state, mgr):
     config = load_config()
     bos = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
     sizes = fetch_sizes(bos, state.tasks)
+    if not sizes:
+        return 0
+    # Re-load fresh state before saving to avoid overwriting daemon updates
+    fresh_state = mgr.load(use_cache=False)
     updated = 0
-    for task in state.tasks:
-        if task.id in sizes:
+    for task in fresh_state.tasks:
+        if task.id in sizes and sizes[task.id] != task.downloaded_gb:
             task.downloaded_gb = sizes[task.id]
             updated += 1
     if updated:
-        mgr.save(state)
+        mgr.save(fresh_state)
     return updated
 
 
@@ -246,18 +228,10 @@ async def background_scheduler():
             server_data = await loop.run_in_executor(_executor, _build_server_status, state)
             cache.set_servers(server_data)
 
-            # Compute per-server download speeds from size changes
-            server_sizes = {}
-            for t in state.tasks:
-                if t.status in ("downloading", "dispatched") and t.server and t.downloaded_gb > 0:
-                    server_sizes[t.server] = server_sizes.get(t.server, 0) + t.downloaded_gb
-            cache.update_speeds(server_sizes)
-
             # Update dashboard cache
             dashboard_data = _build_dashboard(state)
             dashboard_data["servers"] = server_data
-            dashboard_data["speeds"] = cache.get_speeds()
-            dashboard_data["task_speeds"] = cache.get_task_speeds()
+            dashboard_data["alerts"] = _build_alerts(state, server_data)
             cache.set_dashboard(dashboard_data)
 
             # Update tasks cache

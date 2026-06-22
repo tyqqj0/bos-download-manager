@@ -17,12 +17,18 @@ SORT_KEYS = ["name", "status", "server", "size", "category"]
 @click.option("--reverse", "reverse_sort", is_flag=True, help="倒序排列")
 @click.option("--size", "check_size", is_flag=True, help="实时查询 BOS 获取真实下载大小")
 @click.option("--refresh", "refresh_total", is_flag=True, help="强制刷新所有 HF 总大小（含已有值的）")
+@click.option("--live", "live_mode", is_flag=True, help="只显示活跃任务 + 实时进度/速度（快速，不调外部API）")
 @click.option("--all", "show_all", is_flag=True, help="包含 skipped/needs-auth")
 @click.option("--format", "fmt", type=click.Choice(["table", "json", "csv"]), default="table")
-def ls_cmd(status, server, category, priority, sort_by, reverse_sort, check_size, refresh_total, show_all, fmt):
+def ls_cmd(status, server, category, priority, sort_by, reverse_sort, check_size, refresh_total, live_mode, show_all, fmt):
     """列出下载任务。"""
     mgr = StateManager.create()
-    state = mgr.load()
+    state = mgr.load(use_cache=not live_mode)
+
+    # Live mode: show only active tasks with progress/speed
+    if live_mode:
+        _print_live(state)
+        return
 
     # Real-time size check via BOS API
     if check_size or refresh_total:
@@ -177,3 +183,48 @@ def _print_table(tasks):
 
     # Legend
     click.echo(f"图例: ✓ done  ↓ downloading  → dispatched  ○ queued  ✗ failed")
+
+
+def _print_live(state):
+    """Show only active (downloading/dispatched) tasks with progress info."""
+    active = [t for t in state.tasks if t.status in ("downloading", "dispatched")]
+    if not active:
+        click.echo("无活跃任务。")
+        return
+
+    active.sort(key=lambda t: (0 if t.status == "downloading" else 1, t.server or ""))
+
+    click.echo(f"{'服务器':<5} {'名称':<28} {'状态':<5} {'进度':<7} {'速度':<10} {'ETA':<8}")
+    click.echo("─" * 70)
+
+    for t in active:
+        name = t.name[:26] if len(t.name) > 26 else t.name
+        svr = t.server or "-"
+
+        if t.status == "downloading":
+            pct = f"{t.progress_pct:.0f}%" if t.progress_pct > 0 else "-"
+            speed = f"{t.speed_mbps:.1f}MB/s" if t.speed_mbps > 0 else "-"
+            eta = _format_eta_short(t.eta_seconds)
+            phase = t.phase or ""
+            if phase == "moving":
+                pct = "上传中"
+                speed = ""
+                eta = ""
+            click.echo(f"{svr:<5} {name:<28} {'↓':<5} {pct:<7} {speed:<10} {eta:<8}")
+        else:
+            click.echo(f"{svr:<5} {name:<28} {'→':<5} {'等待':<7} {'':<10} {'':<8}")
+
+    click.echo("")
+    dl_count = sum(1 for t in active if t.status == "downloading")
+    disp_count = sum(1 for t in active if t.status == "dispatched")
+    click.echo(f"{dl_count} 下载中, {disp_count} 待执行")
+
+
+def _format_eta_short(seconds):
+    if not seconds or seconds <= 0:
+        return "-"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}min"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60}m"

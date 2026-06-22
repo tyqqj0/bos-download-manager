@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..cache import cache
+from . import run_blocking
 
 router = APIRouter(tags=["tasks"])
 
@@ -87,12 +88,6 @@ class AddTaskRequest(BaseModel):
 @router.post("/tasks")
 async def add_task(req: AddTaskRequest):
     """Add a new download task. Auto-dispatches unless no_dispatch=True."""
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-
-    executor = ThreadPoolExecutor(max_workers=1)
-    loop = asyncio.get_event_loop()
-
     def _do_add():
         from ...core.state import StateManager
         from ...core.parser import parse_repo, build_download_cmd, derive_bos_path
@@ -149,7 +144,7 @@ async def add_task(req: AddTaskRequest):
                 repo_id=repo_id,
                 source=parsed["source"],
                 dtype=parsed["type"],
-                category=req.category,
+                category=task.category,
                 remote_path=srv.path,
                 include=req.include,
                 custom_name=req.name,
@@ -166,7 +161,7 @@ async def add_task(req: AddTaskRequest):
         from dataclasses import asdict
         return {"task": asdict(task)}
 
-    result = await loop.run_in_executor(executor, _do_add)
+    result = await run_blocking(_do_add)
     if "error" in result:
         raise HTTPException(400, result["error"])
     return result
@@ -179,12 +174,6 @@ class RetryRequest(BaseModel):
 @router.post("/tasks/{task_id}/retry")
 async def retry_task(task_id: str, req: RetryRequest = None):
     """Retry a failed task."""
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-
-    executor = ThreadPoolExecutor(max_workers=1)
-    loop = asyncio.get_event_loop()
-
     def _do_retry():
         from ...core.state import StateManager
         from ...core.parser import build_download_cmd
@@ -227,7 +216,29 @@ async def retry_task(task_id: str, req: RetryRequest = None):
             return {"status": "dispatched", "server": server_key}
         return {"error": f"SSH dispatch failed to {server_key}"}
 
-    result = await loop.run_in_executor(executor, _do_retry)
+    result = await run_blocking(_do_retry)
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+    return result
+
+
+@router.delete("/tasks/{task_id}")
+async def delete_task(task_id: str):
+    """Delete a task from state."""
+    def _do():
+        from ...core.state import StateManager
+        mgr = StateManager.create()
+        state = mgr.load(use_cache=False)
+        task = state.find_task_by_id(task_id)
+        if not task:
+            return {"error": f"Task not found: {task_id}"}
+        if task.status == "downloading":
+            return {"error": "Cannot delete a task that is currently downloading"}
+        state.tasks = [t for t in state.tasks if t.id != task_id]
+        mgr.save(state)
+        return {"id": task_id, "deleted": True}
+
+    result = await run_blocking(_do)
     if "error" in result:
         raise HTTPException(400, result["error"])
     return result
@@ -255,11 +266,7 @@ async def update_priority(task_id: str, req: PriorityRequest):
         mgr.save(state)
         return {"id": task_id, "priority": req.priority}
 
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    result = await asyncio.get_event_loop().run_in_executor(
-        ThreadPoolExecutor(max_workers=1), _do
-    )
+    result = await run_blocking(_do)
     if "error" in result:
         raise HTTPException(404, result["error"])
     return result
@@ -279,11 +286,7 @@ async def skip_task(task_id: str):
         mgr.save(state)
         return {"id": task_id, "status": "skipped"}
 
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    result = await asyncio.get_event_loop().run_in_executor(
-        ThreadPoolExecutor(max_workers=1), _do
-    )
+    result = await run_blocking(_do)
     if "error" in result:
         raise HTTPException(404, result["error"])
     return result
@@ -368,8 +371,4 @@ async def batch_action(req: BatchRequest):
         mgr.save(state)
         return {"results": results}
 
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-    return await asyncio.get_event_loop().run_in_executor(
-        ThreadPoolExecutor(max_workers=1), _do
-    )
+    return await run_blocking(_do)

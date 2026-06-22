@@ -5,26 +5,25 @@ function app() {
         tasks: [],
         categories: [],
         filters: { status: '', server: '', category: '', search: '' },
+        sortField: '',
+        sortReverse: false,
         selectedTasks: [],
         selectAll: false,
         showAddModal: false,
         showLogModal: false,
         logServer: '',
         logContent: '',
-        selectedServer: '',
         lastSync: '',
+        showDoctorModal: false,
+        doctorLoading: false,
+        doctorFixing: false,
+        doctorFindings: null,
         toast: { show: false, message: '', type: 'success' },
         addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', no_dispatch: false, parsed: null, error: '' },
-        serverQueues: {},
-        originalQueues: {},
-        queueDirty: {},
-        expandedServer: '',
-        sortableInstances: {},
 
         async init() {
             await this.fetchDashboard();
             await this.fetchTasks();
-            // Auto-refresh
             setInterval(() => this.fetchDashboard(), 10000);
             setInterval(() => this.fetchTasks(), 15000);
         },
@@ -36,6 +35,13 @@ function app() {
 
         get serverKeys() {
             return Object.keys(this.dashboard.servers || {});
+        },
+
+        get workersOnly() {
+            const servers = this.dashboard.servers || {};
+            return Object.entries(servers)
+                .filter(([_, srv]) => !srv.local)
+                .map(([key, srv]) => ({ key, ...srv }));
         },
 
         get filteredTasks() {
@@ -67,6 +73,7 @@ function app() {
                 const data = await res.json();
                 this.tasks = data.tasks || [];
                 if (data.categories) this.categories = data.categories;
+                if (this.sortField) this._applySort();
             } catch (e) { console.error('Tasks fetch error:', e); }
         },
 
@@ -107,6 +114,7 @@ function app() {
         },
 
         async batchAction(action) {
+            if (!confirm(`Confirm ${action} on ${this.selectedTasks.length} tasks?`)) return;
             try {
                 const res = await fetch('/api/tasks/batch', {
                     method: 'POST',
@@ -161,6 +169,7 @@ function app() {
         },
 
         async restartWorker(key) {
+            if (!confirm(`Confirm restart worker on ${key}?`)) return;
             try {
                 const res = await fetch(`/api/servers/${key}/restart`, { method: 'POST' });
                 if (res.ok) {
@@ -184,17 +193,47 @@ function app() {
             } catch (e) { this.logContent = 'Failed to fetch log'; }
         },
 
+        confirmDelete(taskId, taskName) {
+            if (confirm(`Delete task "${taskName}"? This cannot be undone.`)) {
+                this.deleteTask(taskId);
+            }
+        },
+
+        async deleteTask(taskId) {
+            try {
+                const res = await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
+                if (res.ok) {
+                    this.showToast('Task deleted', 'success');
+                    await this.fetchTasks();
+                } else {
+                    const data = await res.json();
+                    this.showToast(data.detail || 'Delete failed', 'error');
+                }
+            } catch (e) { this.showToast('Delete failed', 'error'); }
+        },
+
         toggleSort(field) {
-            // Simple client-side sort toggle
+            if (this.sortField === field) {
+                this.sortReverse = !this.sortReverse;
+            } else {
+                this.sortField = field;
+                this.sortReverse = false;
+            }
+            this._applySort();
+        },
+
+        _applySort() {
             const STATUS_ORDER = { downloading: 0, dispatched: 1, queued: 2, failed: 3, done: 4 };
+            const field = this.sortField;
+            const rev = this.sortReverse ? -1 : 1;
             if (field === 'status') {
-                this.tasks.sort((a, b) => (STATUS_ORDER[a.status] || 9) - (STATUS_ORDER[b.status] || 9));
+                this.tasks.sort((a, b) => rev * ((STATUS_ORDER[a.status] || 9) - (STATUS_ORDER[b.status] || 9)));
             } else if (field === 'name') {
-                this.tasks.sort((a, b) => a.name.localeCompare(b.name));
+                this.tasks.sort((a, b) => rev * a.name.localeCompare(b.name));
             } else if (field === 'size') {
-                this.tasks.sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0));
+                this.tasks.sort((a, b) => rev * ((b.size_gb || 0) - (a.size_gb || 0)));
             } else if (field === 'server') {
-                this.tasks.sort((a, b) => (a.server || 'ZZZ').localeCompare(b.server || 'ZZZ'));
+                this.tasks.sort((a, b) => rev * (a.server || 'ZZZ').localeCompare(b.server || 'ZZZ'));
             }
         },
 
@@ -204,6 +243,53 @@ function app() {
             } else {
                 this.selectedTasks = [];
             }
+        },
+
+        async runDoctor() {
+            this.showDoctorModal = true;
+            this.doctorLoading = true;
+            this.doctorFindings = null;
+            try {
+                const res = await fetch('/api/doctor');
+                this.doctorFindings = await res.json();
+            } catch (e) {
+                this.doctorFindings = { error: 'Failed to run diagnostics' };
+            }
+            this.doctorLoading = false;
+        },
+
+        async doctorFix(actions) {
+            this.doctorFixing = true;
+            try {
+                const res = await fetch('/api/doctor', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ actions: actions || [] })
+                });
+                const data = await res.json();
+                const total = (data.reset_stuck?.length || 0) + (data.skip_zombie?.length || 0) + (data.restart_dead?.length || 0);
+                this.showToast(`Fixed ${total} issues`, 'success');
+                this.showDoctorModal = false;
+                await this.fetchDashboard();
+                await this.fetchTasks();
+            } catch (e) {
+                this.showToast('Fix failed', 'error');
+            }
+            this.doctorFixing = false;
+        },
+
+        async cleanServer(key) {
+            if (!confirm(`Clean orphan staging data on ${key}?`)) return;
+            try {
+                const res = await fetch(`/api/servers/${key}/cleanup`, { method: 'POST' });
+                const data = await res.json();
+                if (data.cleaned) {
+                    this.showToast(`Cleaned ${data.cleaned.length} dirs on ${key}`, 'success');
+                } else {
+                    this.showToast(data.message || 'Nothing to clean', 'success');
+                }
+                await this.fetchDashboard();
+            } catch (e) { this.showToast('Cleanup failed', 'error'); }
         },
 
         // Helpers
@@ -220,146 +306,66 @@ function app() {
                 queued: 'bg-gray-700 text-gray-300',
                 failed: 'bg-red-900 text-red-300',
                 skipped: 'bg-gray-700 text-gray-400',
+                'needs-auth': 'bg-yellow-900 text-yellow-300',
             };
             return classes[status] || 'bg-gray-700 text-gray-300';
         },
 
+        formatSpeed(mbps) {
+            if (!mbps || mbps <= 0) return '0 MB/s';
+            if (mbps >= 1024) return `${(mbps / 1024).toFixed(1)} GB/s`;
+            if (mbps >= 100) return `${Math.round(mbps)} MB/s`;
+            if (mbps >= 10) return `${mbps.toFixed(0)} MB/s`;
+            return `${mbps.toFixed(1)} MB/s`;
+        },
+
+        formatEta(seconds) {
+            if (!seconds || seconds <= 0) return '';
+            if (seconds < 60) return `${seconds}s`;
+            if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+            const h = Math.floor(seconds / 3600);
+            const m = Math.round((seconds % 3600) / 60);
+            return m > 0 ? `${h}h ${m}m` : `${h}h`;
+        },
+
+        formatGB(gb) {
+            if (!gb || gb <= 0) return '0';
+            if (gb >= 1000) return `${(gb / 1000).toFixed(1)}T`;
+            if (gb >= 100) return `${Math.round(gb)}G`;
+            if (gb >= 10) return `${Math.round(gb)}G`;
+            return `${gb.toFixed(1)}G`;
+        },
+
         formatSize(t) {
-            const fmt = (gb) => {
-                if (gb >= 1000) return `${(gb/1000).toFixed(1)}T`;
-                if (gb >= 10) return `${Math.round(gb)}G`;
-                if (gb > 0) return `${gb.toFixed(1)}G`;
-                return '0';
-            };
-            const dl = t.downloaded_gb || 0;
-            const total = t.size_gb || 0;
-            if (t.status === 'done') {
-                if (dl > 0) return fmt(dl);
-                if (total > 0) return fmt(total);
-                return 'done';
-            }
-            if (dl > 0 && total > 0) {
-                if (dl > total) return fmt(dl);
-                return `${fmt(dl)}/${fmt(total)}`;
-            }
-            if (dl > 0) return `${fmt(dl)}/?`;
-            if (total > 0) return `0/${fmt(total)}`;
+            if (t.status === 'done') return t.downloaded_gb > 0 ? this.formatGB(t.downloaded_gb) : (t.size_gb > 0 ? this.formatGB(t.size_gb) : '-');
+            if (t.size_gb > 0) return `${this.formatGB(t.downloaded_gb || 0)}/${this.formatGB(t.size_gb)}`;
+            if (t.downloaded_gb > 0) return `${this.formatGB(t.downloaded_gb)}/?`;
             return '-';
         },
 
-        taskProgress(t) {
-            if (t.status === 'done') return 100;
-            const dl = t.downloaded_gb || 0;
-            const total = t.size_gb || 0;
-            if (total <= 0) return 0;
-            if (dl >= total) return 100;
-            return Math.round((dl / total) * 100);
-        },
-
-        extractRepo(cmdLine) {
-            const parts = cmdLine.split(/\s+/);
-            for (let i = 0; i < parts.length; i++) {
-                if (parts[i].endsWith('download.sh') || parts[i].endsWith('download-modelscope.sh')) {
-                    return parts[i + 1] || cmdLine.slice(0, 40);
-                }
+        formatAlert(al) {
+            if (!al || !al.type) return '';
+            if (al.type === 'worker_offline') {
+                const dur = al.duration_min || 0;
+                const time = dur >= 60 ? `${Math.floor(dur / 60)}h ${dur % 60}m` : `${dur}m`;
+                return `${al.server || '?'} offline for ${time}`;
             }
-            return cmdLine.slice(0, 40);
-        },
-
-        getSpeed(serverKey) {
-            return (this.dashboard.speeds || {})[serverKey] || 0;
-        },
-
-        getTaskSpeed(task) {
-            if (task.status !== 'downloading') return 0;
-            return (this.dashboard.task_speeds || {})[task.repo_id] || 0;
-        },
-
-        formatSpeed(mbps) {
-            if (mbps <= 0) return '';
-            if (mbps >= 1024) return `${(mbps/1024).toFixed(1)} GB/s`;
-            if (mbps >= 1) return `${mbps.toFixed(1)} MB/s`;
-            return `${(mbps*1024).toFixed(0)} KB/s`;
+            if (al.type === 'task_failed_repeat') {
+                return `${al.task || '?'} failed ${al.count || 0}x${al.error ? ` (${al.error})` : ''}`;
+            }
+            if (al.type === 'disk_low') {
+                return `${al.server || '?'} disk low: ${al.free_gb || 0}G free`;
+            }
+            return al.type;
         },
 
         timeAgo(isoStr) {
             if (!isoStr) return '';
             const diff = (Date.now() - new Date(isoStr).getTime()) / 1000;
             if (diff < 60) return 'just now';
-            if (diff < 3600) return `${Math.round(diff/60)}m ago`;
-            if (diff < 86400) return `${Math.round(diff/3600)}h ago`;
-            return `${Math.round(diff/86400)}d ago`;
-        },
-
-        async toggleServer(key) {
-            if (this.expandedServer === key) {
-                this.expandedServer = '';
-                return;
-            }
-            this.expandedServer = key;
-            await this.fetchQueue(key);
-        },
-
-        async fetchQueue(key) {
-            try {
-                const res = await fetch(`/api/servers/${key}/queue`);
-                const data = await res.json();
-                this.serverQueues[key] = data.queue || [];
-                this.originalQueues[key] = JSON.parse(JSON.stringify(data.queue || []));
-                this.queueDirty[key] = false;
-            } catch (e) {
-                this.serverQueues[key] = [];
-                console.error('Queue fetch error:', e);
-            }
-        },
-
-        initSortable(el, key) {
-            if (this.sortableInstances[key]) {
-                this.sortableInstances[key].destroy();
-            }
-            const self = this;
-            this.sortableInstances[key] = new Sortable(el, {
-                handle: '.drag-handle',
-                animation: 150,
-                ghostClass: 'opacity-30',
-                chosenClass: 'border-blue-500',
-                onEnd() {
-                    const items = el.querySelectorAll('[data-line]');
-                    const newOrder = Array.from(items).map(item => item.dataset.line);
-                    self.serverQueues[key] = newOrder.map(line => {
-                        return self.serverQueues[key].find(q => q.line === line) || {line, repo_id: '', display: line.slice(0, 40)};
-                    });
-                    self.queueDirty[key] = true;
-                },
-            });
-        },
-
-        async saveQueueOrder(key) {
-            const lines = (this.serverQueues[key] || []).map(q => q.line);
-            try {
-                const res = await fetch(`/api/servers/${key}/queue`, {
-                    method: 'PUT',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ order: lines })
-                });
-                if (res.ok) {
-                    const data = await res.json();
-                    this.serverQueues[key] = data.queue || [];
-                    this.originalQueues[key] = JSON.parse(JSON.stringify(data.queue || []));
-                    this.queueDirty[key] = false;
-                    this.showToast('Queue reordered', 'success');
-                } else {
-                    const data = await res.json();
-                    this.showToast(data.detail || 'Reorder failed', 'error');
-                }
-            } catch (e) {
-                this.showToast('Reorder failed', 'error');
-            }
-        },
-
-        cancelQueueReorder(key) {
-            this.serverQueues[key] = JSON.parse(JSON.stringify(this.originalQueues[key] || []));
-            this.queueDirty[key] = false;
+            if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+            if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+            return `${Math.round(diff / 86400)}d ago`;
         },
 
         showToast(message, type = 'success') {

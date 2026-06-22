@@ -2,14 +2,14 @@
 
 from fastapi import APIRouter
 
+from . import run_blocking
+
 router = APIRouter(tags=["actions"])
 
 
 @router.post("/sync")
 async def trigger_sync():
     """Manually trigger a sync cycle (normally runs every 60s in background)."""
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
     from ..scheduler import _load_state_fresh, _run_sync, _build_dashboard, _build_server_status
     from ..cache import cache
     from dataclasses import asdict
@@ -35,17 +35,12 @@ async def trigger_sync():
         })
         return {"changes": changes}
 
-    return await asyncio.get_event_loop().run_in_executor(
-        ThreadPoolExecutor(max_workers=1), _do
-    )
+    return await run_blocking(_do)
 
 
 @router.post("/dispatch")
 async def dispatch_queued():
     """Dispatch all queued tasks to servers."""
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
-
     def _do():
         from ...core.state import StateManager
         from ...core.parser import build_download_cmd
@@ -83,6 +78,4 @@ async def dispatch_queued():
             mgr.save(state)
         return {"dispatched": dispatched, "count": len(dispatched)}
 
-    return await asyncio.get_event_loop().run_in_executor(
-        ThreadPoolExecutor(max_workers=1), _do
-    )
+    return await run_blocking(_do)

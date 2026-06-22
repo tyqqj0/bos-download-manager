@@ -156,9 +156,13 @@ def _generate_key():
     if key_path.exists():
         return
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", ""],
-            capture_output=True, timeout=10,
+            capture_output=True, text=True, timeout=10,
         )
-    except Exception:
-        pass
+        if result.returncode != 0:
+            click.echo(f"  ssh-keygen 失败: {result.stderr.strip()}")
+    except FileNotFoundError:
+        click.echo("  ssh-keygen 未找到，请手动生成 SSH 密钥")
+    except Exception as e:
+        click.echo(f"  SSH 密钥生成失败: {e}")

@@ -40,6 +40,14 @@ class Task:
     retry_count: int = 0
     error: Optional[str] = None
     notes: str = ""
+    # Worker-reported fields
+    worker_pid: Optional[int] = None
+    worker_heartbeat: Optional[str] = None
+    progress_pct: float = 0.0
+    speed_mbps: float = 0.0
+    eta_seconds: Optional[int] = None
+    phase: Optional[str] = None
+    error_class: Optional[str] = None
 
     def __post_init__(self):
         if not self.created_at:
@@ -56,6 +64,7 @@ class State:
     servers: dict = field(default_factory=dict)
     tasks: list = field(default_factory=list)
     categories: list = field(default_factory=list)
+    worker_heartbeats: dict = field(default_factory=dict)
 
     def find_task(self, repo_id: str) -> Optional[Task]:
         for t in self.tasks:
@@ -94,6 +103,7 @@ class State:
             "servers": {k: asdict(v) if isinstance(v, Server) else v for k, v in self.servers.items()},
             "tasks": [asdict(t) if isinstance(t, Task) else t for t in self.tasks],
             "categories": self.categories,
+            "worker_heartbeats": self.worker_heartbeats,
         }
 
     @classmethod
@@ -101,17 +111,20 @@ class State:
         state = cls()
         state.meta = data.get("meta", state.meta)
         state.categories = data.get("categories", [])
+        state.worker_heartbeats = data.get("worker_heartbeats", {})
         for k, v in data.get("servers", {}).items():
             if isinstance(v, Server):
                 state.servers[k] = v
             else:
                 v.pop("key", None)
                 state.servers[k] = Server(key=k, **v)
+        _task_fields = {f.name for f in Task.__dataclass_fields__.values()}
         for t in data.get("tasks", []):
             if isinstance(t, Task):
                 state.tasks.append(t)
             else:
-                state.tasks.append(Task(**t))
+                filtered = {k: v for k, v in t.items() if k in _task_fields}
+                state.tasks.append(Task(**filtered))
         return state
 
 

@@ -1,138 +1,176 @@
-"""dlm status — Real-time status of all servers (parallel SSH)."""
+"""dlm status — Cluster status from heartbeats (no SSH)."""
 
 import click
-import time
+from datetime import datetime, timezone
 
 from ..core.state import StateManager
-from ..core.servers import load_servers
-from ..core.models import Server
-from ..core.ssh import ssh_parallel
 
 
 @click.command("status")
-@click.option("--watch", is_flag=True, help="每 15 秒自动刷新")
-@click.option("--server", "server_filter", default=None, help="只看指定服务器")
-def status_cmd(watch, server_filter):
-    """显示所有服务器实时状态。"""
-    if watch:
-        try:
-            while True:
-                click.clear()
-                _show_status(server_filter)
-                click.echo(f"\n[每 15 秒刷新，Ctrl+C 退出]")
-                time.sleep(15)
-        except KeyboardInterrupt:
-            pass
-    else:
-        _show_status(server_filter)
+@click.option("--json", "as_json", is_flag=True, help="JSON 输出")
+def status_cmd(as_json):
+    """显示所有 Worker 实时状态（从心跳读取，秒级响应）。"""
+    mgr = StateManager.create()
+    state = mgr.load(use_cache=False)
 
+    heartbeats = state.worker_heartbeats
+    downloading = [t for t in state.tasks if t.status == "downloading"]
 
-def _show_status(server_filter=None):
-    # Load server config from yaml
-    server_cfgs = load_servers()
-    if server_filter:
-        server_cfgs = {k: v for k, v in server_cfgs.items() if k == server_filter}
-
-    if not server_cfgs:
-        click.echo("无注册服务器。使用 'dlm init' 或 'dlm server add' 配置。")
+    if as_json:
+        import json
+        data = {
+            "heartbeats": heartbeats,
+            "downloading": [
+                {"id": t.id, "server": t.server, "name": t.name,
+                 "progress_pct": t.progress_pct, "speed_mbps": t.speed_mbps,
+                 "eta_seconds": t.eta_seconds, "phase": t.phase}
+                for t in downloading
+            ],
+        }
+        click.echo(json.dumps(data, ensure_ascii=False, indent=2))
         return
 
-    # Build Server models
-    srv_models = [
-        Server(key=k, host=c.host, user=c.user, path=c.path, enabled=c.enabled)
-        for k, c in server_cfgs.items() if c.enabled and not c.local
-    ]
+    now = datetime.now(timezone.utc)
 
-    # Parallel SSH: get worker status + current task + queue depth in one command
-    status_cmd_str = (
-        "tmux has-session -t worker 2>/dev/null && echo WORKER_ALIVE || echo WORKER_DEAD; "
-        "cat ~/code/auwomo-tools/current.txt 2>/dev/null || echo ''; "
-        "echo '---QUEUE---'; "
-        "wc -l < ~/code/auwomo-tools/queue.txt 2>/dev/null || echo 0"
-    )
-    results = ssh_parallel(srv_models, status_cmd_str, timeout=10) if srv_models else {}
+    click.echo("═" * 58)
+    click.echo("  DLM Cluster Status")
+    click.echo("═" * 58)
 
-    # Load state for task summary
-    try:
-        mgr = StateManager.create()
-        state = mgr.load()
-    except Exception:
-        state = None
+    if not heartbeats:
+        click.echo("\n  无 Worker 心跳。daemon 可能未启动。")
+        click.echo("  启动: ssh <server> 'python3 -m dlm.worker --server-key <key>'")
+        _print_summary(state)
+        return
 
-    click.echo("═" * 60)
-    click.echo("  DLM 服务器状态")
-    click.echo("═" * 60)
+    for key in sorted(heartbeats.keys()):
+        hb = heartbeats[key]
+        alive_at = hb.get("alive_at", "")
+        pid = hb.get("pid", "?")
+        disk_gb = hb.get("disk_free_gb", 0)
+        current_task = hb.get("current_task")
 
-    for key, cfg in server_cfgs.items():
-        if not cfg.enabled:
-            click.echo(f"\n  {key} ({cfg.host}) — DISABLED")
-            continue
+        # Determine alive status
+        icon, status_text = _alive_status(alive_at, now)
 
-        if cfg.local:
-            click.echo(f"\n  ● {key} ({cfg.host}) — 本机 (master)")
-            continue
+        click.echo(f"\n  {icon} {key} — {status_text}  (pid={pid}, disk={disk_gb:.0f}GB free)")
 
-        out, ok = results.get(key, ("", False))
-        if not ok:
-            click.echo(f"\n  ✗ {key} ({cfg.host}) — 连接失败")
-            continue
+        # Show current task with progress
+        task_info = next((t for t in downloading if t.server == key), None)
+        if task_info:
+            name = task_info.name[:30]
+            pct = task_info.progress_pct
+            speed = task_info.speed_mbps
+            eta = task_info.eta_seconds
+            phase = task_info.phase or "downloading"
 
-        lines = out.split("\n")
-        alive = "WORKER_ALIVE" in lines[0] if lines else False
-        status_icon = "●" if alive else "○"
-        worker_status = "运行中" if alive else "已停止"
+            progress_bar = _bar(min(pct, 100))
+            speed_str = f"{speed:.1f} MB/s" if speed > 0 else ""
+            eta_str = _format_eta(eta) if eta else ""
 
-        # Parse current task
-        current = ""
-        queue_depth = 0
-        in_queue_section = False
-        for line in lines[1:]:
-            if "---QUEUE---" in line:
-                in_queue_section = True
-                continue
-            if in_queue_section:
-                try:
-                    queue_depth = int(line.strip())
-                except ValueError:
-                    pass
+            click.echo(f"    ↓ {name}")
+            if phase == "moving":
+                click.echo(f"      上传到 BOS 中...  {speed_str}")
             else:
-                if line.strip():
-                    current = line.strip()
-
-        click.echo(f"\n  {status_icon} {key} ({cfg.host}) — Worker {worker_status}")
-
-        if current:
-            repo = _extract_repo_name(current)
-            click.echo(f"    当前: {repo}")
+                click.echo(f"      {progress_bar} {pct:.0f}%  {speed_str}  {eta_str}")
+                if phase and phase not in ("downloading", "starting"):
+                    click.echo(f"      阶段: {phase}")
+        elif current_task:
+            click.echo(f"    任务: {current_task} (等待状态更新)")
         else:
-            click.echo(f"    当前: 空闲")
+            click.echo(f"    空闲")
 
-        click.echo(f"    队列: {queue_depth} 个待执行")
-
-        # Tasks from state
-        if state:
-            active = state.active_tasks_for_server(key)
-            if active:
-                names = ', '.join(t.name for t in active[:3])
-                suffix = '...' if len(active) > 3 else ''
-                click.echo(f"    分配: {len(active)} 个 ({names}{suffix})")
-
-    # Overall summary
-    if state:
-        click.echo(f"\n{'─' * 60}")
-        total = len(state.tasks)
-        by_status = {}
-        for t in state.tasks:
-            by_status[t.status] = by_status.get(t.status, 0) + 1
-        parts = [f"{v} {k}" for k, v in sorted(by_status.items())]
-        click.echo(f"  总计 {total} 个任务: {', '.join(parts)}")
+    _print_summary(state)
 
 
-def _extract_repo_name(cmd_line: str) -> str:
-    """Extract a readable repo name from a download command."""
-    parts = cmd_line.split()
-    for i, p in enumerate(parts):
-        if p.endswith("download.sh") or p.endswith("download-modelscope.sh"):
-            if i + 1 < len(parts):
-                return parts[i + 1]
-    return cmd_line[:60]
+def _alive_status(alive_at: str, now: datetime) -> tuple:
+    """Return (icon, text) based on heartbeat age."""
+    if not alive_at:
+        return "○", "未知"
+    try:
+        ts = datetime.fromisoformat(alive_at)
+        age_s = (now - ts).total_seconds()
+    except (ValueError, TypeError):
+        return "○", "未知"
+
+    if age_s < 180:
+        return "●", f"活跃 ({int(age_s)}s ago)"
+    elif age_s < 300:
+        return "◐", f"延迟 ({int(age_s)}s ago)"
+    else:
+        mins = int(age_s / 60)
+        return "○", f"离线 ({mins}min ago)"
+
+
+def _bar(pct: float, width: int = 20) -> str:
+    """Simple progress bar."""
+    pct = min(max(pct, 0), 100)
+    filled = int(width * pct / 100)
+    return f"[{'█' * filled}{'░' * (width - filled)}]"
+
+
+def _format_eta(seconds: int) -> str:
+    if seconds is None or seconds <= 0:
+        return ""
+    if seconds < 60:
+        return f"ETA {seconds}s"
+    if seconds < 3600:
+        return f"ETA {seconds // 60}min"
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    return f"ETA {hours}h{mins}m"
+
+
+def _print_summary(state):
+    """Print task count summary."""
+    click.echo(f"\n{'─' * 58}")
+    by_status = {}
+    for t in state.tasks:
+        by_status[t.status] = by_status.get(t.status, 0) + 1
+    parts = [f"{v} {k}" for k, v in sorted(by_status.items(), key=lambda x: x[1], reverse=True)]
+    click.echo(f"  {len(state.tasks)} 个任务: {', '.join(parts)}")
+
+    # Alerts
+    now = datetime.now(timezone.utc)
+    alerts = _check_alerts(state, now)
+    if alerts:
+        click.echo(f"\n{'─' * 58}")
+        click.echo("  告警:")
+        for a in alerts:
+            click.echo(a)
+
+
+def _check_alerts(state, now):
+    """Detect conditions that need attention."""
+    alerts = []
+    heartbeats = state.worker_heartbeats
+
+    for key in sorted(heartbeats.keys()):
+        hb = heartbeats[key]
+        disk = hb.get("disk_free_gb", 999)
+        if disk < 5:
+            alerts.append(f"    !! {key}: 磁盘将满 ({disk:.0f}GB free)")
+        alive_at = hb.get("alive_at", "")
+        if alive_at:
+            try:
+                age = (now - datetime.fromisoformat(alive_at)).total_seconds()
+                if age > 300:
+                    alerts.append(f"    !! {key}: 离线 ({age/60:.0f}min 未响应)")
+            except (ValueError, TypeError):
+                pass
+
+    for t in state.tasks:
+        if t.status == "downloading" and t.worker_heartbeat:
+            try:
+                hb_age = (now - datetime.fromisoformat(t.worker_heartbeat)).total_seconds()
+                if hb_age > 3600:
+                    alerts.append(
+                        f"    !! {t.server}: {t.name[:20]} 可能卡住 ({hb_age/3600:.0f}h 无更新)"
+                    )
+            except (ValueError, TypeError):
+                pass
+
+    failed = [t for t in state.tasks if t.status == "failed"]
+    if failed:
+        alerts.append(f"    !! {len(failed)} 个任务失败")
+
+    return alerts

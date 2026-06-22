@@ -5,318 +5,446 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DLM Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.6/Sortable.min.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
     <style>
         [x-cloak] { display: none !important; }
         .progress-bar { transition: width 0.5s ease; }
-        .drag-handle { cursor: grab; }
-        .drag-handle:active { cursor: grabbing; }
+        .gradient-bar { background: linear-gradient(90deg, #3b82f6, #10b981); }
     </style>
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen" x-data="app()" x-init="init()">
 
 <!-- Top Nav -->
-<nav class="bg-gray-800 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-4">
-        <h1 class="text-xl font-bold text-white">DLM Dashboard</h1>
-        <span class="text-xs text-gray-400" x-text="lastSync"></span>
+<nav class="bg-gray-800 border-b border-gray-700 px-6 py-2.5 flex items-center justify-between">
+    <div class="flex items-center gap-6">
+        <h1 class="text-lg font-bold text-white">DLM</h1>
+        <div class="flex gap-1">
+            <button @click="view = 'dashboard'" :class="view === 'dashboard' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'" class="px-3 py-1.5 rounded text-sm font-medium">
+                Dashboard
+            </button>
+            <button @click="view = 'tasks'" :class="view === 'tasks' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'" class="px-3 py-1.5 rounded text-sm font-medium">
+                Tasks
+            </button>
+            <button @click="view = 'servers'" :class="view === 'servers' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'" class="px-3 py-1.5 rounded text-sm font-medium">
+                Servers
+            </button>
+        </div>
     </div>
-    <div class="flex items-center gap-2">
-        <button @click="triggerSync()" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium">
+    <div class="flex items-center gap-3">
+        <span class="text-xs text-gray-500" x-text="lastSync"></span>
+        <button @click="runDoctor()" class="px-3 py-1.5 bg-yellow-700 hover:bg-yellow-600 rounded text-sm" title="Health Check">
+            Doctor
+        </button>
+        <button @click="triggerSync()" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">
             Sync
         </button>
-        <button @click="showAddModal = true" class="px-3 py-1.5 bg-green-600 hover:bg-green-700 rounded text-sm font-medium">
+        <button @click="showAddModal = true" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium">
             + Add
         </button>
     </div>
 </nav>
 
-<div class="flex">
-    <!-- Sidebar -->
-    <aside class="w-48 bg-gray-800 border-r border-gray-700 min-h-[calc(100vh-52px)] p-4">
-        <nav class="space-y-1">
-            <button @click="view = 'dashboard'" :class="view === 'dashboard' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'" class="w-full text-left px-3 py-2 rounded text-sm">
-                Dashboard
-            </button>
-            <button @click="view = 'tasks'" :class="view === 'tasks' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'" class="w-full text-left px-3 py-2 rounded text-sm">
-                Tasks
-            </button>
-            <button @click="view = 'servers'" :class="view === 'servers' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'" class="w-full text-left px-3 py-2 rounded text-sm">
-                Servers
-            </button>
-        </nav>
-    </aside>
+<!-- Main Content -->
+<main class="max-w-7xl mx-auto px-4 py-4">
 
-    <!-- Main Content -->
-    <main class="flex-1 p-6">
+    <!-- ==================== DASHBOARD VIEW ==================== -->
+    <div x-show="view === 'dashboard'" x-cloak>
 
-        <!-- Dashboard View -->
-        <div x-show="view === 'dashboard'" x-cloak>
-            <!-- Progress Bar -->
-            <div class="bg-gray-800 rounded-lg p-4 mb-6">
-                <div class="flex justify-between mb-2">
-                    <span class="text-sm text-gray-400">Total Progress</span>
-                    <span class="text-sm font-mono" x-text="`${dashboard.total_downloaded_tb || 0} TB / ${dashboard.total_estimated_tb || 0} TB`"></span>
+        <!-- Overview Strip -->
+        <div class="bg-gray-800 rounded-lg p-4 mb-4">
+            <div class="flex items-center gap-6">
+                <!-- Progress -->
+                <div class="flex-1">
+                    <div class="flex items-center gap-3 mb-1.5">
+                        <span class="text-sm font-mono text-gray-200" x-text="`${dashboard.total_downloaded_tb || 0} / ${dashboard.total_estimated_tb || 0} TB`"></span>
+                        <span class="text-xs text-gray-500" x-text="`${progressPct}%`"></span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-2.5">
+                        <div class="gradient-bar h-2.5 rounded-full progress-bar" :style="`width: ${progressPct}%`"></div>
+                    </div>
                 </div>
-                <div class="w-full bg-gray-700 rounded-full h-4">
-                    <div class="bg-blue-500 h-4 rounded-full progress-bar" :style="`width: ${progressPct}%`"></div>
-                </div>
-                <div class="flex justify-between mt-2 text-xs text-gray-500">
-                    <span x-text="`${dashboard.total_tasks || 0} tasks total`"></span>
-                    <span x-text="`${progressPct}%`"></span>
+                <!-- Speed -->
+                <div class="text-right pl-4 border-l border-gray-700">
+                    <div class="text-lg font-bold text-blue-400" x-text="formatSpeed(dashboard.aggregate_speed_mbps || 0)"></div>
+                    <div class="text-xs text-gray-500">total speed</div>
                 </div>
             </div>
-
-            <!-- Status Summary -->
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-                <div class="bg-gray-800 rounded-lg p-4">
-                    <div class="text-2xl font-bold text-green-400" x-text="dashboard.by_status?.done || 0"></div>
-                    <div class="text-xs text-gray-400">Done</div>
-                </div>
-                <div class="bg-gray-800 rounded-lg p-4">
-                    <div class="text-2xl font-bold text-blue-400" x-text="dashboard.by_status?.downloading || 0"></div>
-                    <div class="text-xs text-gray-400">Downloading</div>
-                </div>
-                <div class="bg-gray-800 rounded-lg p-4">
-                    <div class="text-2xl font-bold text-yellow-400" x-text="(dashboard.by_status?.queued || 0) + (dashboard.by_status?.dispatched || 0)"></div>
-                    <div class="text-xs text-gray-400">Queued</div>
-                </div>
-                <div class="bg-gray-800 rounded-lg p-4">
-                    <div class="text-2xl font-bold text-red-400" x-text="dashboard.by_status?.failed || 0"></div>
-                    <div class="text-xs text-gray-400">Failed</div>
-                </div>
+            <!-- Status pills -->
+            <div class="flex items-center gap-3 mt-3">
+                <span class="inline-flex items-center gap-1 text-xs">
+                    <span class="w-2 h-2 rounded-full bg-green-400"></span>
+                    <span class="text-gray-300" x-text="`${dashboard.by_status?.done || 0} done`"></span>
+                </span>
+                <span class="inline-flex items-center gap-1 text-xs">
+                    <span class="w-2 h-2 rounded-full bg-blue-400"></span>
+                    <span class="text-gray-300" x-text="`${dashboard.by_status?.downloading || 0} active`"></span>
+                </span>
+                <span class="inline-flex items-center gap-1 text-xs">
+                    <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
+                    <span class="text-gray-300" x-text="`${dashboard.by_status?.dispatched || 0} dispatched`"></span>
+                </span>
+                <span class="inline-flex items-center gap-1 text-xs">
+                    <span class="w-2 h-2 rounded-full bg-yellow-400"></span>
+                    <span class="text-gray-300" x-text="`${dashboard.by_status?.queued || 0} queued`"></span>
+                </span>
+                <span class="inline-flex items-center gap-1 text-xs">
+                    <span class="w-2 h-2 rounded-full bg-red-400"></span>
+                    <span class="text-gray-300" x-text="`${dashboard.by_status?.failed || 0} failed`"></span>
+                </span>
             </div>
+        </div>
 
-            <!-- Server Cards -->
-            <h3 class="text-sm font-medium text-gray-400 mb-3">Servers</h3>
-            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
-                <template x-for="(srv, key) in (dashboard.servers || {})" :key="key">
-                    <div class="bg-gray-800 rounded-lg p-3 cursor-pointer hover:bg-gray-750 border border-gray-700"
-                         :class="srv.worker_alive ? 'border-green-800' : 'border-red-800'"
-                         @click="view = 'servers'; selectedServer = key">
-                        <div class="flex items-center gap-2 mb-1">
-                            <span class="w-2 h-2 rounded-full" :class="srv.worker_alive ? 'bg-green-400' : 'bg-red-400'"></span>
-                            <span class="font-medium text-sm" x-text="key"></span>
-                            <span class="text-xs text-cyan-400 ml-auto" x-show="getSpeed(key) > 0" x-text="formatSpeed(getSpeed(key))"></span>
+        <!-- Active Downloads (Hero) -->
+        <div class="mb-4">
+            <h3 class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Active Downloads</h3>
+            <div class="space-y-2" x-show="(dashboard.active_downloads || []).length > 0">
+                <template x-for="dl in (dashboard.active_downloads || [])" :key="dl.id">
+                    <div class="bg-gray-800 rounded-lg p-3 border border-gray-700 border-l-4 border-l-blue-500">
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="flex items-center gap-3">
+                                <span class="text-xs font-mono bg-gray-700 px-1.5 py-0.5 rounded text-gray-300" x-text="dl.server || '?'"></span>
+                                <span class="font-medium text-sm text-gray-100" x-text="dl.name"></span>
+                                <span class="text-xs text-gray-500 bg-gray-700/50 px-1.5 py-0.5 rounded" x-text="dl.phase || 'downloading'" x-show="dl.phase"></span>
+                            </div>
+                            <div class="flex items-center gap-4 text-xs">
+                                <span class="font-mono text-blue-300" x-text="formatSpeed(dl.speed_mbps)"></span>
+                                <span class="text-gray-400" x-text="dl.eta_seconds ? `ETA ${formatEta(dl.eta_seconds)}` : ''"></span>
+                            </div>
                         </div>
-                        <div class="text-xs text-gray-400 truncate" x-text="srv.current_task ? extractRepo(srv.current_task) : (srv.active_tasks?.length ? 'working...' : 'idle')"></div>
-                        <div class="text-xs text-gray-500" x-text="`${srv.active_tasks?.length || 0} tasks`"></div>
+                        <div class="flex items-center gap-3">
+                            <div class="flex-1 bg-gray-700 rounded-full h-2">
+                                <div class="gradient-bar h-2 rounded-full progress-bar" :style="`width: ${Math.min(100, dl.progress_pct || 0)}%`"></div>
+                            </div>
+                            <span class="text-xs font-mono text-gray-400 w-28 text-right" x-text="`${formatGB(dl.downloaded_gb)} / ${formatGB(dl.size_gb)}`"></span>
+                            <span class="text-xs font-mono text-gray-300 w-10 text-right" x-text="`${Math.round(dl.progress_pct || 0)}%`"></span>
+                        </div>
                     </div>
                 </template>
             </div>
+            <div x-show="(dashboard.active_downloads || []).length === 0" class="bg-gray-800 rounded-lg p-6 text-center text-gray-500 text-sm">
+                No active downloads
+            </div>
+        </div>
 
-            <!-- Recent Activity -->
-            <h3 class="text-sm font-medium text-gray-400 mb-3">Recent Activity</h3>
-            <div class="bg-gray-800 rounded-lg divide-y divide-gray-700">
-                <template x-for="t in (dashboard.recent_activity || [])" :key="t.id">
-                    <div class="px-4 py-2 flex items-center gap-3">
-                        <span class="text-sm" :class="t.status === 'done' ? 'text-green-400' : 'text-red-400'" x-text="t.status === 'done' ? '&#10003;' : '&#10007;'"></span>
-                        <span class="text-sm flex-1" x-text="t.name"></span>
-                        <span class="text-xs text-gray-500" x-text="t.server || '-'"></span>
-                        <span class="text-xs text-gray-500" x-text="timeAgo(t.completed_at)"></span>
+        <!-- Workers (compact chips) -->
+        <div class="mb-4">
+            <h3 class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Workers</h3>
+            <div class="bg-gray-800 rounded-lg p-3 flex flex-wrap gap-3">
+                <template x-for="w in workersOnly" :key="w.key">
+                    <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-md cursor-pointer hover:bg-gray-600"
+                         :class="w.worker_alive ? 'bg-gray-700' : 'bg-red-900/30'"
+                         @click="view = 'servers'">
+                        <span class="w-2 h-2 rounded-full" :class="w.worker_alive ? 'bg-green-400' : 'bg-red-400'"></span>
+                        <span class="text-sm font-medium" x-text="w.key"></span>
+                        <span class="text-xs text-gray-400" x-text="w.worker_alive ? `${w.disk_free_gb || 0}G free` : 'offline'"></span>
                     </div>
                 </template>
             </div>
         </div>
 
-        <!-- Tasks View -->
-        <div x-show="view === 'tasks'" x-cloak>
-            <!-- Filters -->
-            <div class="flex flex-wrap gap-3 mb-4 items-center">
-                <select x-model="filters.status" class="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm">
-                    <option value="">All Status</option>
-                    <option value="downloading">Downloading</option>
-                    <option value="dispatched">Dispatched</option>
-                    <option value="queued">Queued</option>
-                    <option value="failed">Failed</option>
-                    <option value="done">Done</option>
-                </select>
-                <select x-model="filters.server" class="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm">
-                    <option value="">All Servers</option>
-                    <template x-for="key in serverKeys" :key="key">
-                        <option :value="key" x-text="key"></option>
+        <!-- Alerts & Queue -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- Alerts -->
+            <div>
+                <h3 class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Alerts</h3>
+                <div class="bg-gray-800 rounded-lg p-3 space-y-1.5 min-h-[60px]">
+                    <template x-for="(al, i) in (dashboard.alerts || [])" :key="i">
+                        <div class="flex items-center gap-2 text-xs">
+                            <span class="text-yellow-400" x-show="al.type === 'worker_offline' || al.type === 'disk_low'">&#9888;</span>
+                            <span class="text-red-400" x-show="al.type === 'task_failed_repeat'">&#10007;</span>
+                            <span class="text-gray-300" x-text="formatAlert(al)"></span>
+                        </div>
                     </template>
-                </select>
-                <select x-model="filters.category" class="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm">
-                    <option value="">All Categories</option>
-                    <template x-for="c in categories" :key="c">
-                        <option :value="c" x-text="c"></option>
-                    </template>
-                </select>
-                <input x-model="filters.search" type="text" placeholder="Search..."
-                       class="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm w-48">
-                <span class="text-xs text-gray-500 ml-auto" x-text="`${filteredTasks.length} tasks`"></span>
+                    <div x-show="!(dashboard.alerts || []).length" class="text-xs text-gray-600">No alerts</div>
+                </div>
             </div>
+            <!-- Queue -->
+            <div>
+                <h3 class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Next in Queue</h3>
+                <div class="bg-gray-800 rounded-lg p-3 space-y-1.5 min-h-[60px]">
+                    <template x-for="(q, i) in (dashboard.queue_next || [])" :key="i">
+                        <div class="flex items-center gap-2 text-xs">
+                            <span class="text-gray-500" x-text="`${i + 1}.`"></span>
+                            <span class="text-gray-300 flex-1 truncate" x-text="q.name"></span>
+                            <span class="text-gray-500" x-text="q.server || 'auto'"></span>
+                            <span class="text-gray-500" x-text="q.size_gb ? formatGB(q.size_gb) : ''"></span>
+                        </div>
+                    </template>
+                    <div x-show="!(dashboard.queue_next || []).length" class="text-xs text-gray-600">Queue empty</div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-            <!-- Task Table -->
-            <div class="bg-gray-800 rounded-lg overflow-hidden">
-                <table class="w-full text-sm">
-                    <thead class="bg-gray-750 text-gray-400 text-xs uppercase">
-                        <tr>
-                            <th class="px-4 py-2 text-left w-8"><input type="checkbox" x-model="selectAll" @change="toggleSelectAll()"></th>
-                            <th class="px-4 py-2 text-left cursor-pointer" @click="toggleSort('name')">Name</th>
-                            <th class="px-4 py-2 text-left cursor-pointer" @click="toggleSort('status')">Status</th>
-                            <th class="px-4 py-2 text-left cursor-pointer" @click="toggleSort('server')">Server</th>
-                            <th class="px-4 py-2 text-left cursor-pointer" @click="toggleSort('size')">Progress</th>
-                            <th class="px-4 py-2 text-left">Category</th>
-                            <th class="px-4 py-2 text-left">Actions</th>
+    <!-- ==================== TASKS VIEW ==================== -->
+    <div x-show="view === 'tasks'" x-cloak>
+        <!-- Filters -->
+        <div class="flex flex-wrap gap-3 mb-4 items-center">
+            <select x-model="filters.status" class="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm">
+                <option value="">All Status</option>
+                <option value="downloading">Downloading</option>
+                <option value="dispatched">Dispatched</option>
+                <option value="queued">Queued</option>
+                <option value="failed">Failed</option>
+                <option value="done">Done</option>
+                <option value="skipped">Skipped</option>
+                <option value="needs-auth">Needs Auth</option>
+            </select>
+            <select x-model="filters.server" class="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm">
+                <option value="">All Servers</option>
+                <template x-for="key in serverKeys" :key="key">
+                    <option :value="key" x-text="key"></option>
+                </template>
+            </select>
+            <select x-model="filters.category" class="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm">
+                <option value="">All Categories</option>
+                <template x-for="c in categories" :key="c">
+                    <option :value="c" x-text="c"></option>
+                </template>
+            </select>
+            <input x-model="filters.search" type="text" placeholder="Search..."
+                   class="bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm w-48">
+            <span class="text-xs text-gray-500 ml-auto" x-text="`${filteredTasks.length} tasks`"></span>
+        </div>
+
+        <!-- Task Table -->
+        <div class="bg-gray-800 rounded-lg overflow-hidden">
+            <table class="w-full text-sm">
+                <thead class="bg-gray-750 text-gray-400 text-xs uppercase">
+                    <tr>
+                        <th class="px-3 py-2 text-left w-8"><input type="checkbox" x-model="selectAll" @change="toggleSelectAll()"></th>
+                        <th class="px-3 py-2 text-left cursor-pointer" @click="toggleSort('name')">Name</th>
+                        <th class="px-3 py-2 text-left cursor-pointer" @click="toggleSort('status')">Status</th>
+                        <th class="px-3 py-2 text-left cursor-pointer" @click="toggleSort('server')">Server</th>
+                        <th class="px-3 py-2 text-left cursor-pointer" @click="toggleSort('size')">Progress</th>
+                        <th class="px-3 py-2 text-left">Speed</th>
+                        <th class="px-3 py-2 text-left">Category</th>
+                        <th class="px-3 py-2 text-left">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-700">
+                    <template x-for="t in filteredTasks" :key="t.id">
+                        <tr class="hover:bg-gray-750">
+                            <td class="px-3 py-2"><input type="checkbox" :value="t.id" x-model="selectedTasks"></td>
+                            <td class="px-3 py-2">
+                                <div class="font-medium text-sm" x-text="t.name"></div>
+                                <div class="text-xs text-gray-500" x-text="t.repo_id"></div>
+                            </td>
+                            <td class="px-3 py-2">
+                                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium"
+                                      :class="statusClass(t.status)">
+                                    <span x-text="t.status"></span>
+                                </span>
+                            </td>
+                            <td class="px-3 py-2 text-gray-400 text-xs" x-text="t.server || '-'"></td>
+                            <td class="px-3 py-2">
+                                <div class="flex items-center gap-2">
+                                    <div class="w-16 bg-gray-700 rounded-full h-1.5" x-show="t.size_gb > 0">
+                                        <div class="bg-blue-500 h-1.5 rounded-full progress-bar"
+                                             :style="`width: ${Math.min(100, (t.downloaded_gb / t.size_gb) * 100)}%`"></div>
+                                    </div>
+                                    <span class="text-xs text-gray-400" x-text="formatSize(t)"></span>
+                                </div>
+                            </td>
+                            <td class="px-3 py-2">
+                                <span class="text-xs font-mono text-blue-300" x-show="t.status === 'downloading' && t.speed_mbps > 0" x-text="formatSpeed(t.speed_mbps)"></span>
+                                <span class="text-xs text-gray-600" x-show="t.status !== 'downloading' || !t.speed_mbps">-</span>
+                            </td>
+                            <td class="px-3 py-2 text-gray-400 text-xs" x-text="t.category"></td>
+                            <td class="px-3 py-2">
+                                <div class="flex gap-1">
+                                    <button x-show="t.status === 'failed' || t.status === 'queued'"
+                                            @click="retryTask(t.id)" title="Retry"
+                                            class="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">&#8635;</button>
+                                    <button x-show="t.status !== 'done' && t.status !== 'skipped'"
+                                            @click="skipTask(t.id)" title="Skip"
+                                            class="px-2 py-1 bg-gray-600 hover:bg-gray-500 rounded text-xs">&#9209;</button>
+                                    <button x-show="t.status !== 'downloading'"
+                                            @click="confirmDelete(t.id, t.name)" title="Delete"
+                                            class="px-2 py-1 bg-red-700 hover:bg-red-600 rounded text-xs">&#10005;</button>
+                                </div>
+                            </td>
                         </tr>
-                    </thead>
-                    <tbody class="divide-y divide-gray-700">
-                        <template x-for="t in filteredTasks" :key="t.id">
-                            <tr class="hover:bg-gray-750">
-                                <td class="px-4 py-2"><input type="checkbox" :value="t.id" x-model="selectedTasks"></td>
-                                <td class="px-4 py-2">
-                                    <div class="font-medium" x-text="t.name"></div>
-                                    <div class="text-xs text-gray-500" x-text="t.repo_id"></div>
-                                </td>
-                                <td class="px-4 py-2">
-                                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium"
-                                          :class="statusClass(t.status)">
-                                        <span x-text="statusIcon(t.status)"></span>
-                                        <span x-text="t.status"></span>
-                                    </span>
-                                </td>
-                                <td class="px-4 py-2 text-gray-400" x-text="t.server || '-'"></td>
-                                <td class="px-4 py-2">
-                                    <div class="flex items-center gap-2">
-                                        <div class="w-20 bg-gray-700 rounded-full h-2">
-                                            <div class="h-2 rounded-full progress-bar"
-                                                 :class="t.status === 'done' ? 'bg-green-500' : 'bg-blue-500'"
-                                                 :style="`width: ${taskProgress(t)}%`"></div>
-                                        </div>
-                                        <span class="text-xs text-gray-400" x-text="formatSize(t)"></span>
-                                        <span x-show="getTaskSpeed(t) > 0" class="text-xs text-cyan-400" x-text="formatSpeed(getTaskSpeed(t))"></span>
-                                    </div>
-                                </td>
-                                <td class="px-4 py-2 text-gray-400 text-xs" x-text="t.category"></td>
-                                <td class="px-4 py-2">
-                                    <div class="flex gap-1">
-                                        <button x-show="t.status === 'failed' || t.status === 'queued'"
-                                                @click="retryTask(t.id)" title="Retry"
-                                                class="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">&#8635;</button>
-                                        <button x-show="t.status !== 'done' && t.status !== 'skipped'"
-                                                @click="skipTask(t.id)" title="Skip"
-                                                class="px-2 py-1 bg-gray-600 hover:bg-gray-500 rounded text-xs">&#9209;</button>
-                                    </div>
-                                </td>
-                            </tr>
-                        </template>
-                    </tbody>
-                </table>
-            </div>
+                    </template>
+                </tbody>
+            </table>
+        </div>
 
-            <!-- Batch Actions -->
-            <div class="mt-3 flex gap-2" x-show="selectedTasks.length > 0">
-                <span class="text-sm text-gray-400" x-text="`${selectedTasks.length} selected`"></span>
-                <button @click="batchAction('dispatch')" class="px-3 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">Dispatch</button>
-                <button @click="batchAction('retry')" class="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 rounded text-xs">Retry</button>
-                <button @click="batchAction('skip')" class="px-3 py-1 bg-gray-600 hover:bg-gray-500 rounded text-xs">Skip</button>
+        <!-- Batch Actions -->
+        <div class="mt-3 flex gap-2" x-show="selectedTasks.length > 0">
+            <span class="text-sm text-gray-400" x-text="`${selectedTasks.length} selected`"></span>
+            <button @click="batchAction('dispatch')" class="px-3 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">Dispatch</button>
+            <button @click="batchAction('retry')" class="px-3 py-1 bg-yellow-600 hover:bg-yellow-700 rounded text-xs">Retry</button>
+            <button @click="batchAction('skip')" class="px-3 py-1 bg-gray-600 hover:bg-gray-500 rounded text-xs">Skip</button>
+        </div>
+    </div>
+
+    <!-- ==================== SERVERS VIEW ==================== -->
+    <div x-show="view === 'servers'" x-cloak>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <template x-for="(srv, key) in (dashboard.servers || {})" :key="key">
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700"
+                     :class="srv.worker_alive ? '' : 'border-red-900/50'">
+                    <div class="flex items-center justify-between mb-3">
+                        <div class="flex items-center gap-2">
+                            <span class="w-3 h-3 rounded-full" :class="srv.worker_alive ? 'bg-green-400' : 'bg-red-400'"></span>
+                            <span class="font-bold" x-text="key"></span>
+                            <span class="text-xs text-gray-500" x-text="srv.host"></span>
+                        </div>
+                        <button @click="restartWorker(key)" class="px-2 py-1 bg-orange-600 hover:bg-orange-700 rounded text-xs"
+                                x-show="!srv.worker_alive && !srv.local">
+                            Restart
+                        </button>
+                    </div>
+                    <div class="space-y-2 text-sm">
+                        <div class="flex justify-between">
+                            <span class="text-gray-400">Status</span>
+                            <span :class="srv.worker_alive ? 'text-green-400' : 'text-red-400'"
+                                  x-text="srv.local ? 'master' : (srv.worker_alive ? 'running' : 'offline')"></span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-400">Disk Free</span>
+                            <span class="text-gray-200" x-text="`${srv.disk_free_gb || 0} GB`"></span>
+                        </div>
+                        <div class="flex justify-between" x-show="srv.disk_free_gb > 0">
+                            <span class="text-gray-400">Disk</span>
+                            <div class="w-24 bg-gray-700 rounded-full h-2 mt-1">
+                                <div class="h-2 rounded-full" :style="`width: ${Math.min(100, Math.max(0, 100 - (srv.disk_free_gb / 2)))}%`"
+                                     :class="srv.disk_free_gb < 20 ? 'bg-red-500' : (srv.disk_free_gb < 50 ? 'bg-yellow-500' : 'bg-green-500')"></div>
+                            </div>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-400">Current</span>
+                            <span class="text-gray-200 truncate max-w-[200px]" x-text="srv.current_task || 'idle'"></span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-400">Queue</span>
+                            <span x-text="`${srv.queue_depth} tasks`"></span>
+                        </div>
+                        <div class="flex justify-between" x-show="srv.alive_at">
+                            <span class="text-gray-400">Last heartbeat</span>
+                            <span class="text-xs text-gray-500" x-text="timeAgo(srv.alive_at)"></span>
+                        </div>
+                    </div>
+                    <!-- Active tasks -->
+                    <div class="mt-3 border-t border-gray-700 pt-2" x-show="srv.active_tasks?.length">
+                        <div class="text-xs text-gray-500 mb-1">Active tasks:</div>
+                        <template x-for="at in (srv.active_tasks || [])" :key="at.id">
+                            <div class="text-xs text-gray-300 truncate" x-text="`${statusIcon(at.status)} ${at.name}`"></div>
+                        </template>
+                    </div>
+                    <button @click="viewLog(key)" class="mt-2 text-xs text-blue-400 hover:text-blue-300" x-show="!srv.local">
+                        View Log
+                    </button>
+                    <button @click="cleanServer(key)" class="mt-2 ml-3 text-xs text-yellow-400 hover:text-yellow-300" x-show="!srv.local && srv.disk_free_gb < 50">
+                        Clean Staging
+                    </button>
+                </div>
+            </template>
+        </div>
+
+        <!-- Log Modal -->
+        <div x-show="showLogModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showLogModal = false">
+            <div class="bg-gray-800 rounded-lg p-6 w-[700px] max-h-[80vh] overflow-auto">
+                <div class="flex justify-between mb-3">
+                    <h3 class="font-bold" x-text="`Log: ${logServer}`"></h3>
+                    <button @click="showLogModal = false" class="text-gray-400 hover:text-white">&times;</button>
+                </div>
+                <pre class="text-xs text-gray-300 font-mono whitespace-pre-wrap bg-gray-900 p-3 rounded max-h-[60vh] overflow-auto" x-text="logContent"></pre>
             </div>
         </div>
 
-        <!-- Servers View -->
-        <div x-show="view === 'servers'" x-cloak>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <template x-for="(srv, key) in (dashboard.servers || {})" :key="key">
-                    <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                        <div class="flex items-center justify-between mb-3">
-                            <div class="flex items-center gap-2">
-                                <span class="w-3 h-3 rounded-full" :class="srv.worker_alive ? 'bg-green-400' : 'bg-red-400'"></span>
-                                <span class="font-bold" x-text="key"></span>
-                                <span class="text-xs text-gray-500" x-text="srv.host"></span>
-                            </div>
-                            <div class="flex items-center gap-2">
-                                <button @click="restartWorker(key)" class="px-2 py-1 bg-orange-600 hover:bg-orange-700 rounded text-xs"
-                                        x-show="!srv.worker_alive && !srv.local">
-                                    Restart
-                                </button>
-                                <button @click="toggleServer(key)" class="px-2 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs"
-                                        x-show="!srv.local">
-                                    <span x-text="expandedServer === key ? '▲ Collapse' : '▼ Queue'"></span>
-                                </button>
-                            </div>
-                        </div>
-                        <div class="space-y-1 text-sm">
-                            <div class="flex justify-between">
-                                <span class="text-gray-400">Worker</span>
-                                <span :class="srv.worker_alive ? 'text-green-400' : 'text-red-400'"
-                                      x-text="srv.local ? 'master' : (srv.worker_alive ? 'running' : 'dead')"></span>
-                            </div>
-                            <div class="flex justify-between">
-                                <span class="text-gray-400">Current</span>
-                                <span class="text-gray-200 truncate max-w-[200px]" x-text="srv.current_task ? extractRepo(srv.current_task) : (srv.active_tasks?.length ? 'working...' : 'idle')"></span>
-                            </div>
-                            <div class="flex justify-between" x-show="getSpeed(key) > 0">
-                                <span class="text-gray-400">Speed</span>
-                                <span class="text-cyan-400" x-text="formatSpeed(getSpeed(key))"></span>
-                            </div>
-                            <div class="flex justify-between">
-                                <span class="text-gray-400">Active</span>
-                                <span x-text="`${srv.active_tasks?.length || 0} tasks`"></span>
-                            </div>
-                            <div class="flex justify-between" x-show="srv.queue_depth > 0">
-                                <span class="text-gray-400">Queued</span>
-                                <span x-text="`${srv.queue_depth} in queue.txt`"></span>
-                            </div>
-                        </div>
+        <!-- Doctor Modal -->
+        <div x-show="showDoctorModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showDoctorModal = false">
+            <div class="bg-gray-800 rounded-lg p-6 w-[600px] max-h-[80vh] overflow-auto">
+                <div class="flex justify-between mb-4">
+                    <h3 class="font-bold text-lg">Cluster Health Check</h3>
+                    <button @click="showDoctorModal = false" class="text-gray-400 hover:text-white text-xl">&times;</button>
+                </div>
 
-                        <!-- Expandable Queue Section -->
-                        <div x-show="expandedServer === key" class="mt-3 border-t border-gray-700 pt-3">
-                            <div class="text-xs text-gray-400 mb-2 font-medium">Queue (drag to reorder):</div>
-                            <template x-if="(serverQueues[key] || []).length === 0">
-                                <div class="text-xs text-gray-500 italic py-2">Queue empty</div>
+                <!-- Loading -->
+                <div x-show="doctorLoading" class="text-center py-8 text-gray-400">
+                    Diagnosing...
+                </div>
+
+                <!-- Results -->
+                <div x-show="!doctorLoading && doctorFindings" class="space-y-4">
+                    <!-- Healthy -->
+                    <div x-show="doctorFindings?.healthy" class="text-center py-8">
+                        <div class="text-4xl mb-2">&#10003;</div>
+                        <p class="text-green-400 font-medium">All healthy — no issues found</p>
+                    </div>
+
+                    <!-- Stuck Downloads -->
+                    <div x-show="doctorFindings?.stuck_downloads?.length > 0">
+                        <h4 class="text-sm font-bold text-yellow-400 mb-2">Stuck Downloads</h4>
+                        <div class="space-y-1">
+                            <template x-for="item in (doctorFindings?.stuck_downloads || [])" :key="item.task_id">
+                                <div class="flex justify-between items-center bg-gray-900 rounded px-3 py-1.5 text-sm">
+                                    <span><span class="text-gray-400" x-text="item.server"></span> <span x-text="item.name"></span></span>
+                                    <span class="text-xs text-gray-500" x-text="item.reason"></span>
+                                </div>
                             </template>
-                            <div x-ref="queueList"
-                                 x-init="$watch('expandedServer', v => { if (v === key) $nextTick(() => initSortable($refs.queueList, key)) })"
-                                 class="space-y-1">
-                                <template x-for="(item, idx) in (serverQueues[key] || [])" :key="item.line">
-                                    <div :data-line="item.line"
-                                         class="flex items-center gap-2 bg-gray-750 bg-gray-900/50 rounded px-2 py-1.5 border border-gray-700 hover:border-gray-500">
-                                        <span class="drag-handle text-gray-500 hover:text-gray-300 select-none">&#9776;</span>
-                                        <span class="text-xs text-gray-400 w-4" x-text="idx + 1"></span>
-                                        <span class="text-sm text-gray-200 flex-1 truncate" x-text="item.display"></span>
-                                        <span class="text-xs text-gray-500 truncate max-w-[120px]" x-text="item.repo_id" x-show="item.repo_id !== item.display"></span>
+                        </div>
+                    </div>
+
+                    <!-- Dead Workers -->
+                    <div x-show="doctorFindings?.dead_workers?.length > 0">
+                        <h4 class="text-sm font-bold text-red-400 mb-2">Offline Workers</h4>
+                        <div class="space-y-1">
+                            <template x-for="item in (doctorFindings?.dead_workers || [])" :key="item.key">
+                                <div class="flex justify-between items-center bg-gray-900 rounded px-3 py-1.5 text-sm">
+                                    <span x-text="item.key"></span>
+                                    <span class="text-xs text-gray-500" x-text="item.reason"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+
+                    <!-- Zombie Tasks -->
+                    <div x-show="doctorFindings?.zombie_tasks?.length > 0">
+                        <h4 class="text-sm font-bold text-orange-400 mb-2">Invalid Tasks (will be skipped)</h4>
+                        <div class="space-y-1">
+                            <template x-for="item in (doctorFindings?.zombie_tasks || [])" :key="item.task_id">
+                                <div class="flex justify-between items-center bg-gray-900 rounded px-3 py-1.5 text-sm">
+                                    <span x-text="item.name"></span>
+                                    <span class="text-xs text-gray-500 max-w-[200px] truncate" x-text="item.reason"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+
+                    <!-- Disk Full -->
+                    <div x-show="doctorFindings?.disk_full?.length > 0">
+                        <h4 class="text-sm font-bold text-red-400 mb-2">Disk Full</h4>
+                        <div class="space-y-1">
+                            <template x-for="item in (doctorFindings?.disk_full || [])" :key="item.key">
+                                <div class="flex justify-between items-center bg-gray-900 rounded px-3 py-1.5 text-sm">
+                                    <span x-text="item.key"></span>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs text-gray-500" x-text="`${item.disk_free_gb}G free`"></span>
+                                        <button @click="cleanServer(item.key)" class="px-2 py-0.5 bg-red-700 hover:bg-red-600 rounded text-xs">Clean</button>
                                     </div>
-                                </template>
-                            </div>
-                            <!-- Confirm / Cancel buttons (only show when dirty) -->
-                            <div x-show="queueDirty[key]" class="mt-2 flex gap-2">
-                                <button @click="saveQueueOrder(key)"
-                                        class="px-3 py-1 bg-green-600 hover:bg-green-700 rounded text-xs font-medium">
-                                    Confirm
-                                </button>
-                                <button @click="cancelQueueReorder(key)"
-                                        class="px-3 py-1 bg-gray-600 hover:bg-gray-500 rounded text-xs">
-                                    Cancel
-                                </button>
-                            </div>
-                        </div>
-
-                        <!-- Log button -->
-                        <div class="mt-2 flex gap-3">
-                            <button @click="viewLog(key)" class="text-xs text-blue-400 hover:text-blue-300" x-show="!srv.local">
-                                View Log
-                            </button>
+                                </div>
+                            </template>
                         </div>
                     </div>
-                </template>
-            </div>
 
-            <!-- Log Modal -->
-            <div x-show="showLogModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showLogModal = false">
-                <div class="bg-gray-800 rounded-lg p-6 w-[700px] max-h-[80vh] overflow-auto">
-                    <div class="flex justify-between mb-3">
-                        <h3 class="font-bold" x-text="`Log: ${logServer}`"></h3>
-                        <button @click="showLogModal = false" class="text-gray-400 hover:text-white">&times;</button>
+                    <!-- Fix All Button -->
+                    <div x-show="!doctorFindings?.healthy" class="pt-3 border-t border-gray-700 flex justify-between items-center">
+                        <span class="text-sm text-gray-400" x-text="`${doctorFindings?.total_issues || 0} issues found`"></span>
+                        <button @click="doctorFix([])" :disabled="doctorFixing"
+                                class="px-4 py-2 bg-green-700 hover:bg-green-600 disabled:bg-gray-600 rounded font-medium text-sm">
+                            <span x-show="!doctorFixing">Fix All</span>
+                            <span x-show="doctorFixing">Fixing...</span>
+                        </button>
                     </div>
-                    <pre class="text-xs text-gray-300 font-mono whitespace-pre-wrap bg-gray-900 p-3 rounded max-h-[60vh] overflow-auto" x-text="logContent"></pre>
                 </div>
             </div>
         </div>
-    </main>
-</div>
+    </div>
+
+</main>
 
 <!-- Add Task Modal -->
 <div x-show="showAddModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showAddModal = false">
@@ -363,7 +491,7 @@
         </div>
         <div class="flex justify-end gap-2 mt-4">
             <button @click="showAddModal = false" class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded text-sm">Cancel</button>
-            <button @click="submitAdd()" class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded text-sm" :disabled="!addForm.url">Add & Dispatch</button>
+            <button @click="submitAdd()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm" :disabled="!addForm.url">Add & Dispatch</button>
         </div>
         <div x-show="addForm.error" class="mt-2 text-xs text-red-400" x-text="addForm.error"></div>
     </div>
@@ -377,6 +505,6 @@
      x-transition>
 </div>
 
-<script src="app.js"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>

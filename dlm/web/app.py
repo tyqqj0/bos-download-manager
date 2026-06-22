@@ -39,11 +39,13 @@ def create_app() -> FastAPI:
     from .routes.tasks import router as tasks_router
     from .routes.servers import router as servers_router
     from .routes.actions import router as actions_router
+    from .routes.doctor import router as doctor_router
 
     app.include_router(dashboard_router, prefix="/api")
     app.include_router(tasks_router, prefix="/api")
     app.include_router(servers_router, prefix="/api")
     app.include_router(actions_router, prefix="/api")
+    app.include_router(doctor_router, prefix="/api")
 
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
