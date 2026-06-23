@@ -6,3 +6,4 @@ build/
 .env
 .venv/
 docs/*-feishu.md
+CLAUDE.md
