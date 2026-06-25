@@ -11,6 +11,7 @@ class Server:
     user: str = "root"
     path: str = "~/code/auwomo-tools"
     enabled: bool = True
+    role: str = "worker"  # "worker" | "controller"
     added_at: str = ""
     notes: str = ""
 

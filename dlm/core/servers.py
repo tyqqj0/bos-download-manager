@@ -20,6 +20,7 @@ class ServerConfig:
     path: str = "~/code/auwomo-tools"
     enabled: bool = True
     local: bool = False
+    role: str = "worker"  # "worker" | "controller"
     notes: str = ""
 
 
@@ -45,6 +46,7 @@ def load_servers() -> dict[str, ServerConfig]:
                 path=cfg.get("path", "~/code/auwomo-tools"),
                 enabled=cfg.get("enabled", True),
                 local=cfg.get("local", False),
+                role=cfg.get("role", "worker"),
                 notes=cfg.get("notes", ""),
             )
     return servers
@@ -62,6 +64,8 @@ def save_servers(servers: dict[str, ServerConfig]):
             entry["enabled"] = False
         if srv.local:
             entry["local"] = True
+        if srv.role != "worker":
+            entry["role"] = srv.role
         if srv.notes:
             entry["notes"] = srv.notes
         data["servers"][key] = entry

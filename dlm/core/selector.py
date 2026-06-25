@@ -20,6 +20,7 @@ def select_server(state: State, check_live: bool = True, exclude: list = None) -
     candidates = {
         k: v for k, v in state.servers.items()
         if v.enabled and k not in exclude
+        and getattr(v, 'role', 'worker') == 'worker'
     }
     if not candidates:
         return None

@@ -62,6 +62,11 @@ class WorkerDaemon:
 
     def _poll_for_task(self):
         """Check BOS state for tasks assigned to this server."""
+        pressure = self.disk.pressure_level()
+        if pressure != "ok":
+            logger.debug(f"Skipping poll, disk pressure={pressure}")
+            return None
+
         state = self.state_manager.load(use_cache=False)
         candidates = [
             t for t in state.tasks

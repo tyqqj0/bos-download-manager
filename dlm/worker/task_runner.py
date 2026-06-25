@@ -21,7 +21,7 @@ MODEL_BUCKET = "auwomo-model-open"
 _MIN_UPDATE_INTERVAL = 30
 
 # Chunked mode: use when dataset size > this fraction of available disk
-_CHUNK_THRESHOLD_RATIO = 0.7
+_CHUNK_THRESHOLD_RATIO = 0.5
 # Each batch should use at most this fraction of free disk
 _BATCH_DISK_RATIO = 0.6
 
@@ -67,6 +67,11 @@ class TaskRunner:
             need_chunked = True
             logger.info(
                 f"Chunked mode: {est_size:.1f}GB dataset, {avail_gb:.1f}GB available"
+            )
+        elif est_size == 0 and self.task.source == "hf":
+            need_chunked = True
+            logger.info(
+                f"Chunked mode: size unknown, defaulting to chunked for safety"
             )
         elif est_size and est_size > 0:
             ok, reason = self.disk.preflight_check(est_size)
@@ -131,31 +136,58 @@ class TaskRunner:
 
         total_bytes = sum(f["size"] for f in files)
         uploaded_bytes = 0
+
+        # Update size_gb now that we know the real size
+        real_gb = total_bytes / (1024 ** 3)
+        if real_gb > self.task.size_gb:
+            try:
+                self.state_manager.update_task(self.task.id, {"size_gb": round(real_gb, 2)})
+            except Exception:
+                pass
+            self.task.size_gb = real_gb
+
+        logger.info(f"Chunked: {len(files)} files, {real_gb:.1f}GB total")
+
+        # Sort files largest first for better bin-packing
+        files_sorted = sorted(files, key=lambda f: f["size"], reverse=True)
+        remaining_files = list(files_sorted)
         batch_num = 0
 
-        logger.info(f"Chunked: {len(files)} files, {total_bytes / 1024**3:.1f}GB total")
-
-        # Split into batches based on available disk
-        batches = self._make_batches(files)
-        total_batches = len(batches)
-
-        for batch_num, batch in enumerate(batches, 1):
+        while remaining_files:
             if self.cancel_event.is_set():
                 raise TaskError("Cancelled", ErrorClass.TRANSIENT)
 
-            batch_size = sum(f["size"] for f in batch)
+            batch_num += 1
+
+            # Recalculate available space each iteration
+            avail_gb = self.disk.available_gb()
+            max_batch_bytes = int(avail_gb * _BATCH_DISK_RATIO * 1024 ** 3)
+
+            # Build this batch from remaining files
+            batch = []
+            batch_size = 0
+            leftover = []
+            for f in remaining_files:
+                if batch_size + f["size"] <= max_batch_bytes or not batch:
+                    batch.append(f)
+                    batch_size += f["size"]
+                else:
+                    leftover.append(f)
+            remaining_files = leftover
+
             batch_files_list = [f["path"] for f in batch]
 
             logger.info(
-                f"Batch {batch_num}/{total_batches}: "
-                f"{len(batch)} files, {batch_size / 1024**3:.1f}GB"
+                f"Batch {batch_num}: "
+                f"{len(batch)} files, {batch_size / 1024**3:.1f}GB "
+                f"(avail: {avail_gb:.1f}GB)"
             )
 
             # Update progress
             pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
             self._throttled_update({
                 "progress_pct": round(pct, 1),
-                "phase": f"downloading batch {batch_num}/{total_batches}",
+                "phase": f"downloading batch {batch_num}",
                 "worker_heartbeat": _now(),
             })
 
@@ -167,7 +199,7 @@ class TaskRunner:
 
             # Upload this batch to BOS
             self._throttled_update({
-                "phase": f"uploading batch {batch_num}/{total_batches}",
+                "phase": f"uploading batch {batch_num}",
                 "worker_heartbeat": _now(),
             })
 
@@ -200,7 +232,7 @@ class TaskRunner:
             shutil.rmtree(staging_dir, ignore_errors=True)
             logger.info(f"Batch {batch_num} done, {uploaded_bytes / 1024**3:.1f}GB uploaded total")
 
-        logger.info(f"Task {self.task.id} chunked download completed: {total_batches} batches")
+        logger.info(f"Task {self.task.id} chunked download completed: {batch_num} batches")
 
     def _list_repo_files(self) -> list:
         """List all files in the HF repo with sizes."""
