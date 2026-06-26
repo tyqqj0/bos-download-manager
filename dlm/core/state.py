@@ -99,8 +99,9 @@ class StateManager:
                 time.sleep(0.2 * (2 ** attempt))
         return state
 
-    def update_heartbeat(self, server_key: str, heartbeat: dict, max_retries: int = 3) -> State:
+    def update_heartbeat(self, server_key: str, heartbeat: dict, max_retries: int = 5) -> State:
         """Atomically update a worker's heartbeat."""
+        import random
         for attempt in range(max_retries):
             state = self.load(use_cache=False)
             version = state.meta.get("version", 0)
@@ -111,7 +112,7 @@ class StateManager:
             except OptimisticLockError:
                 if attempt == max_retries - 1:
                     raise
-                time.sleep(0.2 * (2 ** attempt))
+                time.sleep(0.3 * (2 ** attempt) + random.uniform(0, 0.5))
         return state
 
     def _initial_state(self) -> State:
