@@ -10,6 +10,7 @@ from . import run_blocking
 router = APIRouter(tags=["doctor"])
 
 HEARTBEAT_TIMEOUT = 180  # seconds
+TASK_HEARTBEAT_TIMEOUT = 600  # seconds — fallback check on task-level heartbeat
 INVALID_REPO_PATTERNS = [".org", ".io", ".ai", "github.com", "arxiv"]
 
 
@@ -49,6 +50,16 @@ def _find_stuck_downloads(state) -> list[dict]:
             except (ValueError, TypeError):
                 is_stuck = True
                 reason = "bad heartbeat timestamp"
+
+        # Fallback: check task-level heartbeat (written by _throttled_update,
+        # survives BOS version conflicts better than global heartbeat)
+        if is_stuck and t.worker_heartbeat:
+            try:
+                task_hb_age = (now - datetime.fromisoformat(t.worker_heartbeat)).total_seconds()
+                if task_hb_age < TASK_HEARTBEAT_TIMEOUT:
+                    is_stuck = False
+            except (ValueError, TypeError):
+                pass
 
         if is_stuck:
             stuck.append({
