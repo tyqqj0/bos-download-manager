@@ -90,9 +90,8 @@ async def add_task(req: AddTaskRequest):
     """Add a new download task. Auto-dispatches unless no_dispatch=True."""
     def _do_add():
         from ...core.state import StateManager
-        from ...core.parser import parse_repo, build_download_cmd, derive_bos_path
+        from ...core.parser import parse_repo, derive_bos_path
         from ...core.selector import select_server
-        from ...core.ssh import ssh_append_queue, ssh_check_queue_contains
         from ...core.servers import load_servers
         from ...core.models import Task, _now
 
@@ -141,23 +140,8 @@ async def add_task(req: AddTaskRequest):
         state.tasks.append(task)
 
         if not req.no_dispatch and task.server:
-            srv = server_cfgs.get(task.server) or state.servers.get(task.server)
-            cmd = build_download_cmd(
-                repo_id=repo_id,
-                source=parsed["source"],
-                dtype=parsed["type"],
-                category=task.category,
-                remote_path=srv.path,
-                include=req.include,
-                custom_name=req.name,
-            )
-            if not ssh_check_queue_contains(srv, repo_id):
-                ok = ssh_append_queue(srv, cmd)
-                if ok:
-                    task.status = "dispatched"
-                    task.dispatched_at = _now()
-            else:
-                task.status = "dispatched"
+            task.status = "dispatched"
+            task.dispatched_at = _now()
 
         mgr.save(state)
         from dataclasses import asdict
@@ -178,9 +162,7 @@ async def retry_task(task_id: str, req: RetryRequest = None):
     """Retry a failed task."""
     def _do_retry():
         from ...core.state import StateManager
-        from ...core.parser import build_download_cmd
         from ...core.selector import select_server
-        from ...core.ssh import ssh_append_queue
         from ...core.servers import load_servers
         from ...core.models import _now
 
@@ -199,28 +181,19 @@ async def retry_task(task_id: str, req: RetryRequest = None):
             return {"error": "No available server"}
 
         server_cfgs = load_servers()
-        srv = server_cfgs.get(server_key) or state.servers.get(server_key)
-        if not srv:
+        if server_key not in server_cfgs and server_key not in state.servers:
             return {"error": f"Unknown server: {server_key}"}
-        cmd = build_download_cmd(
-            repo_id=task.repo_id,
-            source=task.source,
-            dtype=task.type,
-            category=task.category,
-            remote_path=srv.path if hasattr(srv, 'path') else getattr(srv, 'path', '~/code/auwomo-tools'),
-            include=task.include,
-            custom_name=None,
-        )
-        ok = ssh_append_queue(srv, cmd)
-        if ok:
-            task.status = "dispatched"
-            task.server = server_key
-            task.dispatched_at = _now()
-            task.retry_count += 1
-            task.error = None
-            mgr.save(state)
-            return {"status": "dispatched", "server": server_key}
-        return {"error": f"SSH dispatch failed to {server_key}"}
+
+        task.status = "dispatched"
+        task.server = server_key
+        task.dispatched_at = _now()
+        task.retry_count += 1
+        task.error = None
+        task.phase = None
+        task.speed_mbps = 0
+        task.worker_pid = None
+        mgr.save(state)
+        return {"status": "dispatched", "server": server_key}
 
     result = await run_blocking(_do_retry)
     if "error" in result:
@@ -324,9 +297,7 @@ async def batch_action(req: BatchRequest):
 
     def _do():
         from ...core.state import StateManager
-        from ...core.parser import build_download_cmd
         from ...core.selector import select_server
-        from ...core.ssh import ssh_append_queue
         from ...core.servers import load_servers
         from ...core.models import _now
 
@@ -355,29 +326,17 @@ async def batch_action(req: BatchRequest):
                     results.append({"id": tid, "error": "no server available"})
                     continue
 
-                srv = server_cfgs.get(server_key) or state.servers.get(server_key)
-                if not srv:
+                if server_key not in server_cfgs and server_key not in state.servers:
                     results.append({"id": tid, "error": f"unknown server: {server_key}"})
                     continue
-                cmd = build_download_cmd(
-                    repo_id=task.repo_id,
-                    source=task.source,
-                    dtype=task.type,
-                    category=task.category,
-                    remote_path=srv.path,
-                    include=task.include,
-                )
-                ok = ssh_append_queue(srv, cmd)
-                if ok:
-                    task.status = "dispatched"
-                    task.server = server_key
-                    task.dispatched_at = _now()
-                    if req.action == "retry":
-                        task.retry_count += 1
-                        task.error = None
-                    results.append({"id": tid, "status": "dispatched", "server": server_key})
-                else:
-                    results.append({"id": tid, "error": f"SSH failed to {server_key}"})
+
+                task.status = "dispatched"
+                task.server = server_key
+                task.dispatched_at = _now()
+                if req.action == "retry":
+                    task.retry_count += 1
+                    task.error = None
+                results.append({"id": tid, "status": "dispatched", "server": server_key})
 
         mgr.save(state)
         return {"results": results}
