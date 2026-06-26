@@ -45,6 +45,9 @@ class WorkerDaemon:
         except Exception as e:
             logger.warning(f"Startup cleanup failed: {e}")
 
+        # Recover zombie tasks left in "downloading" by previous daemon instance
+        self._recover_zombie_tasks()
+
         while not self.shutdown_event.is_set():
             try:
                 task = self._poll_for_task()
@@ -74,7 +77,7 @@ class WorkerDaemon:
             and t.status in ("dispatched",)
         ]
         if not candidates:
-            return None
+            return self._try_steal_task()
 
         # Sort by priority (P0 first) then creation time
         priority_order = {p: i for i, p in enumerate(PRIORITIES)}
@@ -155,6 +158,58 @@ class WorkerDaemon:
         finally:
             self.current_runner = None
             self.heartbeat.current_task_id = None
+
+    def _recover_zombie_tasks(self):
+        """Reset tasks stuck in 'downloading' from a previous daemon instance."""
+        try:
+            state = self.state_manager.load(use_cache=False)
+            for t in state.tasks:
+                if (t.server == self.server_key
+                        and t.status == "downloading"
+                        and t.worker_pid != os.getpid()):
+                    logger.warning(f"Recovering zombie task {t.id} ({t.name})")
+                    self.state_manager.update_task(t.id, {
+                        "status": "dispatched",
+                        "phase": None,
+                        "speed_mbps": 0,
+                        "eta_seconds": None,
+                        "worker_pid": None,
+                    })
+        except Exception as e:
+            logger.warning(f"Zombie recovery failed: {e}")
+
+    def _try_steal_task(self):
+        """When idle, steal a dispatched task from an overloaded worker."""
+        state = self.state_manager.load(use_cache=False)
+
+        # Build: server → list of dispatched tasks
+        load_map = {}
+        for t in state.tasks:
+            if t.status == "dispatched" and t.server and t.server != self.server_key:
+                load_map.setdefault(t.server, []).append(t)
+
+        # Only steal from servers with queue > 1 (leave them at least 1 task)
+        for server_key, tasks in sorted(load_map.items(), key=lambda x: -len(x[1])):
+            if len(tasks) <= 1:
+                break
+
+            # Steal the lowest-priority / latest-created task
+            priority_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+            steal_target = sorted(tasks, key=lambda t: (
+                priority_order.get(t.priority, 9),
+                t.created_at or "",
+            ))[-1]
+
+            logger.info(
+                f"Work-stealing: taking {steal_target.id} ({steal_target.name}) "
+                f"from {server_key} (queue={len(tasks)})"
+            )
+            self.state_manager.update_task(steal_target.id, {
+                "server": self.server_key,
+            })
+            return steal_target
+
+        return None
 
     def _handle_signal(self, signum, frame):
         logger.info(f"Received signal {signum}, shutting down...")

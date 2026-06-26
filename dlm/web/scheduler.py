@@ -15,6 +15,7 @@ _executor = ThreadPoolExecutor(max_workers=4)
 SYNC_INTERVAL = 60
 SIZE_INTERVAL = 300
 SERVER_INTERVAL = 30
+DOCTOR_INTERVAL = 300
 
 
 def _load_state_fresh():
@@ -197,10 +198,36 @@ def _refresh_sizes(state, mgr):
     return updated
 
 
+def _auto_doctor(state, mgr):
+    """Auto-reset stuck downloading tasks (heartbeat stale > 180s)."""
+    from .routes.doctor import _find_stuck_downloads
+
+    stuck = _find_stuck_downloads(state)
+    if not stuck:
+        return []
+
+    fresh = mgr.load(use_cache=False)
+    fixed = []
+    for item in stuck:
+        for t in fresh.tasks:
+            if t.id == item["task_id"]:
+                t.status = "dispatched"
+                t.phase = None
+                t.speed_mbps = 0
+                t.eta_seconds = None
+                t.worker_pid = None
+                fixed.append(item["name"])
+                break
+    if fixed:
+        mgr.save(fresh)
+    return fixed
+
+
 async def background_scheduler():
     """Main background loop — runs sync, refreshes sizes and server status."""
     loop = asyncio.get_event_loop()
     last_size_refresh = 0
+    last_doctor_run = 0
 
     # Initial load
     await asyncio.sleep(2)
@@ -223,6 +250,14 @@ async def background_scheduler():
                     logger.info(f"Size refresh: {count} tasks updated")
                     _, state = await loop.run_in_executor(_executor, _load_state_fresh)
                 last_size_refresh = now
+
+            # Auto-doctor: reset stuck downloads every DOCTOR_INTERVAL
+            if now - last_doctor_run > DOCTOR_INTERVAL:
+                fixed = await loop.run_in_executor(_executor, _auto_doctor, state, mgr)
+                if fixed:
+                    logger.info(f"Auto-doctor: reset {len(fixed)} stuck tasks: {fixed}")
+                    _, state = await loop.run_in_executor(_executor, _load_state_fresh)
+                last_doctor_run = now
 
             # Update server status cache
             server_data = await loop.run_in_executor(_executor, _build_server_status, state)

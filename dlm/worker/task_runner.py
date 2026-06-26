@@ -384,6 +384,7 @@ class TaskRunner:
         self._last_update_time = now
 
         pct = (downloaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
+        pct = min(pct, 100.0)
         speed_mbps = speed_bps / (1024 * 1024) if speed_bps > 0 else 0
         eta = int((total_bytes - downloaded_bytes) / speed_bps) if speed_bps > 0 and total_bytes > downloaded_bytes else None
 
@@ -412,6 +413,7 @@ class TaskRunner:
         self._last_update_time = now
 
         pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
+        pct = min(pct, 100.0)
         try:
             self.state_manager.update_task(self.task.id, {
                 "progress_pct": round(pct, 1),
