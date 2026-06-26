@@ -248,12 +248,13 @@
                             </td>
                             <td class="px-3 py-2">
                                 <span class="text-xs font-mono text-blue-300" x-show="t.status === 'downloading' && t.speed_mbps > 0" x-text="formatSpeed(t.speed_mbps)"></span>
-                                <span class="text-xs text-gray-600" x-show="t.status !== 'downloading' || !t.speed_mbps">-</span>
+                                <span class="text-xs text-red-400 truncate max-w-[200px] inline-block" x-show="t.error && (t.status === 'failed' || t.status === 'needs-auth')" x-text="t.error" :title="t.error"></span>
+                                <span class="text-xs text-gray-600" x-show="t.status === 'downloading' && !t.speed_mbps">-</span>
                             </td>
                             <td class="px-3 py-2 text-gray-400 text-xs" x-text="t.category"></td>
                             <td class="px-3 py-2">
                                 <div class="flex gap-1">
-                                    <button x-show="t.status === 'failed' || t.status === 'queued'"
+                                    <button x-show="t.status === 'failed' || t.status === 'queued' || t.status === 'needs-auth'"
                                             @click="retryTask(t.id)" title="Retry"
                                             class="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">&#8635;</button>
                                     <button x-show="t.status !== 'done' && t.status !== 'skipped'"

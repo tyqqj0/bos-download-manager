@@ -286,12 +286,19 @@ class TaskRunner:
         """Download specific files from the repo."""
         import os
 
+        # Split into sub-batches if file list is too long (avoid Errno 7: arg list too long)
+        MAX_ARGS = 500
+        if len(file_paths) > MAX_ARGS:
+            for i in range(0, len(file_paths), MAX_ARGS):
+                chunk = file_paths[i:i + MAX_ARGS]
+                self._download_batch(chunk, staging_dir)
+            return
+
         cmd = [
             "hf", "download", self.task.repo_id,
             "--local-dir", str(staging_dir),
             "--repo-type", self.task.type,
         ]
-        # Add each file as a positional argument
         cmd.extend(file_paths)
 
         env = os.environ.copy()

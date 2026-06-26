@@ -186,7 +186,7 @@ async def retry_task(task_id: str, req: RetryRequest = None):
         task = state.find_task_by_id(task_id)
         if not task:
             return {"error": f"Task not found: {task_id}"}
-        if task.status not in ("failed", "queued"):
+        if task.status not in ("failed", "queued", "needs-auth"):
             return {"error": f"Cannot retry task with status: {task.status}"}
 
         server_key = (req.server if req else None) or task.server
