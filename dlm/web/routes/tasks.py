@@ -93,6 +93,7 @@ async def add_task(req: AddTaskRequest):
         from ...core.parser import parse_repo, build_download_cmd, derive_bos_path
         from ...core.selector import select_server
         from ...core.ssh import ssh_append_queue, ssh_check_queue_contains
+        from ...core.servers import load_servers
         from ...core.models import Task, _now
 
         parsed = parse_repo(req.url_or_repo)
@@ -107,6 +108,7 @@ async def add_task(req: AddTaskRequest):
 
         mgr = StateManager.create()
         state = mgr.load(use_cache=False)
+        server_cfgs = load_servers()
 
         existing = state.find_task(repo_id)
         if existing:
@@ -128,7 +130,7 @@ async def add_task(req: AddTaskRequest):
         )
 
         if req.server:
-            if req.server not in state.servers:
+            if req.server not in server_cfgs and req.server not in state.servers:
                 return {"error": f"Unknown server: {req.server}"}
             task.server = req.server
         elif not req.no_dispatch:
@@ -139,7 +141,7 @@ async def add_task(req: AddTaskRequest):
         state.tasks.append(task)
 
         if not req.no_dispatch and task.server:
-            srv = state.servers[task.server]
+            srv = server_cfgs.get(task.server) or state.servers.get(task.server)
             cmd = build_download_cmd(
                 repo_id=repo_id,
                 source=parsed["source"],
@@ -179,6 +181,7 @@ async def retry_task(task_id: str, req: RetryRequest = None):
         from ...core.parser import build_download_cmd
         from ...core.selector import select_server
         from ...core.ssh import ssh_append_queue
+        from ...core.servers import load_servers
         from ...core.models import _now
 
         mgr = StateManager.create()
@@ -195,13 +198,16 @@ async def retry_task(task_id: str, req: RetryRequest = None):
         if not server_key:
             return {"error": "No available server"}
 
-        srv = state.servers[server_key]
+        server_cfgs = load_servers()
+        srv = server_cfgs.get(server_key) or state.servers.get(server_key)
+        if not srv:
+            return {"error": f"Unknown server: {server_key}"}
         cmd = build_download_cmd(
             repo_id=task.repo_id,
             source=task.source,
             dtype=task.type,
             category=task.category,
-            remote_path=srv.path,
+            remote_path=srv.path if hasattr(srv, 'path') else getattr(srv, 'path', '~/code/auwomo-tools'),
             include=task.include,
             custom_name=None,
         )
@@ -321,10 +327,12 @@ async def batch_action(req: BatchRequest):
         from ...core.parser import build_download_cmd
         from ...core.selector import select_server
         from ...core.ssh import ssh_append_queue
+        from ...core.servers import load_servers
         from ...core.models import _now
 
         mgr = StateManager.create()
         state = mgr.load(use_cache=False)
+        server_cfgs = load_servers()
         results = []
 
         for tid in req.task_ids:
@@ -347,7 +355,10 @@ async def batch_action(req: BatchRequest):
                     results.append({"id": tid, "error": "no server available"})
                     continue
 
-                srv = state.servers[server_key]
+                srv = server_cfgs.get(server_key) or state.servers.get(server_key)
+                if not srv:
+                    results.append({"id": tid, "error": f"unknown server: {server_key}"})
+                    continue
                 cmd = build_download_cmd(
                     repo_id=task.repo_id,
                     source=task.source,
