@@ -321,8 +321,14 @@ class TaskRunner:
 
             current_size = self._dir_size(staging_dir)
             if current_size > last_staging_size:
+                delta = current_size - last_staging_size
                 last_staging_size = current_size
                 last_progress_time = time.time()
+                self._throttled_update({
+                    "downloaded_gb": round(current_size / (1024 ** 3), 2),
+                    "speed_mbps": round(delta / (30 * 1024 * 1024), 1),
+                    "worker_heartbeat": _now(),
+                })
             elif time.time() - last_progress_time > stall_timeout:
                 logger.warning(
                     f"Batch download stalled for {stall_timeout//60}min, killing"
