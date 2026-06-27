@@ -16,7 +16,7 @@ RETRY_POLICIES = {
     ErrorClass.TRANSIENT: {"max_retries": 5, "base_delay": 60, "backoff": "exponential"},
     ErrorClass.AUTH: {"max_retries": 0},
     ErrorClass.NOT_FOUND: {"max_retries": 0},
-    ErrorClass.DISK: {"max_retries": 1, "base_delay": 300},
+    ErrorClass.DISK: {"max_retries": 3, "base_delay": 300},
     ErrorClass.CORRUPTION: {"max_retries": 2, "base_delay": 30},
     ErrorClass.UNKNOWN: {"max_retries": 2, "base_delay": 120, "backoff": "linear"},
 }

@@ -67,7 +67,7 @@ class WorkerDaemon:
         """Check BOS state for tasks assigned to this server."""
         pressure = self.disk.pressure_level()
         if pressure != "ok":
-            logger.debug(f"Skipping poll, disk pressure={pressure}")
+            logger.info(f"Skipping poll, disk pressure={pressure} ({self.disk.available_gb():.1f}GB free)")
             return None
 
         state = self.state_manager.load(use_cache=False)
@@ -225,6 +225,14 @@ class WorkerDaemon:
             logger.info(f"Disk pressure={pressure}, running emergency cleanup")
             freed = self.disk.emergency_cleanup()
             logger.info(f"Freed {freed:.1f}GB")
+        else:
+            # Proactive: clean HF cache even when not under pressure
+            import shutil
+            from pathlib import Path
+            for cache in [Path("/tmp/hf_cache"), Path("/root/.cache/huggingface")]:
+                if cache.exists() and any(cache.iterdir()):
+                    shutil.rmtree(cache, ignore_errors=True)
+                    logger.info(f"Cleaned HF cache: {cache}")
 
         if self.disk.pressure_level() == "ok":
             try:

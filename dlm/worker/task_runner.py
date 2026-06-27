@@ -161,6 +161,18 @@ class TaskRunner:
 
             # Recalculate available space each iteration
             avail_gb = self.disk.available_gb()
+
+            # If disk is under pressure, clean caches before proceeding
+            if self.disk.pressure_level() != "ok":
+                logger.info(f"Disk pressure before batch {batch_num}, running cleanup")
+                self.disk.emergency_cleanup()
+                avail_gb = self.disk.available_gb()
+                if self.disk.pressure_level() == "critical":
+                    raise TaskError(
+                        f"Disk critically full even after cleanup ({avail_gb:.1f}GB free)",
+                        ErrorClass.DISK,
+                    )
+
             max_batch_bytes = int(avail_gb * _BATCH_DISK_RATIO * 1024 ** 3)
 
             # Build this batch from remaining files

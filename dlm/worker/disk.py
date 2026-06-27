@@ -11,7 +11,7 @@ STAGING_PATH = Path("/data/staging")
 WARNING_RATIO = 0.85
 CRITICAL_RATIO = 0.92
 CLEANUP_AGE_HOURS = 48
-SAFETY_MARGIN_GB = 20
+SAFETY_MARGIN_GB = 10
 
 
 class DiskManager:
@@ -87,9 +87,13 @@ class DiskManager:
                 except Exception as e:
                     logger.warning(f"Failed to remove {d.name}: {e}")
 
-        hf_cache = Path("/tmp/hf_cache")
-        if hf_cache.exists():
-            shutil.rmtree(hf_cache, ignore_errors=True)
+        # Clean all HF caches
+        for cache_path in [
+            Path("/tmp/hf_cache"),
+            Path("/root/.cache/huggingface"),
+        ]:
+            if cache_path.exists():
+                shutil.rmtree(cache_path, ignore_errors=True)
 
         freed = self.available_gb() - before
         logger.info(f"Emergency cleanup freed ~{freed:.1f}GB")

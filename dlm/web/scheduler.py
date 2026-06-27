@@ -180,6 +180,7 @@ def _refresh_sizes(state, mgr):
     from ..core.size import fetch_sizes
     from ..core.config import load_config
     from ..core.bos import create_bos_client
+    from datetime import datetime, timezone
 
     config = load_config()
     bos = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
@@ -188,25 +189,41 @@ def _refresh_sizes(state, mgr):
         return 0
     # Re-load fresh state before saving to avoid overwriting daemon updates
     fresh_state = mgr.load(use_cache=False)
+    now = datetime.now(timezone.utc)
     updated = 0
     for task in fresh_state.tasks:
-        if task.id in sizes and sizes[task.id] != task.downloaded_gb:
-            task.downloaded_gb = sizes[task.id]
-            updated += 1
+        if task.id in sizes:
+            # Never overwrite worker-reported progress for active downloads
+            if task.status == "downloading":
+                continue
+            # Task might be actively downloading despite dispatched status
+            # (happens when retry resets status while worker is still running)
+            if task.worker_heartbeat:
+                try:
+                    hb_age = (now - datetime.fromisoformat(task.worker_heartbeat)).total_seconds()
+                    if hb_age < 600:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            if sizes[task.id] != task.downloaded_gb:
+                task.downloaded_gb = sizes[task.id]
+                updated += 1
     if updated:
         mgr.save(fresh_state)
     return updated
 
 
 def _auto_doctor(state, mgr):
-    """Auto-reset stuck downloading tasks (heartbeat stale > 180s)."""
+    """Auto-reset stuck downloading tasks and fix wrongly-dispatched ones."""
     from .routes.doctor import _find_stuck_downloads
+    from datetime import datetime, timezone
 
-    stuck = _find_stuck_downloads(state)
-    if not stuck:
-        return []
-
+    now = datetime.now(timezone.utc)
     fresh = mgr.load(use_cache=False)
+    changed = False
+
+    # Fix 1: Tasks stuck in "downloading" with stale heartbeat → reset to dispatched
+    stuck = _find_stuck_downloads(state)
     fixed = []
     for item in stuck:
         for t in fresh.tasks:
@@ -217,9 +234,27 @@ def _auto_doctor(state, mgr):
                 t.eta_seconds = None
                 t.worker_pid = None
                 fixed.append(item["name"])
+                changed = True
                 break
-    if fixed:
+
+    # Fix 2: Tasks stuck in "dispatched" but worker is still active → restore to downloading
+    restored = []
+    for t in fresh.tasks:
+        if t.status != "dispatched" or not t.worker_heartbeat:
+            continue
+        try:
+            hb_age = (now - datetime.fromisoformat(t.worker_heartbeat)).total_seconds()
+            if hb_age < 600:
+                t.status = "downloading"
+                restored.append(t.name)
+                changed = True
+        except (ValueError, TypeError):
+            pass
+
+    if changed:
         mgr.save(fresh)
+    if restored:
+        logger.info(f"Auto-doctor: restored {len(restored)} active tasks: {restored}")
     return fixed
 
 

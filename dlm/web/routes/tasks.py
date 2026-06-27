@@ -165,6 +165,7 @@ async def retry_task(task_id: str, req: RetryRequest = None):
         from ...core.selector import select_server
         from ...core.servers import load_servers
         from ...core.models import _now
+        from datetime import datetime, timezone
 
         mgr = StateManager.create()
         state = mgr.load(use_cache=False)
@@ -173,6 +174,16 @@ async def retry_task(task_id: str, req: RetryRequest = None):
             return {"error": f"Task not found: {task_id}"}
         if task.status not in ("failed", "queued", "needs-auth"):
             return {"error": f"Cannot retry task with status: {task.status}"}
+
+        # Guard: if worker_heartbeat is recent, task is still being processed
+        if task.worker_heartbeat:
+            try:
+                now = datetime.now(timezone.utc)
+                hb_age = (now - datetime.fromisoformat(task.worker_heartbeat)).total_seconds()
+                if hb_age < 600:
+                    return {"error": f"Task is still being processed (heartbeat {int(hb_age)}s ago)"}
+            except (ValueError, TypeError):
+                pass
 
         server_key = (req.server if req else None) or task.server
         if not server_key:
