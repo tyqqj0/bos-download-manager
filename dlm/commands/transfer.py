@@ -76,10 +76,11 @@ def push_cmd(task_ids, all_done, category, username, password, wait):
         click.echo(f"  Target: {target_path}")
 
         try:
+            from ..constants import DATA_BUCKET
             task_id = client.import_from_bos(
                 bos_ak=bos_ak,
                 bos_sk=bos_sk,
-                bos_bucket="westlake-autolab-databuilder-data",
+                bos_bucket=DATA_BUCKET,
                 bos_path=bos_path,
                 target_path=target_path,
             )

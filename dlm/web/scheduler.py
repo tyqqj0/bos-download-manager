@@ -351,10 +351,16 @@ def _auto_transfer(state, mgr):
                 target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.name}"
 
             try:
+                from ..constants import DATA_BUCKET
+                if task.category:
+                    try:
+                        client.create_folder("/727a2f92-30c/auwomo-datasets/raw-data/", task.category)
+                    except Exception:
+                        pass
                 task_id = client.import_from_bos(
                     bos_ak=bos_ak,
                     bos_sk=bos_sk,
-                    bos_bucket="westlake-autolab-databuilder-data",
+                    bos_bucket=DATA_BUCKET,
                     bos_path=bos_path,
                     target_path=target_path,
                 )
