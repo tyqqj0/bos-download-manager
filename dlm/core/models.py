@@ -49,6 +49,12 @@ class Task:
     eta_seconds: Optional[int] = None
     phase: Optional[str] = None
     error_class: Optional[str] = None
+    # Transfer to D-Robotics (地瓜云) fields
+    transfer_status: Optional[str] = None
+    transfer_task_id: Optional[str] = None
+    transfer_error: Optional[str] = None
+    transfer_started_at: Optional[str] = None
+    transfer_completed_at: Optional[str] = None
 
     def __post_init__(self):
         if not self.created_at:

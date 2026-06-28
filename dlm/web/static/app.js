@@ -20,12 +20,16 @@ function app() {
         doctorFindings: null,
         toast: { show: false, message: '', type: 'success' },
         addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', no_dispatch: false, parsed: null, error: '' },
+        transferTasks: [],
+        transferSummary: {},
+        transferPaused: false,
 
         async init() {
             await this.fetchDashboard();
             await this.fetchTasks();
             setInterval(() => this.fetchDashboard(), 10000);
             setInterval(() => this.fetchTasks(), 15000);
+            setInterval(() => { if (this.view === 'transfer') this.fetchTransfer(); }, 15000);
         },
 
         get progressPct() {
@@ -357,6 +361,90 @@ function app() {
                 return `${al.server || '?'} disk low: ${al.free_gb || 0}G free`;
             }
             return al.type;
+        },
+
+        // ==================== TRANSFER ====================
+
+        async fetchTransfer() {
+            try {
+                const resp = await fetch('/api/transfer');
+                const data = await resp.json();
+                this.transferTasks = data.tasks || [];
+                this.transferSummary = data.summary || {};
+                this.transferPaused = data.paused || false;
+            } catch (e) {
+                console.error('fetchTransfer:', e);
+            }
+        },
+
+        async triggerTransfer(taskId) {
+            try {
+                const resp = await fetch('/api/transfer/trigger', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_ids: [taskId] }),
+                });
+                const data = await resp.json();
+                if (data.error) { this.showToast(data.error, 'error'); return; }
+                this.showToast(`已触发搬运: ${data.count} 个任务`);
+                await this.fetchTransfer();
+            } catch (e) {
+                this.showToast('触发失败', 'error');
+            }
+        },
+
+        async triggerAllTransfer() {
+            try {
+                const resp = await fetch('/api/transfer/trigger', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                });
+                const data = await resp.json();
+                if (data.error) { this.showToast(data.error, 'error'); return; }
+                this.showToast(`已触发 ${data.count} 个搬运任务`);
+                await this.fetchTransfer();
+            } catch (e) {
+                this.showToast('触发失败', 'error');
+            }
+        },
+
+        async retryTransfer(taskId) {
+            try {
+                const resp = await fetch(`/api/transfer/${taskId}/retry`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.error) { this.showToast(data.error, 'error'); return; }
+                this.showToast(`已重新排队: ${data.name}`);
+                await this.fetchTransfer();
+            } catch (e) {
+                this.showToast('重试失败', 'error');
+            }
+        },
+
+        async toggleTransferPause() {
+            try {
+                const resp = await fetch('/api/transfer/pause', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ paused: !this.transferPaused }),
+                });
+                const data = await resp.json();
+                this.transferPaused = data.paused;
+                this.showToast(data.paused ? '自动搬运已暂停' : '自动搬运已恢复');
+            } catch (e) {
+                this.showToast('操作失败', 'error');
+            }
+        },
+
+        async syncTransfer() {
+            try {
+                const resp = await fetch('/api/transfer/sync', { method: 'POST' });
+                const data = await resp.json();
+                this.showToast(`同步完成: ${data.updated || 0} 个更新`);
+                await this.fetchTransfer();
+            } catch (e) {
+                this.showToast('同步失败', 'error');
+            }
         },
 
         timeAgo(isoStr) {

@@ -17,6 +17,7 @@ class DLMCache:
         self.dashboard = CacheEntry()
         self.servers = CacheEntry()
         self.tasks = CacheEntry()
+        self._kv: dict = {}
 
     def set_dashboard(self, data: dict):
         with self._lock:
@@ -48,6 +49,14 @@ class DLMCache:
     def last_sync_at(self) -> float:
         with self._lock:
             return self.dashboard.updated_at
+
+    def set(self, key: str, value):
+        with self._lock:
+            self._kv[key] = value
+
+    def get(self, key: str, default=None):
+        with self._lock:
+            return self._kv.get(key, default)
 
 
 cache = DLMCache()

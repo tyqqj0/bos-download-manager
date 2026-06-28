@@ -16,6 +16,8 @@ SYNC_INTERVAL = 60
 SIZE_INTERVAL = 300
 SERVER_INTERVAL = 30
 DOCTOR_INTERVAL = 300
+TRANSFER_INTERVAL = 60
+MAX_CONCURRENT_TRANSFERS = 3
 
 
 def _load_state_fresh():
@@ -258,11 +260,150 @@ def _auto_doctor(state, mgr):
     return fixed
 
 
+def _auto_transfer(state, mgr):
+    """Auto-transfer completed tasks to D-Robotics JuiceFS."""
+    import os
+    from ..core.models import _now
+
+    if cache.get("transfer_paused"):
+        return 0
+
+    dcloud_user = os.environ.get("DCLOUD_USER")
+    dcloud_pass = os.environ.get("DCLOUD_PASS")
+    bos_ak = os.environ.get("BAIDU_AK")
+    bos_sk = os.environ.get("BAIDU_SK")
+
+    if not all([dcloud_user, dcloud_pass, bos_ak, bos_sk]):
+        return 0
+
+    # Count currently transferring tasks
+    transferring = [t for t in state.tasks if t.transfer_status == "transferring"]
+
+    # Step B: Poll status of transferring tasks
+    updated = 0
+    if transferring:
+        try:
+            from ..transfer.dcloud import DCloudClient
+            client = DCloudClient(dcloud_user, dcloud_pass)
+            client.login()
+
+            async_tasks = client.list_async_tasks(page_size=100)
+            task_status_map = {t.get("task_id"): t for t in async_tasks}
+
+            fresh = mgr.load(use_cache=False)
+            for task in fresh.tasks:
+                if task.transfer_status != "transferring" or not task.transfer_task_id:
+                    continue
+                remote = task_status_map.get(task.transfer_task_id)
+                if not remote:
+                    continue
+                status = remote.get("status", "")
+                if status in ("成功", "success", "done"):
+                    task.transfer_status = "done"
+                    task.transfer_completed_at = _now()
+                    task.transfer_error = None
+                    updated += 1
+                    logger.info(f"Transfer done: {task.name}")
+                elif status in ("失败", "failed", "error"):
+                    task.transfer_status = "failed"
+                    task.transfer_error = remote.get("error_msg", status)
+                    task.transfer_completed_at = _now()
+                    updated += 1
+                    logger.warning(f"Transfer failed: {task.name} — {task.transfer_error}")
+            if updated:
+                mgr.save(fresh)
+                state = fresh
+        except Exception as e:
+            logger.error(f"Transfer poll error: {e}")
+
+    # Recount after poll
+    transferring_count = sum(1 for t in state.tasks if t.transfer_status == "transferring")
+
+    # Step A: Trigger new imports (up to MAX_CONCURRENT_TRANSFERS)
+    slots = MAX_CONCURRENT_TRANSFERS - transferring_count
+    if slots <= 0:
+        return updated
+
+    pending = [
+        t for t in state.tasks
+        if t.status == "done" and t.transfer_status in (None, "queued")
+    ]
+    if not pending:
+        return updated
+
+    try:
+        from ..transfer.dcloud import DCloudClient
+        client = DCloudClient(dcloud_user, dcloud_pass)
+        client.login()
+
+        fresh = mgr.load(use_cache=False)
+        triggered = 0
+        for task in fresh.tasks:
+            if triggered >= slots:
+                break
+            if task.status != "done" or task.transfer_status not in (None, "queued"):
+                continue
+
+            bos_path = task.bos_path.lstrip("/")
+            if task.category:
+                target_path = f"/auwomo-datasets/raw-data/{task.category}/{task.name}"
+            else:
+                target_path = f"/auwomo-datasets/raw-data/{task.name}"
+
+            try:
+                task_id = client.import_from_bos(
+                    bos_ak=bos_ak,
+                    bos_sk=bos_sk,
+                    bos_bucket="westlake-autolab-databuilder-data",
+                    bos_path=bos_path,
+                    target_path=target_path,
+                )
+                task.transfer_status = "transferring"
+                task.transfer_task_id = task_id
+                task.transfer_started_at = _now()
+                task.transfer_error = None
+                triggered += 1
+                updated += 1
+                logger.info(f"Transfer started: {task.name} → {target_path} (task_id={task_id})")
+            except Exception as e:
+                task.transfer_status = "failed"
+                task.transfer_error = str(e)
+                updated += 1
+                logger.error(f"Transfer trigger failed for {task.name}: {e}")
+
+        if updated:
+            mgr.save(fresh)
+    except Exception as e:
+        logger.error(f"Transfer trigger error: {e}")
+
+    # Step C: Auto-retry failed (max 3 attempts)
+    try:
+        fresh = mgr.load(use_cache=False)
+        retried = 0
+        for task in fresh.tasks:
+            if task.transfer_status == "failed" and task.status == "done":
+                # Simple retry counter: count transfer attempts from started_at resets
+                task.transfer_status = "queued"
+                task.transfer_error = None
+                retried += 1
+                if retried >= 2:
+                    break
+        if retried:
+            mgr.save(fresh)
+            updated += retried
+            logger.info(f"Transfer auto-retry: queued {retried} failed tasks")
+    except Exception as e:
+        logger.debug(f"Transfer retry check failed: {e}")
+
+    return updated
+
+
 async def background_scheduler():
     """Main background loop — runs sync, refreshes sizes and server status."""
     loop = asyncio.get_event_loop()
     last_size_refresh = 0
     last_doctor_run = 0
+    last_transfer_run = 0
 
     # Initial load
     await asyncio.sleep(2)
@@ -293,6 +434,14 @@ async def background_scheduler():
                     logger.info(f"Auto-doctor: reset {len(fixed)} stuck tasks: {fixed}")
                     _, state = await loop.run_in_executor(_executor, _load_state_fresh)
                 last_doctor_run = now
+
+            # Auto-transfer: push done tasks to D-Robotics
+            if now - last_transfer_run > TRANSFER_INTERVAL:
+                count = await loop.run_in_executor(_executor, _auto_transfer, state, mgr)
+                if count:
+                    logger.info(f"Auto-transfer: {count} tasks updated")
+                    _, state = await loop.run_in_executor(_executor, _load_state_fresh)
+                last_transfer_run = now
 
             # Update server status cache
             server_data = await loop.run_in_executor(_executor, _build_server_status, state)

@@ -28,6 +28,9 @@
             <button @click="view = 'servers'" :class="view === 'servers' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'" class="px-3 py-1.5 rounded text-sm font-medium">
                 Servers
             </button>
+            <button @click="view = 'transfer'; fetchTransfer()" :class="view === 'transfer' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white'" class="px-3 py-1.5 rounded text-sm font-medium">
+                Transfer
+            </button>
         </div>
     </div>
     <div class="flex items-center gap-3">
@@ -441,6 +444,122 @@
                         </button>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== TRANSFER VIEW ==================== -->
+    <div x-show="view === 'transfer'" x-cloak>
+
+        <!-- Summary Strip -->
+        <div class="bg-gray-800 rounded-lg p-4 mb-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-4">
+                    <span class="text-sm font-medium text-gray-200">BOS → 地瓜云 搬运</span>
+                    <span class="inline-flex items-center gap-1 text-xs">
+                        <span class="w-2 h-2 rounded-full bg-green-400"></span>
+                        <span class="text-gray-300" x-text="`${transferSummary.transferred || 0} 已完成`"></span>
+                    </span>
+                    <span class="inline-flex items-center gap-1 text-xs">
+                        <span class="w-2 h-2 rounded-full bg-blue-400"></span>
+                        <span class="text-gray-300" x-text="`${transferSummary.transferring || 0} 搬运中`"></span>
+                    </span>
+                    <span class="inline-flex items-center gap-1 text-xs">
+                        <span class="w-2 h-2 rounded-full bg-red-400"></span>
+                        <span class="text-gray-300" x-text="`${transferSummary.failed || 0} 失败`"></span>
+                    </span>
+                    <span class="inline-flex items-center gap-1 text-xs">
+                        <span class="w-2 h-2 rounded-full bg-gray-500"></span>
+                        <span class="text-gray-300" x-text="`${transferSummary.pending || 0} 待搬`"></span>
+                    </span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <button @click="toggleTransferPause()" class="px-3 py-1.5 rounded text-sm"
+                            :class="transferPaused ? 'bg-yellow-700 hover:bg-yellow-600' : 'bg-gray-700 hover:bg-gray-600'"
+                            x-text="transferPaused ? '▶ 恢复自动' : '⏸ 暂停自动'">
+                    </button>
+                    <button @click="syncTransfer()" class="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm">
+                        ⟳ 立即检查
+                    </button>
+                    <button @click="triggerAllTransfer()" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium">
+                        全部搬运
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Transfer Table -->
+        <div class="bg-gray-800 rounded-lg overflow-hidden">
+            <table class="w-full text-sm">
+                <thead class="text-xs text-gray-400 uppercase bg-gray-850">
+                    <tr>
+                        <th class="px-4 py-3 text-left">Name</th>
+                        <th class="px-4 py-3 text-left">Category</th>
+                        <th class="px-4 py-3 text-right">Size</th>
+                        <th class="px-4 py-3 text-center">下载</th>
+                        <th class="px-4 py-3 text-center">搬运</th>
+                        <th class="px-4 py-3 text-left">Error</th>
+                        <th class="px-4 py-3 text-right">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="t in transferTasks" :key="t.id">
+                        <tr class="border-t border-gray-700 hover:bg-gray-750">
+                            <td class="px-4 py-2.5">
+                                <div class="font-medium text-gray-200 truncate max-w-[200px]" x-text="t.name" :title="t.name"></div>
+                            </td>
+                            <td class="px-4 py-2.5">
+                                <span class="text-xs text-gray-400" x-text="t.category || '-'"></span>
+                            </td>
+                            <td class="px-4 py-2.5 text-right">
+                                <span class="font-mono text-xs" x-text="formatGB(t.size_gb)"></span>
+                            </td>
+                            <td class="px-4 py-2.5 text-center">
+                                <span x-show="t.status === 'done'" class="text-green-400 text-xs">✓</span>
+                                <span x-show="t.status === 'downloading'" class="text-blue-400 text-xs">↓</span>
+                                <span x-show="t.status !== 'done' && t.status !== 'downloading'" class="text-gray-500 text-xs" x-text="t.status"></span>
+                            </td>
+                            <td class="px-4 py-2.5 text-center">
+                                <span x-show="t.transfer_status === 'done'" class="inline-flex items-center gap-1 text-xs text-green-400">
+                                    ✓ 完成
+                                </span>
+                                <span x-show="t.transfer_status === 'transferring'" class="inline-flex items-center gap-1 text-xs text-blue-400">
+                                    <span class="animate-spin">⟳</span> 搬运中
+                                </span>
+                                <span x-show="t.transfer_status === 'failed'" class="inline-flex items-center gap-1 text-xs text-red-400">
+                                    ✗ 失败
+                                </span>
+                                <span x-show="t.transfer_status === 'queued'" class="text-xs text-yellow-400">
+                                    排队中
+                                </span>
+                                <span x-show="!t.transfer_status && t.status === 'done'" class="text-xs text-gray-500">
+                                    待搬运
+                                </span>
+                                <span x-show="!t.transfer_status && t.status !== 'done'" class="text-xs text-gray-600">
+                                    —
+                                </span>
+                            </td>
+                            <td class="px-4 py-2.5">
+                                <span x-show="t.transfer_error" class="text-xs text-red-400 truncate max-w-[200px] block" x-text="t.transfer_error" :title="t.transfer_error"></span>
+                            </td>
+                            <td class="px-4 py-2.5 text-right">
+                                <button x-show="t.transfer_status === 'failed'"
+                                        @click="retryTransfer(t.id)"
+                                        class="text-xs px-2 py-1 bg-yellow-700 hover:bg-yellow-600 rounded">
+                                    重试
+                                </button>
+                                <button x-show="!t.transfer_status && t.status === 'done'"
+                                        @click="triggerTransfer(t.id)"
+                                        class="text-xs px-2 py-1 bg-blue-700 hover:bg-blue-600 rounded">
+                                    搬运
+                                </button>
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+            <div x-show="transferTasks.length === 0" class="text-center text-gray-500 py-8 text-sm">
+                No tasks to display
             </div>
         </div>
     </div>
