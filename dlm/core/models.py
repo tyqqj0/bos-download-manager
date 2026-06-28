@@ -55,10 +55,18 @@ class Task:
     transfer_error: Optional[str] = None
     transfer_started_at: Optional[str] = None
     transfer_completed_at: Optional[str] = None
+    # Preserve unknown fields from JSON (forward-compat with newer code)
+    _extra: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         if not self.created_at:
             self.created_at = _now()
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d.pop("_extra", None)
+        d.update(self._extra)
+        return d
 
 
 @dataclass
@@ -108,7 +116,7 @@ class State:
         return {
             "meta": self.meta,
             "servers": {k: asdict(v) if isinstance(v, Server) else v for k, v in self.servers.items()},
-            "tasks": [asdict(t) if isinstance(t, Task) else t for t in self.tasks],
+            "tasks": [t.to_dict() if isinstance(t, Task) else t for t in self.tasks],
             "categories": self.categories,
             "worker_heartbeats": self.worker_heartbeats,
         }
@@ -125,13 +133,16 @@ class State:
             else:
                 v.pop("key", None)
                 state.servers[k] = Server(key=k, **v)
-        _task_fields = {f.name for f in Task.__dataclass_fields__.values()}
+        _task_fields = {f.name for f in Task.__dataclass_fields__.values()} - {"_extra"}
         for t in data.get("tasks", []):
             if isinstance(t, Task):
                 state.tasks.append(t)
             else:
-                filtered = {k: v for k, v in t.items() if k in _task_fields}
-                state.tasks.append(Task(**filtered))
+                known = {k: v for k, v in t.items() if k in _task_fields}
+                extra = {k: v for k, v in t.items() if k not in _task_fields}
+                task = Task(**known)
+                task._extra = extra
+                state.tasks.append(task)
         return state
 
 
