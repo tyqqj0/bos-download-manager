@@ -346,9 +346,9 @@ def _auto_transfer(state, mgr):
 
             bos_path = task.bos_path.lstrip("/")
             if task.category:
-                target_path = f"/auwomo-datasets/raw-data/{task.category}/{task.name}"
+                target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.category}/{task.name}"
             else:
-                target_path = f"/auwomo-datasets/raw-data/{task.name}"
+                target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.name}"
 
             try:
                 task_id = client.import_from_bos(
