@@ -79,11 +79,12 @@ def push_cmd(task_ids, all_done, category, username, password, wait):
         click.echo(f"  Target: {target_path}")
 
         try:
-            from ..constants import DATA_BUCKET
+            from ..constants import DATA_BUCKET, MODEL_BUCKET
+            bos_bucket = MODEL_BUCKET if t.type == "model" else DATA_BUCKET
             task_id = client.import_from_bos(
                 bos_ak=bos_ak,
                 bos_sk=bos_sk,
-                bos_bucket=DATA_BUCKET,
+                bos_bucket=bos_bucket,
                 bos_path=bos_path,
                 target_path=target_path,
             )

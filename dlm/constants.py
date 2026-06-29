@@ -14,4 +14,5 @@ CATEGORIES = [
 
 META_BUCKET = "westlake-autolab-databuilder-meta"
 DATA_BUCKET = "auwomo-data"
+MODEL_BUCKET = "auwomo-model-open"
 STATE_KEY = "download-manager/state.json"

@@ -108,17 +108,18 @@ async def trigger_transfer(body: dict = None):
                     target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.name}"
 
             try:
-                from ...constants import DATA_BUCKET
+                from ...constants import DATA_BUCKET, MODEL_BUCKET
                 if task.category:
                     try:
                         base = "/727a2f92-30c/auwomo-model/" if task.type == "model" else "/727a2f92-30c/auwomo-datasets/raw-data/"
                         client.create_folder(base, task.category)
                     except Exception:
                         pass
+                bos_bucket = MODEL_BUCKET if task.type == "model" else DATA_BUCKET
                 tid = client.import_from_bos(
                     bos_ak=bos_ak,
                     bos_sk=bos_sk,
-                    bos_bucket=DATA_BUCKET,
+                    bos_bucket=bos_bucket,
                     bos_path=bos_path,
                     target_path=target_path,
                 )

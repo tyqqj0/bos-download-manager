@@ -338,7 +338,7 @@ def _auto_transfer(state, mgr):
 
     try:
         from ..transfer.dcloud import DCloudClient
-        from ..constants import DATA_BUCKET
+        from ..constants import DATA_BUCKET, MODEL_BUCKET
         client = DCloudClient(dcloud_user, dcloud_pass)
         client.login()
 
@@ -349,11 +349,13 @@ def _auto_transfer(state, mgr):
 
             bos_path = task.bos_path.lstrip("/")
             if task.type == "model":
+                bos_bucket = MODEL_BUCKET
                 if task.category:
                     target_path = f"/727a2f92-30c/auwomo-model/{task.category}/{task.name}"
                 else:
                     target_path = f"/727a2f92-30c/auwomo-model/{task.name}"
             else:
+                bos_bucket = DATA_BUCKET
                 if task.category:
                     target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.category}/{task.name}"
                 else:
@@ -369,7 +371,7 @@ def _auto_transfer(state, mgr):
                 task_id = client.import_from_bos(
                     bos_ak=bos_ak,
                     bos_sk=bos_sk,
-                    bos_bucket=DATA_BUCKET,
+                    bos_bucket=bos_bucket,
                     bos_path=bos_path,
                     target_path=target_path,
                 )
