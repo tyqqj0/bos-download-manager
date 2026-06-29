@@ -261,7 +261,11 @@ def _auto_doctor(state, mgr):
 
 
 def _auto_transfer(state, mgr):
-    """Auto-transfer completed tasks to D-Robotics JuiceFS."""
+    """Auto-transfer completed tasks to D-Robotics JuiceFS.
+
+    Uses update_task() for atomic writes to avoid race conditions with
+    worker heartbeats overwriting transfer_status.
+    """
     import os
     from ..core.models import _now
 
@@ -276,7 +280,6 @@ def _auto_transfer(state, mgr):
     if not all([dcloud_user, dcloud_pass, bos_ak, bos_sk]):
         return 0
 
-    # Count currently transferring tasks
     transferring = [t for t in state.tasks if t.transfer_status == "transferring"]
 
     # Step B: Poll status of transferring tasks
@@ -290,33 +293,35 @@ def _auto_transfer(state, mgr):
             async_tasks = client.list_async_tasks(page_size=100)
             task_status_map = {t.get("task_id"): t for t in async_tasks}
 
-            fresh = mgr.load(use_cache=False)
-            for task in fresh.tasks:
-                if task.transfer_status != "transferring" or not task.transfer_task_id:
+            for task in transferring:
+                if not task.transfer_task_id:
                     continue
                 remote = task_status_map.get(task.transfer_task_id)
                 if not remote:
                     continue
                 status = remote.get("status", "")
                 if status in ("成功", "success", "done"):
-                    task.transfer_status = "done"
-                    task.transfer_completed_at = _now()
-                    task.transfer_error = None
+                    mgr.update_task(task.id, {
+                        "transfer_status": "done",
+                        "transfer_completed_at": _now(),
+                        "transfer_error": None,
+                    })
                     updated += 1
                     logger.info(f"Transfer done: {task.name}")
                 elif status in ("失败", "failed", "error"):
-                    task.transfer_status = "failed"
-                    task.transfer_error = remote.get("error_msg", status)
-                    task.transfer_completed_at = _now()
+                    mgr.update_task(task.id, {
+                        "transfer_status": "failed",
+                        "transfer_error": remote.get("error_msg", status),
+                        "transfer_completed_at": _now(),
+                    })
                     updated += 1
-                    logger.warning(f"Transfer failed: {task.name} — {task.transfer_error}")
-            if updated:
-                mgr.save(fresh)
-                state = fresh
+                    logger.warning(f"Transfer failed: {task.name} — {remote.get('error_msg', status)}")
         except Exception as e:
             logger.error(f"Transfer poll error: {e}")
 
-    # Recount after poll
+    # Reload state after poll updates
+    if updated:
+        state = mgr.load(use_cache=False)
     transferring_count = sum(1 for t in state.tasks if t.transfer_status == "transferring")
 
     # Step A: Trigger new imports (up to MAX_CONCURRENT_TRANSFERS)
@@ -333,28 +338,32 @@ def _auto_transfer(state, mgr):
 
     try:
         from ..transfer.dcloud import DCloudClient
+        from ..constants import DATA_BUCKET
         client = DCloudClient(dcloud_user, dcloud_pass)
         client.login()
 
-        fresh = mgr.load(use_cache=False)
         triggered = 0
-        for task in fresh.tasks:
+        for task in pending:
             if triggered >= slots:
                 break
-            if task.status != "done" or task.transfer_status not in (None, "queued"):
-                continue
 
             bos_path = task.bos_path.lstrip("/")
-            if task.category:
-                target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.category}/{task.name}"
+            if task.type == "model":
+                if task.category:
+                    target_path = f"/727a2f92-30c/auwomo-model/{task.category}/{task.name}"
+                else:
+                    target_path = f"/727a2f92-30c/auwomo-model/{task.name}"
             else:
-                target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.name}"
+                if task.category:
+                    target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.category}/{task.name}"
+                else:
+                    target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.name}"
 
             try:
-                from ..constants import DATA_BUCKET
                 if task.category:
                     try:
-                        client.create_folder("/727a2f92-30c/auwomo-datasets/raw-data/", task.category)
+                        base = "/727a2f92-30c/auwomo-model/" if task.type == "model" else "/727a2f92-30c/auwomo-datasets/raw-data/"
+                        client.create_folder(base, task.category)
                     except Exception:
                         pass
                 task_id = client.import_from_bos(
@@ -364,21 +373,22 @@ def _auto_transfer(state, mgr):
                     bos_path=bos_path,
                     target_path=target_path,
                 )
-                task.transfer_status = "transferring"
-                task.transfer_task_id = task_id
-                task.transfer_started_at = _now()
-                task.transfer_error = None
+                mgr.update_task(task.id, {
+                    "transfer_status": "transferring",
+                    "transfer_task_id": task_id,
+                    "transfer_started_at": _now(),
+                    "transfer_error": None,
+                })
                 triggered += 1
                 updated += 1
                 logger.info(f"Transfer started: {task.name} → {target_path} (task_id={task_id})")
             except Exception as e:
-                task.transfer_status = "failed"
-                task.transfer_error = str(e)
+                mgr.update_task(task.id, {
+                    "transfer_status": "failed",
+                    "transfer_error": str(e),
+                })
                 updated += 1
                 logger.error(f"Transfer trigger failed for {task.name}: {e}")
-
-        if updated:
-            mgr.save(fresh)
     except Exception as e:
         logger.error(f"Transfer trigger error: {e}")
 
@@ -388,14 +398,14 @@ def _auto_transfer(state, mgr):
         retried = 0
         for task in fresh.tasks:
             if task.transfer_status == "failed" and task.status == "done":
-                # Simple retry counter: count transfer attempts from started_at resets
-                task.transfer_status = "queued"
-                task.transfer_error = None
+                mgr.update_task(task.id, {
+                    "transfer_status": "queued",
+                    "transfer_error": None,
+                })
                 retried += 1
                 if retried >= 2:
                     break
         if retried:
-            mgr.save(fresh)
             updated += retried
             logger.info(f"Transfer auto-retry: queued {retried} failed tasks")
     except Exception as e:

@@ -69,7 +69,10 @@ def push_cmd(task_ids, all_done, category, username, password, wait):
     results = []
     for t in tasks:
         bos_path = t.bos_path.lstrip("/")
-        target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{t.category}/{t.name}" if t.category else f"/727a2f92-30c/auwomo-datasets/raw-data/{t.name}"
+        if t.type == "model":
+            target_path = f"/727a2f92-30c/auwomo-model/{t.category}/{t.name}" if t.category else f"/727a2f92-30c/auwomo-model/{t.name}"
+        else:
+            target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{t.category}/{t.name}" if t.category else f"/727a2f92-30c/auwomo-datasets/raw-data/{t.name}"
 
         click.echo(f"\n→ Importing {t.name}...")
         click.echo(f"  BOS: {t.bos_path}")

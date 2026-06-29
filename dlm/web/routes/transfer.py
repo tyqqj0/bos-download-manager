@@ -96,16 +96,23 @@ async def trigger_transfer(body: dict = None):
                 continue
 
             bos_path = task.bos_path.lstrip("/")
-            if task.category:
-                target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.category}/{task.name}"
+            if task.type == "model":
+                if task.category:
+                    target_path = f"/727a2f92-30c/auwomo-model/{task.category}/{task.name}"
+                else:
+                    target_path = f"/727a2f92-30c/auwomo-model/{task.name}"
             else:
-                target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.name}"
+                if task.category:
+                    target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.category}/{task.name}"
+                else:
+                    target_path = f"/727a2f92-30c/auwomo-datasets/raw-data/{task.name}"
 
             try:
                 from ...constants import DATA_BUCKET
                 if task.category:
                     try:
-                        client.create_folder("/727a2f92-30c/auwomo-datasets/raw-data/", task.category)
+                        base = "/727a2f92-30c/auwomo-model/" if task.type == "model" else "/727a2f92-30c/auwomo-datasets/raw-data/"
+                        client.create_folder(base, task.category)
                     except Exception:
                         pass
                 tid = client.import_from_bos(
