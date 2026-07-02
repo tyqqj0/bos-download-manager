@@ -1,0 +1,256 @@
+"""SQLite snapshot — fast state reads for the web dashboard.
+
+Workers report progress here; the dashboard reads from here (<10ms).
+This replaces BOS state.json polling for the web layer.
+"""
+
+import logging
+import os
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+DB_PATH = Path(os.environ.get("DLM_DB_PATH", "/data/dlm.db"))
+
+_local = threading.local()
+
+
+def _conn() -> sqlite3.Connection:
+    if not hasattr(_local, "conn") or _local.conn is None:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _local.conn = sqlite3.connect(str(DB_PATH), timeout=10)
+        _local.conn.execute("PRAGMA journal_mode=WAL")
+        _local.conn.execute("PRAGMA busy_timeout=5000")
+        _local.conn.row_factory = sqlite3.Row
+    return _local.conn
+
+
+def init_db():
+    """Create tables if they don't exist."""
+    conn = _conn()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            repo_id TEXT,
+            source TEXT,
+            type TEXT,
+            category TEXT,
+            bos_path TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            server TEXT,
+            priority INTEGER NOT NULL DEFAULT 5,
+            size_gb REAL DEFAULT 0,
+            downloaded_gb REAL DEFAULT 0,
+            progress_pct REAL DEFAULT 0,
+            speed_mbps REAL DEFAULT 0,
+            phase TEXT,
+            error TEXT,
+            error_class TEXT,
+            retry_count INTEGER DEFAULT 0,
+            celery_task_id TEXT,
+            transfer_status TEXT,
+            transfer_task_id TEXT,
+            transfer_error TEXT,
+            created_at TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            updated_at REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS workers (
+            hostname TEXT PRIMARY KEY,
+            server_key TEXT,
+            status TEXT DEFAULT 'offline',
+            current_task_id TEXT,
+            disk_free_gb REAL,
+            last_seen REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_tasks_celery ON tasks(celery_task_id);
+    """)
+    conn.commit()
+
+
+def upsert_task(task: dict):
+    """Insert or update a task record."""
+    conn = _conn()
+    task["updated_at"] = time.time()
+    columns = [
+        "id", "name", "repo_id", "source", "type", "category", "bos_path",
+        "status", "server", "priority", "size_gb", "downloaded_gb",
+        "progress_pct", "speed_mbps", "phase", "error", "error_class",
+        "retry_count", "celery_task_id", "transfer_status", "transfer_task_id",
+        "transfer_error", "created_at", "started_at", "completed_at", "updated_at",
+    ]
+    values = [task.get(c) for c in columns]
+    placeholders = ", ".join(["?"] * len(columns))
+    col_str = ", ".join(columns)
+    updates = ", ".join(f"{c}=excluded.{c}" for c in columns if c != "id")
+
+    conn.execute(
+        f"INSERT INTO tasks ({col_str}) VALUES ({placeholders}) "
+        f"ON CONFLICT(id) DO UPDATE SET {updates}",
+        values,
+    )
+    conn.commit()
+
+
+def update_task_progress(task_id: str, progress_pct: float = None,
+                         speed_mbps: float = None, downloaded_gb: float = None,
+                         phase: str = None, server: str = None,
+                         status: str = None, error: str = None,
+                         error_class: str = None, **extra):
+    """Update progress fields for a running task (called by workers)."""
+    conn = _conn()
+    sets = ["updated_at = ?"]
+    vals = [time.time()]
+
+    if progress_pct is not None:
+        sets.append("progress_pct = ?")
+        vals.append(progress_pct)
+    if speed_mbps is not None:
+        sets.append("speed_mbps = ?")
+        vals.append(speed_mbps)
+    if downloaded_gb is not None:
+        sets.append("downloaded_gb = ?")
+        vals.append(downloaded_gb)
+    if phase is not None:
+        sets.append("phase = ?")
+        vals.append(phase)
+    if server is not None:
+        sets.append("server = ?")
+        vals.append(server)
+    if status is not None:
+        sets.append("status = ?")
+        vals.append(status)
+    if error is not None:
+        sets.append("error = ?")
+        vals.append(error)
+    if error_class is not None:
+        sets.append("error_class = ?")
+        vals.append(error_class)
+
+    vals.append(task_id)
+    conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
+    conn.commit()
+
+
+def complete_task(task_id: str, status: str = "done"):
+    """Mark task as completed or failed."""
+    conn = _conn()
+    now = time.time()
+    from datetime import datetime, timezone
+    completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        "UPDATE tasks SET status = ?, completed_at = ?, updated_at = ?, "
+        "speed_mbps = 0, phase = NULL WHERE id = ?",
+        (status, completed_at, now, task_id),
+    )
+    conn.commit()
+
+
+def get_task(task_id: str) -> Optional[dict]:
+    """Get a single task by ID."""
+    conn = _conn()
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row:
+        return dict(row)
+    return None
+
+
+def get_all_tasks() -> list:
+    """Get all tasks ordered by status priority then creation time."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM tasks ORDER BY "
+        "CASE status "
+        "  WHEN 'downloading' THEN 0 "
+        "  WHEN 'pending' THEN 1 "
+        "  WHEN 'failed' THEN 2 "
+        "  WHEN 'done' THEN 3 "
+        "  WHEN 'revoked' THEN 4 "
+        "  ELSE 5 END, "
+        "priority ASC, created_at ASC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_tasks_by_status(status: str) -> list:
+    """Get tasks filtered by status."""
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE status = ? ORDER BY priority ASC, created_at ASC",
+        (status,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_worker(hostname: str, server_key: str, status: str = "online",
+                  current_task_id: str = None, disk_free_gb: float = None):
+    """Update worker heartbeat in snapshot."""
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO workers (hostname, server_key, status, current_task_id, disk_free_gb, last_seen) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(hostname) DO UPDATE SET "
+        "server_key=excluded.server_key, status=excluded.status, "
+        "current_task_id=excluded.current_task_id, disk_free_gb=excluded.disk_free_gb, "
+        "last_seen=excluded.last_seen",
+        (hostname, server_key, status, current_task_id, disk_free_gb, time.time()),
+    )
+    conn.commit()
+
+
+def get_workers() -> list:
+    """Get all workers."""
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM workers ORDER BY server_key").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_dashboard_summary() -> dict:
+    """Build dashboard summary from SQLite (fast)."""
+    conn = _conn()
+
+    total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    by_status = {}
+    for row in conn.execute("SELECT status, COUNT(*) as cnt FROM tasks GROUP BY status"):
+        by_status[row["status"]] = row["cnt"]
+
+    total_downloaded = conn.execute(
+        "SELECT COALESCE(SUM(downloaded_gb), 0) FROM tasks"
+    ).fetchone()[0]
+    total_estimated = conn.execute(
+        "SELECT COALESCE(SUM(size_gb), 0) FROM tasks WHERE size_gb > 0"
+    ).fetchone()[0]
+
+    active = conn.execute(
+        "SELECT id, name, server, progress_pct, downloaded_gb, size_gb, "
+        "speed_mbps, phase FROM tasks WHERE status = 'downloading' "
+        "ORDER BY updated_at DESC"
+    ).fetchall()
+
+    aggregate_speed = sum(r["speed_mbps"] or 0 for r in active)
+
+    return {
+        "total_tasks": total,
+        "by_status": by_status,
+        "total_downloaded_tb": round(total_downloaded / 1000, 2),
+        "total_estimated_tb": round(total_estimated / 1000, 2),
+        "aggregate_speed_mbps": round(aggregate_speed, 1),
+        "active_downloads": [dict(r) for r in active],
+        "updated_at": time.time(),
+    }
+
+
+def delete_task(task_id: str):
+    """Remove a task from the snapshot."""
+    conn = _conn()
+    conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()

@@ -7,8 +7,6 @@ import threading
 import time
 from pathlib import Path
 
-from ..core.models import _now
-from ..core.state import StateManager
 from ..constants import DATA_BUCKET
 from .errors import TaskError, ErrorClass, classify_error
 from .disk import DiskManager, STAGING_PATH
@@ -17,62 +15,52 @@ logger = logging.getLogger(__name__)
 
 MODEL_BUCKET = "auwomo-model-open"
 
-# Throttle state updates to avoid BOS write storms
-_MIN_UPDATE_INTERVAL = 30
-
-# Chunked mode: use when dataset size > this fraction of available disk
 _CHUNK_THRESHOLD_RATIO = 0.5
-# Each batch should use at most this fraction of free disk
 _BATCH_DISK_RATIO = 0.6
 
 
 class TaskRunner:
-    def __init__(self, task, state_manager: StateManager, server_key: str):
+    """Orchestrates download + BOS upload for a single task.
+
+    Args:
+        task: Task object (or dataclass) with id, name, repo_id, source, type, bos_path, size_gb, category.
+        server_key: This worker's server identifier.
+        cancel_event: Threading event to signal cancellation (e.g. from SIGUSR1).
+        progress_callback: Called with (downloaded_bytes, total_bytes, speed_bps) during download.
+        move_progress_callback: Called with (uploaded_bytes, total_bytes) during BOS upload.
+    """
+
+    def __init__(self, task, server_key: str, cancel_event: threading.Event = None,
+                 progress_callback=None, move_progress_callback=None):
         self.task = task
-        self.state_manager = state_manager
         self.server_key = server_key
-        self.cancel_event = threading.Event()
+        self.cancel_event = cancel_event or threading.Event()
         self.disk = DiskManager()
-        self._last_update_time = 0
+        self._progress_cb = progress_callback
+        self._move_progress_cb = move_progress_callback
 
     def run(self):
         """Execute the full task pipeline."""
         handler = self._get_handler()
         mover = self._get_mover()
 
-        # Phase 0: Validate
-        self._update_phase("validating")
         handler.validate(self.task)
 
-        # Auto-correct size_gb if estimate is way off
         real_size = handler.estimate_size(self.task)
         if real_size and (real_size > self.task.size_gb * 1.5 or self.task.size_gb == 0):
-            logger.info(
-                f"Correcting size_gb: {self.task.size_gb:.1f} -> {real_size:.1f}"
-            )
-            try:
-                self.state_manager.update_task(self.task.id, {
-                    "size_gb": round(real_size, 2)
-                })
-            except Exception:
-                pass
+            logger.info(f"Correcting size_gb: {self.task.size_gb:.1f} -> {real_size:.1f}")
             self.task.size_gb = real_size
 
-        # Phase 1: Pre-flight — determine if we need chunked mode
         est_size = real_size or self.task.size_gb
         avail_gb = self.disk.available_gb()
 
         need_chunked = False
         if est_size and est_size > avail_gb * _CHUNK_THRESHOLD_RATIO:
             need_chunked = True
-            logger.info(
-                f"Chunked mode: {est_size:.1f}GB dataset, {avail_gb:.1f}GB available"
-            )
+            logger.info(f"Chunked mode: {est_size:.1f}GB dataset, {avail_gb:.1f}GB available")
         elif est_size == 0 and self.task.source == "hf":
             need_chunked = True
-            logger.info(
-                f"Chunked mode: size unknown, defaulting to chunked for safety"
-            )
+            logger.info("Chunked mode: size unknown, defaulting to chunked for safety")
         elif est_size and est_size > 0:
             ok, reason = self.disk.preflight_check(est_size)
             if not ok:
@@ -85,8 +73,6 @@ class TaskRunner:
 
     def _run_simple(self, handler, mover):
         """Standard mode: download all → upload all."""
-        # Download
-        self._update_phase("downloading")
         staging_dir = STAGING_PATH / self.task.name
         staging_dir.mkdir(parents=True, exist_ok=True)
 
@@ -94,7 +80,7 @@ class TaskRunner:
             handler.download(
                 self.task,
                 staging_dir,
-                progress_callback=self._on_download_progress,
+                progress_callback=self._progress_cb,
                 cancel_event=self.cancel_event,
             )
         except TaskError:
@@ -103,13 +89,11 @@ class TaskRunner:
             error_class = classify_error(e)
             raise TaskError(str(e), error_class) from e
 
-        # Move to BOS
-        self._update_phase("moving")
         try:
             mover.move(
                 staging_dir,
                 self.task,
-                progress_callback=self._on_move_progress,
+                progress_callback=self._move_progress_cb,
                 cancel_event=self.cancel_event,
             )
         except TaskError:
@@ -118,7 +102,6 @@ class TaskRunner:
             error_class = classify_error(e)
             raise TaskError(str(e), error_class) from e
 
-        # Cleanup
         shutil.rmtree(staging_dir, ignore_errors=True)
         logger.info(f"Task {self.task.id} completed successfully")
 
@@ -126,29 +109,19 @@ class TaskRunner:
         """Chunked mode: download in batches, upload each batch, free space, repeat."""
         logger.info(f"Starting chunked download for {self.task.repo_id}")
 
-        # List all files in the repo
         files = self._list_repo_files()
         if not files:
-            raise TaskError(
-                f"Could not list files for {self.task.repo_id}",
-                ErrorClass.UNKNOWN,
-            )
+            raise TaskError(f"Could not list files for {self.task.repo_id}", ErrorClass.UNKNOWN)
 
         total_bytes = sum(f["size"] for f in files)
         uploaded_bytes = 0
 
-        # Update size_gb now that we know the real size
         real_gb = total_bytes / (1024 ** 3)
         if real_gb > self.task.size_gb:
-            try:
-                self.state_manager.update_task(self.task.id, {"size_gb": round(real_gb, 2)})
-            except Exception:
-                pass
             self.task.size_gb = real_gb
 
         logger.info(f"Chunked: {len(files)} files, {real_gb:.1f}GB total")
 
-        # Sort files largest first for better bin-packing
         files_sorted = sorted(files, key=lambda f: f["size"], reverse=True)
         remaining_files = list(files_sorted)
         batch_num = 0
@@ -158,11 +131,8 @@ class TaskRunner:
                 raise TaskError("Cancelled", ErrorClass.TRANSIENT)
 
             batch_num += 1
-
-            # Recalculate available space each iteration
             avail_gb = self.disk.available_gb()
 
-            # If disk is under pressure, clean caches before proceeding
             if self.disk.pressure_level() != "ok":
                 logger.info(f"Disk pressure before batch {batch_num}, running cleanup")
                 self.disk.emergency_cleanup()
@@ -175,7 +145,6 @@ class TaskRunner:
 
             max_batch_bytes = int(avail_gb * _BATCH_DISK_RATIO * 1024 ** 3)
 
-            # Build this batch from remaining files
             batch = []
             batch_size = 0
             leftover = []
@@ -188,38 +157,21 @@ class TaskRunner:
             remaining_files = leftover
 
             batch_files_list = [f["path"] for f in batch]
-
             logger.info(
-                f"Batch {batch_num}: "
-                f"{len(batch)} files, {batch_size / 1024**3:.1f}GB "
+                f"Batch {batch_num}: {len(batch)} files, {batch_size / 1024**3:.1f}GB "
                 f"(avail: {avail_gb:.1f}GB)"
             )
 
-            # Update progress
-            pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
-            self._throttled_update({
-                "progress_pct": round(pct, 1),
-                "phase": f"downloading batch {batch_num}",
-                "worker_heartbeat": _now(),
-            })
-
-            # Download this batch
             staging_dir = STAGING_PATH / self.task.name
             staging_dir.mkdir(parents=True, exist_ok=True)
 
             self._download_batch(batch_files_list, staging_dir)
 
-            # Upload this batch to BOS
-            self._throttled_update({
-                "phase": f"uploading batch {batch_num}",
-                "worker_heartbeat": _now(),
-            })
-
             try:
                 mover.move(
                     staging_dir,
                     self.task,
-                    progress_callback=self._on_move_progress,
+                    progress_callback=self._move_progress_cb,
                     cancel_event=self.cancel_event,
                 )
             except TaskError:
@@ -229,18 +181,9 @@ class TaskRunner:
 
             uploaded_bytes += batch_size
 
-            # Update downloaded_gb so totals reflect progress between batches
-            pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
-            try:
-                self.state_manager.update_task(self.task.id, {
-                    "downloaded_gb": round(uploaded_bytes / 1024**3, 2),
-                    "progress_pct": round(pct, 1),
-                    "worker_heartbeat": _now(),
-                })
-            except Exception:
-                pass
+            if self._progress_cb and total_bytes > 0:
+                self._progress_cb(uploaded_bytes, total_bytes, 0)
 
-            # Clean staging for next batch
             shutil.rmtree(staging_dir, ignore_errors=True)
             logger.info(f"Batch {batch_num} done, {uploaded_bytes / 1024**3:.1f}GB uploaded total")
 
@@ -259,46 +202,16 @@ class TaskRunner:
                 self.task.repo_id, repo_type=repo_type, recursive=True
             ):
                 if hasattr(item, "size") and item.size and hasattr(item, "rfilename"):
-                    files.append({
-                        "path": item.rfilename,
-                        "size": item.size,
-                    })
+                    files.append({"path": item.rfilename, "size": item.size})
             return files
         except Exception as e:
             logger.error(f"Failed to list repo files: {e}")
             return []
 
-    def _make_batches(self, files: list) -> list:
-        """Split files into batches that each fit in available disk."""
-        avail = self.disk.available_gb()
-        max_batch_gb = avail * _BATCH_DISK_RATIO
-        max_batch_bytes = int(max_batch_gb * 1024 ** 3)
-
-        # Sort files largest first for better bin-packing
-        files_sorted = sorted(files, key=lambda f: f["size"], reverse=True)
-
-        batches = []
-        current_batch = []
-        current_size = 0
-
-        for f in files_sorted:
-            if current_size + f["size"] > max_batch_bytes and current_batch:
-                batches.append(current_batch)
-                current_batch = []
-                current_size = 0
-            current_batch.append(f)
-            current_size += f["size"]
-
-        if current_batch:
-            batches.append(current_batch)
-
-        return batches
-
     def _download_batch(self, file_paths: list, staging_dir: Path):
         """Download specific files from the repo."""
         import os
 
-        # Split into sub-batches if file list is too long (avoid Errno 7: arg list too long)
         MAX_ARGS = 500
         if len(file_paths) > MAX_ARGS:
             for i in range(0, len(file_paths), MAX_ARGS):
@@ -326,7 +239,8 @@ class TaskRunner:
             text=True,
         )
 
-        stall_timeout = 1800  # 30min with no new bytes = stalled
+        stall_timeout = max(1800, int((self.task.size_gb or 0) * 30 * 60 / max(self.task.size_gb, 1)))
+        stall_timeout = min(stall_timeout, 5400)  # cap at 90 min
         last_progress_time = time.time()
         last_staging_size = self._dir_size(staging_dir)
 
@@ -343,15 +257,11 @@ class TaskRunner:
                 delta = current_size - last_staging_size
                 last_staging_size = current_size
                 last_progress_time = time.time()
-                self._throttled_update({
-                    "downloaded_gb": round(current_size / (1024 ** 3), 2),
-                    "speed_mbps": round(delta / (30 * 1024 * 1024), 1),
-                    "worker_heartbeat": _now(),
-                })
+                if self._progress_cb:
+                    speed_bps = delta / 30
+                    self._progress_cb(current_size, int(self.task.size_gb * 1024**3) or current_size * 2, speed_bps)
             elif time.time() - last_progress_time > stall_timeout:
-                logger.warning(
-                    f"Batch download stalled for {stall_timeout//60}min, killing"
-                )
+                logger.warning(f"Batch download stalled for {stall_timeout//60}min, killing")
                 proc.terminate()
                 proc.wait(timeout=10)
                 raise TaskError(
@@ -376,80 +286,7 @@ class TaskRunner:
     def cancel(self):
         self.cancel_event.set()
 
-    def _update_phase(self, phase: str):
-        try:
-            self.state_manager.update_task(self.task.id, {
-                "phase": phase,
-                "worker_heartbeat": _now(),
-            })
-        except Exception as e:
-            logger.warning(f"Failed to update phase to {phase}: {e}")
-
-    def _throttled_update(self, updates: dict):
-        """Update state, throttled to avoid write storms."""
-        now = time.time()
-        if now - self._last_update_time < _MIN_UPDATE_INTERVAL:
-            return
-        self._last_update_time = now
-        try:
-            self.state_manager.update_task(self.task.id, updates)
-        except Exception as e:
-            logger.debug(f"Throttled update failed: {e}")
-
-    def _on_download_progress(self, downloaded_bytes: int, total_bytes: int, speed_bps: float):
-        """Called by handler periodically."""
-        pressure = self.disk.pressure_level()
-        if pressure == "critical":
-            self.cancel_event.set()
-            raise TaskError("Disk critically full during download", ErrorClass.DISK)
-
-        now = time.time()
-        if now - self._last_update_time < _MIN_UPDATE_INTERVAL:
-            return
-        self._last_update_time = now
-
-        pct = (downloaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
-        pct = min(pct, 100.0)
-        speed_mbps = speed_bps / (1024 * 1024) if speed_bps > 0 else 0
-        eta = int((total_bytes - downloaded_bytes) / speed_bps) if speed_bps > 0 and total_bytes > downloaded_bytes else None
-
-        updates = {
-            "progress_pct": round(pct, 1),
-            "speed_mbps": round(speed_mbps, 1),
-            "downloaded_gb": round(downloaded_bytes / (1024 ** 3), 2),
-            "eta_seconds": eta,
-            "worker_heartbeat": _now(),
-        }
-        if total_bytes > 0:
-            actual_gb = total_bytes / (1024 ** 3)
-            if actual_gb > self.task.size_gb:
-                updates["size_gb"] = round(actual_gb, 2)
-
-        try:
-            self.state_manager.update_task(self.task.id, updates)
-        except Exception as e:
-            logger.debug(f"Progress update failed: {e}")
-
-    def _on_move_progress(self, uploaded_bytes: int, total_bytes: int):
-        """Called by mover periodically."""
-        now = time.time()
-        if now - self._last_update_time < _MIN_UPDATE_INTERVAL:
-            return
-        self._last_update_time = now
-
-        pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
-        pct = min(pct, 100.0)
-        try:
-            self.state_manager.update_task(self.task.id, {
-                "progress_pct": round(pct, 1),
-                "phase": "moving",
-                "worker_heartbeat": _now(),
-            })
-        except Exception as e:
-            logger.debug(f"Move progress update failed: {e}")
-
     def _dir_size(self, path: Path) -> int:
-        """Fast size check using du (Linux) for stall detection."""
         try:
             result = subprocess.run(
                 ["du", "-sb", str(path)],
