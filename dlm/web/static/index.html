@@ -239,7 +239,7 @@
                             <td class="px-3 py-2">
                                 <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium"
                                       :class="statusClass(t.status)">
-                                    <span x-text="t.status"></span>
+                                    <span x-text="t.status === 'preempted' ? '被抢占' : t.status === 'paused' ? '已暂停' : t.status"></span>
                                 </span>
                             </td>
                             <td class="px-3 py-2 text-gray-400 text-xs" x-text="t.server || '-'"></td>
@@ -260,6 +260,15 @@
                             <td class="px-3 py-2 text-gray-400 text-xs" x-text="t.category"></td>
                             <td class="px-3 py-2">
                                 <div class="flex gap-1">
+                                    <button x-show="t.status === 'downloading'"
+                                            @click="pauseTask(t.id)" title="暂停"
+                                            class="px-2 py-1 bg-yellow-600 hover:bg-yellow-700 rounded text-xs">&#9208;</button>
+                                    <button x-show="t.status === 'paused' || t.status === 'preempted'"
+                                            @click="resumeTask(t.id)" title="恢复"
+                                            class="px-2 py-1 bg-green-600 hover:bg-green-700 rounded text-xs">&#9654;</button>
+                                    <button x-show="t.status === 'queued'"
+                                            @click="preemptForTask(t.id)" title="插队"
+                                            class="px-2 py-1 bg-purple-600 hover:bg-purple-700 rounded text-xs">&#9889;</button>
                                     <button x-show="t.status === 'failed' || t.status === 'queued' || t.status === 'needs-auth'"
                                             @click="retryTask(t.id)" title="Retry"
                                             class="px-2 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs">&#8635;</button>
@@ -707,13 +716,18 @@
                 <div class="flex-1 overflow-y-auto">
                     <div x-show="storageJfsLoading" class="text-center text-gray-500 py-4 text-sm">Loading...</div>
                     <div x-show="!storageJfsLoading" class="space-y-0.5">
-                        <template x-for="item in storageJfsItems" :key="item.name">
+                        <template x-for="item in storageJfsItems" :key="(item._root || '') + item.name">
                             <div x-show="!item._separator"
-                                 class="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-700 cursor-pointer"
+                                 class="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-700 cursor-pointer group"
                                  @click="item.is_dir ? jfsNavigate(item) : null">
                                 <span class="text-gray-400 text-xs w-4" x-text="item.is_dir ? '📁' : '📄'"></span>
                                 <span class="flex-1 text-sm truncate" x-text="item.name"
                                       :class="item.is_dir ? 'text-gray-100' : 'text-gray-400'"></span>
+                                <button x-show="item.is_dir && !item._root && !item._separator"
+                                        @click.stop="storageJfsMoveSource = item; storageJfsMoveTarget = ''; storageJfsMoveCategory = ''; showMoveModal = true"
+                                        class="opacity-0 group-hover:opacity-100 px-2 py-0.5 bg-yellow-700 hover:bg-yellow-600 rounded text-[10px] transition-opacity">
+                                    Move →
+                                </button>
                                 <span class="text-xs text-gray-500 w-20 text-right" x-text="item.size ? formatBytes(item.size) : ''"></span>
                             </div>
                         </template>
@@ -782,6 +796,53 @@
     </div>
 
 </main>
+
+<!-- Move Modal -->
+<div x-show="showMoveModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showMoveModal = false">
+    <div class="bg-gray-800 rounded-lg p-6 w-[440px]">
+        <h3 class="font-bold mb-3">Move to Managed Directory</h3>
+        <p class="text-sm text-gray-400 mb-4">
+            Moving: <span class="text-white font-medium" x-text="storageJfsMoveSource?.name"></span>
+        </p>
+        <div class="space-y-2 mb-3">
+            <label class="flex items-center gap-2 p-2.5 rounded cursor-pointer transition-colors"
+                   :class="storageJfsMoveTarget === '/auwomo-datasets/raw-data/' ? 'bg-blue-900/50 ring-1 ring-blue-500' : 'bg-gray-700 hover:bg-gray-600'">
+                <input type="radio" x-model="storageJfsMoveTarget" value="/auwomo-datasets/raw-data/" name="move-target" @change="storageJfsMoveCategory = ''">
+                <span class="text-sm">auwomo-datasets/raw-data/</span>
+                <span class="text-xs text-gray-500 ml-auto">Datasets</span>
+            </label>
+            <label class="flex items-center gap-2 p-2.5 rounded cursor-pointer transition-colors"
+                   :class="storageJfsMoveTarget === '/auwomo-model/' ? 'bg-blue-900/50 ring-1 ring-blue-500' : 'bg-gray-700 hover:bg-gray-600'">
+                <input type="radio" x-model="storageJfsMoveTarget" value="/auwomo-model/" name="move-target" @change="storageJfsMoveCategory = ''">
+                <span class="text-sm">auwomo-model/</span>
+                <span class="text-xs text-gray-500 ml-auto">Models</span>
+            </label>
+        </div>
+        <div x-show="storageJfsMoveTarget" class="mb-4">
+            <label class="text-xs text-gray-400 mb-1 block">Category</label>
+            <select x-model="storageJfsMoveCategory"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500">
+                <option value="">-- Select category --</option>
+                <option value="manipulation">manipulation</option>
+                <option value="whole-body">whole-body</option>
+                <option value="ego-centric">ego-centric</option>
+                <option value="navigation">navigation</option>
+                <option value="driving-vqa">driving-vqa</option>
+                <option value="multimodal">multimodal</option>
+                <option value="other">other</option>
+            </select>
+        </div>
+        <div class="text-xs text-gray-500 mb-4" x-show="storageJfsMoveTarget && storageJfsMoveCategory">
+            Target: <span class="text-gray-300" x-text="storageJfsMoveTarget + storageJfsMoveCategory + '/' + (storageJfsMoveSource?.name || '')"></span>
+        </div>
+        <div class="flex gap-2 justify-end">
+            <button @click="showMoveModal = false; storageJfsMoveSource = null; storageJfsMoveTarget = ''; storageJfsMoveCategory = ''" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm">Cancel</button>
+            <button @click="jfsMove()" :disabled="!storageJfsMoveTarget || !storageJfsMoveCategory || storageJfsMoveLoading"
+                    class="px-4 py-2 bg-green-700 hover:bg-green-600 rounded text-sm font-medium disabled:opacity-50"
+                    x-text="storageJfsMoveLoading ? 'Moving...' : 'Move'"></button>
+        </div>
+    </div>
+</div>
 
 <!-- Add Task Modal -->
 <div x-show="showAddModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showAddModal = false">

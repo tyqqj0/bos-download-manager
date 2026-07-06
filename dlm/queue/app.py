@@ -17,7 +17,8 @@ app.conf.update(
     task_soft_time_limit=86400 * 2,
     worker_prefetch_multiplier=1,
     worker_concurrency=1,
-    worker_max_tasks_per_child=1,
+    worker_max_tasks_per_child=None,
+    worker_max_memory_per_child=8_000_000,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     broker_transport_options={
@@ -31,4 +32,5 @@ app.conf.update(
     },
 )
 
-app.autodiscover_tasks(["dlm.worker", "dlm.transfer"])
+app.autodiscover_tasks(["dlm.transfer"])
+app.conf.include = ["dlm.worker.download", "dlm.transfer.tasks"]

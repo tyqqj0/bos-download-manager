@@ -26,8 +26,8 @@ def _task_for_frontend(t: dict) -> dict:
 
     status = t.get("status", "pending")
     status_map = {"pending": "queued", "downloading": "downloading", "done": "done",
-                  "failed": "failed", "revoked": "skipped", "paused": "queued",
-                  "transferring": "done"}
+                  "failed": "failed", "revoked": "skipped", "paused": "paused",
+                  "preempted": "preempted", "transferring": "done"}
     frontend_status = status_map.get(status, status)
 
     return {

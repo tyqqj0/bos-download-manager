@@ -131,6 +131,25 @@ def download_dataset(self, task_meta: dict):
 
     old_handler = signal.signal(signal.SIGUSR1, _handle_soft_timeout)
 
+    # Signal watcher: polls Redis every 5s for pause/preempt signals
+    stop_watcher = threading.Event()
+
+    def _signal_watcher():
+        from ..queue.signals import check_signal
+        while not stop_watcher.is_set():
+            try:
+                sig = check_signal(task_id)
+                if sig:
+                    logger.info(f"Signal '{sig}' received for task {task_name}")
+                    cancel_event.set()
+                    return
+            except Exception:
+                pass
+            stop_watcher.wait(5)
+
+    watcher = threading.Thread(target=_signal_watcher, daemon=True)
+    watcher.start()
+
     try:
         task_obj = Task(**{k: v for k, v in task_meta.items() if k in Task.__dataclass_fields__})
         runner = TaskRunner(task_obj, server_key=server_key, cancel_event=cancel_event,
@@ -160,14 +179,26 @@ def download_dataset(self, task_meta: dict):
         raise self.retry(countdown=600)
 
     except TaskError as e:
-        logger.error(f"Task {task_name} failed: {e} (class={e.error_class})")
+        # Check if this was triggered by a pause/preempt signal
+        from ..queue.signals import check_signal, signal_clear
+        sig = check_signal(task_id)
+        if sig:
+            signal_clear(task_id)
+            status = "preempted" if sig == "preempt" else "paused"
+            snapshot.update_task_progress(
+                task_id, status=status, phase=None, speed_mbps=0,
+            )
+            logger.info(f"Task {task_name} {status} (reason={sig})")
+            return {"status": status, "task_id": task_id}
+
+        logger.error(f"Task {task_name} failed: {e} (class={e.classification})")
         snapshot.update_task_progress(
             task_id, status="failed", phase=None,
-            error=str(e), error_class=e.error_class.value if hasattr(e.error_class, 'value') else str(e.error_class),
+            error=str(e), error_class=e.classification,
             speed_mbps=0,
         )
 
-        if e.error_class in (ErrorClass.AUTH, ErrorClass.NOT_FOUND):
+        if e.classification in (ErrorClass.AUTH.value, ErrorClass.NOT_FOUND.value):
             snapshot.complete_task(task_id, status="failed")
             return {"status": "failed", "task_id": task_id, "error": str(e), "retryable": False}
 
@@ -185,6 +216,7 @@ def download_dataset(self, task_meta: dict):
         raise self.retry(exc=e, countdown=retry_delay)
 
     finally:
+        stop_watcher.set()
         signal.signal(signal.SIGUSR1, old_handler)
         snapshot.update_worker(
             hostname=socket.gethostname(),

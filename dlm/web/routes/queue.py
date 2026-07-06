@@ -218,10 +218,10 @@ async def interrupt_task(body: dict):
             return {"error": f"Task is not active (status={task['status']})"}
 
         app.control.revoke(task_id, terminate=True, signal="SIGUSR1")
-
         snapshot.update_task_progress(task_id, status="pending", phase="interrupted", speed_mbps=0)
 
         from ...worker.download import download_dataset
+        app.control.revoke(task_id, terminate=False)
         download_dataset.apply_async(
             args=[task], priority=task.get("priority", 5), task_id=task_id,
             countdown=5,
@@ -234,35 +234,44 @@ async def interrupt_task(body: dict):
 
 @router.post("/queue/pause")
 async def pause_task(body: dict):
-    """Pause a task — revoke it without re-enqueueing.
+    """Pause a task using cooperative Redis signals.
+
+    For downloading tasks: sets a Redis signal that the worker checks every 5s,
+    causing graceful exit with staging preserved.
+    For pending tasks: revokes the Celery message.
 
     Body:
         task_id: str
+        reason: str (optional) — "manual" (default) or custom reason
     """
     task_id = body.get("task_id", "")
     if not task_id:
         return {"error": "task_id is required"}
+    reason = body.get("reason", "manual")
 
     def do_pause():
+        from ...queue.signals import signal_pause
         snapshot.init_db()
         task = snapshot.get_task(task_id)
         if not task:
             return {"error": f"Task {task_id} not found"}
 
         if task["status"] == "downloading":
-            app.control.revoke(task_id, terminate=True, signal="SIGUSR1")
+            signal_pause(task_id, reason)
+        elif task["status"] == "pending":
+            app.control.revoke(task_id, terminate=False)
+            snapshot.update_task_progress(task_id, status="paused", phase=None, speed_mbps=0)
+        else:
+            return {"error": f"Cannot pause task in status={task['status']}"}
 
-        app.control.revoke(task_id, terminate=False)
-        snapshot.update_task_progress(task_id, status="paused", phase=None, speed_mbps=0)
-
-        return {"ok": True, "task_id": task_id, "status": "paused"}
+        return {"ok": True, "task_id": task_id, "status": "paused", "message": "Worker will stop within ~5s"}
 
     return await _run_blocking(do_pause)
 
 
 @router.post("/queue/resume")
 async def resume_task(body: dict):
-    """Resume a paused task.
+    """Resume a paused or preempted task.
 
     Body:
         task_id: str
@@ -272,15 +281,19 @@ async def resume_task(body: dict):
         return {"error": "task_id is required"}
 
     def do_resume():
+        from ...queue.signals import signal_clear
         snapshot.init_db()
         task = snapshot.get_task(task_id)
         if not task:
             return {"error": f"Task {task_id} not found"}
 
-        if task["status"] not in ("paused", "failed"):
+        if task["status"] not in ("paused", "preempted", "failed"):
             return {"error": f"Cannot resume task in status={task['status']}"}
 
-        snapshot.update_task_progress(task_id, status="pending", phase="queued")
+        signal_clear(task_id)
+        app.control.revoke(task_id, terminate=False)
+
+        snapshot.update_task_progress(task_id, status="pending", phase="resuming")
 
         from ...worker.download import download_dataset
         download_dataset.apply_async(
@@ -290,6 +303,69 @@ async def resume_task(body: dict):
         return {"ok": True, "task_id": task_id, "status": "pending"}
 
     return await _run_blocking(do_resume)
+
+
+@router.post("/queue/preempt")
+async def preempt_for_task(body: dict):
+    """Preempt: pause the lowest-priority running task to make room for an urgent one.
+
+    Body:
+        urgent_task_id: str — the high-priority task that needs to run NOW
+        target_worker: str (optional) — specific worker to free; auto-selects if omitted
+    """
+    urgent_id = body.get("urgent_task_id", "")
+    if not urgent_id:
+        return {"error": "urgent_task_id is required"}
+    target_worker = body.get("target_worker")
+
+    def do_preempt():
+        from ...queue.signals import signal_pause
+        snapshot.init_db()
+
+        urgent = snapshot.get_task(urgent_id)
+        if not urgent:
+            return {"error": f"Urgent task {urgent_id} not found"}
+        if urgent["status"] == "downloading":
+            return {"error": "Urgent task is already downloading"}
+
+        # Find victim: lowest-priority downloading task (optionally on specific worker)
+        conn = snapshot._conn()
+        if target_worker:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE status = 'downloading' AND server = ? "
+                "ORDER BY priority DESC LIMIT 1",
+                (target_worker,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE status = 'downloading' "
+                "ORDER BY priority DESC, updated_at ASC LIMIT 1",
+            ).fetchone()
+
+        if not row:
+            return {"error": "No active downloading task found to preempt"}
+
+        victim = dict(row)
+
+        # Signal victim to pause
+        signal_pause(victim["id"], "preempt")
+
+        # Dispatch urgent task with 10s delay (wait for victim to exit)
+        from ...worker.download import download_dataset
+        app.control.revoke(urgent_id, terminate=False)
+        download_dataset.apply_async(
+            args=[urgent], priority=0, task_id=urgent_id, countdown=10,
+        )
+        snapshot.update_task_progress(urgent_id, status="pending", phase="preempting")
+
+        return {
+            "ok": True,
+            "preempted_task": {"id": victim["id"], "name": victim["name"]},
+            "urgent_task": {"id": urgent_id, "name": urgent["name"]},
+            "message": f"Pausing '{victim['name']}', '{urgent['name']}' will start in ~10s",
+        }
+
+    return await _run_blocking(do_preempt)
 
 
 @router.delete("/queue/{task_id}")

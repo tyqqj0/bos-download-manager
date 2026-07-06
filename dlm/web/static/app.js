@@ -24,6 +24,28 @@ function app() {
         transferSummary: {},
         transferPaused: false,
 
+        // Storage tab state
+        storageBucket: 'auwomo-data',
+        storageBosPath: [],
+        storageBosItems: [],
+        storageBosLoading: false,
+        storageBosSelected: [],
+        storageJfsSection: 'managed',
+        storageJfsPath: [],
+        storageJfsItems: [],
+        storageJfsLoading: false,
+        storageBottomTab: 'downloads',
+        storageBottomOpen: false,
+        storageAddUrl: '',
+        storageAddCategory: 'other',
+        storageAddType: 'dataset',
+        storageInited: false,
+        storageJfsMoveSource: null,
+        storageJfsMoveTarget: '',
+        storageJfsMoveCategory: '',
+        showMoveModal: false,
+        storageJfsMoveLoading: false,
+
         async init() {
             await this.fetchDashboard();
             await this.fetchTasks();
@@ -115,6 +137,58 @@ function app() {
                     this.showToast('Skip failed', 'error');
                 }
             } catch (e) { this.showToast('Skip failed', 'error'); }
+        },
+
+        async pauseTask(taskId) {
+            try {
+                const res = await fetch('/api/queue/pause', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ task_id: taskId }),
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    this.showToast('暂停信号已发送，~5s 后生效', 'success');
+                    await this.fetchTasks();
+                } else {
+                    this.showToast(data.error || '暂停失败', 'error');
+                }
+            } catch (e) { this.showToast('暂停失败', 'error'); }
+        },
+
+        async resumeTask(taskId) {
+            try {
+                const res = await fetch('/api/queue/resume', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ task_id: taskId }),
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    this.showToast('任务已恢复', 'success');
+                    await this.fetchTasks();
+                } else {
+                    this.showToast(data.error || '恢复失败', 'error');
+                }
+            } catch (e) { this.showToast('恢复失败', 'error'); }
+        },
+
+        async preemptForTask(taskId) {
+            if (!confirm('将暂停一个低优先级下载任务来为此任务腾位。确认插队？')) return;
+            try {
+                const res = await fetch('/api/queue/preempt', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ urgent_task_id: taskId }),
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    this.showToast(data.message, 'success');
+                    await this.fetchTasks();
+                } else {
+                    this.showToast(data.error || '插队失败', 'error');
+                }
+            } catch (e) { this.showToast('插队失败', 'error'); }
         },
 
         async batchAction(action) {
@@ -311,6 +385,8 @@ function app() {
                 failed: 'bg-red-900 text-red-300',
                 skipped: 'bg-gray-700 text-gray-400',
                 'needs-auth': 'bg-yellow-900 text-yellow-300',
+                paused: 'bg-gray-600 text-gray-200',
+                preempted: 'bg-orange-900 text-orange-300',
             };
             return classes[status] || 'bg-gray-700 text-gray-300';
         },
@@ -459,6 +535,193 @@ function app() {
         showToast(message, type = 'success') {
             this.toast = { show: true, message, type };
             setTimeout(() => { this.toast.show = false; }, 3000);
+        },
+
+        // ==================== STORAGE ====================
+
+        get storageRecent() {
+            return this.tasks
+                .filter(t => t.status === 'downloading' || t.status === 'dispatched')
+                .concat(this.tasks.filter(t => t.status === 'done').slice(-3))
+                .slice(0, 8);
+        },
+
+        get storageDownloadCount() {
+            return this.tasks.filter(t => t.status === 'downloading' || t.status === 'dispatched').length;
+        },
+
+        get storageTransferCount() {
+            return this.transferTasks.filter(t => t.transfer_status === 'transferring' || t.transfer_status === 'queued').length;
+        },
+
+        get storageActiveDownloads() {
+            return this.tasks.filter(t => t.status === 'downloading' || t.status === 'dispatched');
+        },
+
+        get storageActiveTransfers() {
+            return this.transferTasks.filter(t => t.transfer_status != null);
+        },
+
+        async initStorage() {
+            if (!this.storageInited) {
+                this.storageInited = true;
+                await this.fetchBos();
+                await this.fetchJfs();
+                await this.fetchTransfer();
+            }
+        },
+
+        async fetchBos() {
+            this.storageBosLoading = true;
+            try {
+                const prefix = this.storageBosPath.length > 0 ? this.storageBosPath.join('/') + '/' : '';
+                const res = await fetch(`/api/storage/bos?bucket=${encodeURIComponent(this.storageBucket)}&prefix=${encodeURIComponent(prefix)}`);
+                const data = await res.json();
+                this.storageBosItems = data.items || [];
+            } catch (e) {
+                console.error('fetchBos:', e);
+                this.storageBosItems = [];
+            }
+            this.storageBosLoading = false;
+        },
+
+        bosNavigate(item) {
+            const name = item.name;
+            this.storageBosPath.push(name);
+            this.storageBosSelected = [];
+            this.fetchBos();
+        },
+
+        async fetchJfs() {
+            this.storageJfsLoading = true;
+            try {
+                let path = '/';
+                if (this.storageJfsSection === 'managed') {
+                    if (this.storageJfsPath.length === 0) {
+                        this.storageJfsItems = [
+                            { name: 'auwomo-datasets/raw-data', is_dir: true, size: 0, _root: '/auwomo-datasets/raw-data/' },
+                            { name: 'auwomo-model', is_dir: true, size: 0, _root: '/auwomo-model/' },
+                        ];
+                        this.storageJfsLoading = false;
+                        return;
+                    }
+                    path = '/' + this.storageJfsPath.join('/') + '/';
+                } else {
+                    if (this.storageJfsPath.length === 0) {
+                        path = '/';
+                    } else {
+                        path = '/' + this.storageJfsPath.join('/') + '/';
+                    }
+                }
+                const res = await fetch(`/api/storage/juicefs?path=${encodeURIComponent(path)}&section=${this.storageJfsSection}`);
+                const data = await res.json();
+                this.storageJfsItems = data.items || [];
+            } catch (e) {
+                console.error('fetchJfs:', e);
+                this.storageJfsItems = [];
+            }
+            this.storageJfsLoading = false;
+        },
+
+        jfsNavigate(item) {
+            if (item._separator) return;
+            if (item._root) {
+                this.storageJfsPath = item._root.split('/').filter(Boolean);
+            } else {
+                this.storageJfsPath.push(item.name);
+            }
+            this.fetchJfs();
+        },
+
+        async jfsMove() {
+            if (!this.storageJfsMoveSource || !this.storageJfsMoveTarget || !this.storageJfsMoveCategory) return;
+            this.storageJfsMoveLoading = true;
+            try {
+                const source = '/' + this.storageJfsPath.concat(this.storageJfsMoveSource.name).join('/');
+                const target = this.storageJfsMoveTarget + this.storageJfsMoveCategory + '/' + this.storageJfsMoveSource.name;
+                const res = await fetch('/api/storage/juicefs/move', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ source, target }),
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    this.showToast(`Moved to ${target}`);
+                    this.showMoveModal = false;
+                    this.storageJfsMoveSource = null;
+                    this.storageJfsMoveTarget = '';
+                    this.storageJfsMoveCategory = '';
+                    await this.fetchJfs();
+                } else {
+                    this.showToast(data.error || 'Move failed', 'error');
+                }
+            } catch (e) {
+                this.showToast('Move failed: network error', 'error');
+            }
+            this.storageJfsMoveLoading = false;
+        },
+
+        async registerSelected() {
+            if (this.storageBosSelected.length === 0) return;
+            let count = 0;
+            for (const prefix of this.storageBosSelected) {
+                const parts = prefix.replace(/\/$/, '').split('/');
+                const name = parts[parts.length - 1];
+                const category = parts.length > 1 ? parts[0] : this.storageAddCategory;
+                try {
+                    const res = await fetch('/api/storage/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            bucket: this.storageBucket,
+                            prefix: prefix.replace(/\/$/, ''),
+                            name: name,
+                            category: category,
+                            type: this.storageBucket === 'auwomo-model-open' ? 'model' : 'dataset',
+                            auto_transfer: true,
+                        }),
+                    });
+                    const data = await res.json();
+                    if (data.ok) count++;
+                } catch (e) { console.error('register error:', e); }
+            }
+            this.showToast(`Registered ${count} items for transfer`);
+            this.storageBosSelected = [];
+            await this.fetchBos();
+        },
+
+        async storageQuickAdd() {
+            if (!this.storageAddUrl) return;
+            try {
+                const res = await fetch('/api/tasks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        url_or_repo: this.storageAddUrl,
+                        category: this.storageAddCategory,
+                        type: this.storageAddType,
+                        priority: 'P1',
+                    }),
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    this.showToast(`Added: ${data.task?.name || 'task'}`);
+                    this.storageAddUrl = '';
+                    await this.fetchTasks();
+                } else {
+                    const data = await res.json();
+                    this.showToast(data.detail || 'Add failed', 'error');
+                }
+            } catch (e) { this.showToast('Add failed', 'error'); }
+        },
+
+        formatBytes(bytes) {
+            if (bytes == null || bytes === 0) return '-';
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
+            if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+            if (bytes < 1024 * 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+            return (bytes / (1024 * 1024 * 1024 * 1024)).toFixed(2) + ' TB';
         },
     };
 }

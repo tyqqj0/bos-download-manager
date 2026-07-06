@@ -78,9 +78,10 @@ def _build_alerts(tasks: list, workers: list) -> list:
 
 
 def _poll_celery_workers() -> list:
-    """Get active Celery workers via inspect."""
+    """Get active Celery workers via inspect and sync task status + progress."""
     from ..queue.app import app as celery_app
-    from ..queue.snapshot import update_worker
+    from ..queue.snapshot import update_worker, update_task_progress, get_task, _conn
+    from celery.result import AsyncResult
 
     try:
         inspect = celery_app.control.inspect(timeout=5)
@@ -88,12 +89,32 @@ def _poll_celery_workers() -> list:
         active_result = inspect.active() or {}
 
         workers = []
+
         for worker_name, _ in ping_result.items():
             parts = worker_name.split("@")
             server_key = parts[0] if parts else worker_name
 
             active_tasks = active_result.get(worker_name, [])
             current_task = active_tasks[0]["id"] if active_tasks else None
+
+            if current_task:
+                result = AsyncResult(current_task, app=celery_app)
+                meta = result.info if isinstance(result.info, dict) else {}
+
+                update_kwargs = {
+                    "status": "downloading",
+                    "server": server_key,
+                }
+                if meta.get("progress_pct") is not None:
+                    update_kwargs["progress_pct"] = meta["progress_pct"]
+                if meta.get("speed_mbps") is not None:
+                    update_kwargs["speed_mbps"] = meta["speed_mbps"]
+                if meta.get("downloaded_gb") is not None:
+                    update_kwargs["downloaded_gb"] = meta["downloaded_gb"]
+                if meta.get("phase"):
+                    update_kwargs["phase"] = meta["phase"]
+
+                update_task_progress(current_task, **update_kwargs)
 
             update_worker(
                 hostname=worker_name,
@@ -108,10 +129,65 @@ def _poll_celery_workers() -> list:
                 "current_task_id": current_task,
             })
 
+        # Ghost task detection: tasks marked "downloading" in SQLite but not
+        # actually running on any Celery worker
+        all_active_ids = set()
+        for worker_tasks in active_result.values():
+            for t in worker_tasks:
+                all_active_ids.add(t["id"])
+
+        try:
+            conn = _conn()
+            downloading = conn.execute(
+                "SELECT id, name, updated_at FROM tasks WHERE status = 'downloading'"
+            ).fetchall()
+
+            for row in downloading:
+                task_id = row["id"]
+                if task_id not in all_active_ids and time.time() - (row["updated_at"] or 0) > 120:
+                    logger.warning(f"Ghost task detected: {row['name']} ({task_id})")
+                    update_task_progress(task_id, status="pending", phase="ghost_recovered", speed_mbps=0)
+        except Exception as e:
+            logger.debug(f"Ghost detection failed: {e}")
+
+        # Auto-resume preempted tasks when workers are idle
+        idle_count = sum(1 for w in workers if w["status"] == "idle")
+        if idle_count > 0:
+            _auto_resume_preempted()
+
         return workers
     except Exception as e:
         logger.debug(f"Celery inspect failed: {e}")
         return []
+
+
+def _auto_resume_preempted():
+    """Resume preempted tasks when a worker becomes available."""
+    from ..queue.snapshot import _conn, update_task_progress
+    from ..queue.signals import signal_clear
+
+    try:
+        conn = _conn()
+        preempted = conn.execute(
+            "SELECT * FROM tasks WHERE status = 'preempted' ORDER BY priority ASC LIMIT 1"
+        ).fetchone()
+
+        if not preempted:
+            return
+
+        task = dict(preempted)
+        signal_clear(task["id"])
+        update_task_progress(task["id"], status="pending", phase="auto_resuming")
+
+        from ..worker.download import download_dataset
+        from ..queue.app import app as celery_app
+        celery_app.control.revoke(task["id"], terminate=False)
+        download_dataset.apply_async(
+            args=[task], priority=task.get("priority", 5), task_id=task["id"],
+        )
+        logger.info(f"Auto-resumed preempted task: {task['name']}")
+    except Exception as e:
+        logger.debug(f"Auto-resume failed: {e}")
 
 
 def _poll_transfers():
