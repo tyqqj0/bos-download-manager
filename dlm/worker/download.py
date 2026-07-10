@@ -90,8 +90,6 @@ class _ProgressReporter:
     retry_backoff=True,
     retry_backoff_max=3600,
     retry_jitter=True,
-    acks_late=True,
-    reject_on_worker_lost=True,
 )
 def download_dataset(self, task_meta: dict):
     """Download a dataset and upload to BOS.
@@ -109,6 +107,22 @@ def download_dataset(self, task_meta: dict):
     server_key = os.environ.get("DLM_SERVER_KEY", socket.gethostname())
 
     logger.info(f"Starting download: {task_name} (id={task_id}, attempt={self.request.retries + 1})")
+
+    # Dedup guard: check if another worker is already running this task
+    try:
+        inspect = app.control.inspect(timeout=3)
+        active = inspect.active() or {}
+        for worker_name, tasks in active.items():
+            if server_key in worker_name:
+                continue
+            for t in tasks:
+                args = t.get("args", [])
+                other_id = args[0].get("id") if args and isinstance(args[0], dict) else t.get("id")
+                if other_id == task_id:
+                    logger.warning(f"Dedup: {task_name} already running on {worker_name}, skipping")
+                    return {"status": "dedup_skipped", "task_id": task_id}
+    except Exception as e:
+        logger.debug(f"Dedup check failed (continuing): {e}")
 
     snapshot.init_db()
     snapshot.update_task_progress(

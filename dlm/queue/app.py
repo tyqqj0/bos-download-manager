@@ -1,8 +1,21 @@
 """Celery application configuration."""
 
 import os
+from pathlib import Path
 
 from celery import Celery
+
+# Ensure .env is loaded (web server may not have it in os.environ)
+try:
+    from dotenv import load_dotenv
+    for candidate in [
+        Path(__file__).resolve().parents[2] / ".env",
+        Path.home() / ".env",
+    ]:
+        if candidate.exists():
+            load_dotenv(candidate)
+except ImportError:
+    pass
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
@@ -19,8 +32,8 @@ app.conf.update(
     worker_concurrency=1,
     worker_max_tasks_per_child=None,
     worker_max_memory_per_child=8_000_000,
-    task_acks_late=True,
-    task_reject_on_worker_lost=True,
+    task_acks_late=False,
+    task_reject_on_worker_lost=False,
     broker_transport_options={
         "priority_steps": list(range(10)),
         "sep": ":",

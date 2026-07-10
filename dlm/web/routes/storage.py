@@ -214,6 +214,9 @@ async def move_juicefs(body: dict):
     if not any(target.startswith(p) for p in MANAGED_PREFIXES):
         return {"error": f"Target must be under a managed directory: {MANAGED_PREFIXES}"}
 
+    if source == target:
+        return {"error": "Source and target are the same"}
+
     dcloud_user = os.environ.get("DCLOUD_USER")
     dcloud_pass = os.environ.get("DCLOUD_PASS")
     if not dcloud_user or not dcloud_pass:

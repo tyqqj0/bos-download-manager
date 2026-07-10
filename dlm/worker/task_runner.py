@@ -1,5 +1,6 @@
 """Task runner — orchestrates download + move for a single task."""
 
+import json
 import shutil
 import subprocess
 import logging
@@ -114,7 +115,6 @@ class TaskRunner:
             raise TaskError(f"Could not list files for {self.task.repo_id}", ErrorClass.UNKNOWN)
 
         total_bytes = sum(f["size"] for f in files)
-        uploaded_bytes = 0
 
         real_gb = total_bytes / (1024 ** 3)
         if real_gb > self.task.size_gb:
@@ -122,7 +122,24 @@ class TaskRunner:
 
         logger.info(f"Chunked: {len(files)} files, {real_gb:.1f}GB total")
 
+        # Resume support: load progress from BOS to skip already-uploaded files
+        completed_files = self._load_progress()
         files_sorted = sorted(files, key=lambda f: f["size"], reverse=True)
+        if completed_files:
+            before = len(files_sorted)
+            files_sorted = [f for f in files_sorted if f["path"] not in completed_files]
+            skipped = before - len(files_sorted)
+            skipped_bytes = sum(
+                f["size"] for f in files if f["path"] in completed_files
+            )
+            logger.info(
+                f"Resume: skipping {skipped} already-uploaded files "
+                f"({skipped_bytes / 1024**3:.1f}GB)"
+            )
+            uploaded_bytes = skipped_bytes
+        else:
+            uploaded_bytes = 0
+
         remaining_files = list(files_sorted)
         batch_num = 0
 
@@ -179,6 +196,10 @@ class TaskRunner:
             except Exception as e:
                 raise TaskError(str(e), classify_error(e)) from e
 
+            # Save progress after successful batch upload
+            completed_files.update(batch_files_list)
+            self._save_progress(completed_files)
+
             uploaded_bytes += batch_size
 
             if self._progress_cb and total_bytes > 0:
@@ -187,6 +208,8 @@ class TaskRunner:
             shutil.rmtree(staging_dir, ignore_errors=True)
             logger.info(f"Batch {batch_num} done, {uploaded_bytes / 1024**3:.1f}GB uploaded total")
 
+        # All done — remove progress file
+        self._clear_progress()
         logger.info(f"Task {self.task.id} chunked download completed: {batch_num} batches")
 
     def _list_repo_files(self) -> list:
@@ -223,11 +246,13 @@ class TaskRunner:
             "hf", "download", self.task.repo_id,
             "--local-dir", str(staging_dir),
             "--repo-type", self.task.type,
+            "--max-workers", "32",
         ]
         cmd.extend(file_paths)
 
         env = os.environ.copy()
         env["HF_HUB_CACHE"] = "/tmp/hf_cache"
+        env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         if os.environ.get("HF_TOKEN"):
             env["HF_TOKEN"] = os.environ["HF_TOKEN"]
 
@@ -285,6 +310,55 @@ class TaskRunner:
 
     def cancel(self):
         self.cancel_event.set()
+
+    def _progress_key(self) -> tuple:
+        """Return (bucket, key) for this task's progress file on BOS."""
+        if self.task.type == "model":
+            bucket = MODEL_BUCKET
+            prefix = f"{self.task.name}/"
+        else:
+            bucket = DATA_BUCKET
+            prefix = f"{self.task.category}/{self.task.name}/"
+        return bucket, prefix + "_chunked_progress.json"
+
+    def _load_progress(self) -> set:
+        """Load set of already-uploaded file paths from BOS progress file."""
+        try:
+            from ..core.bos import create_bos_client
+            from ..core.config import load_config
+            config = load_config()
+            client = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
+            bucket, key = self._progress_key()
+            resp = client.get_object_as_string(bucket, key)
+            data = json.loads(resp)
+            return set(data) if isinstance(data, list) else set()
+        except Exception:
+            return set()
+
+    def _save_progress(self, completed: set):
+        """Save completed file paths to BOS progress file."""
+        try:
+            from ..core.bos import create_bos_client
+            from ..core.config import load_config
+            config = load_config()
+            client = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
+            bucket, key = self._progress_key()
+            data = json.dumps(sorted(completed)).encode()
+            client.put_object(bucket, key, data, len(data))
+        except Exception as e:
+            logger.warning(f"Failed to save progress to BOS: {e}")
+
+    def _clear_progress(self):
+        """Remove progress file from BOS after task completes."""
+        try:
+            from ..core.bos import create_bos_client
+            from ..core.config import load_config
+            config = load_config()
+            client = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
+            bucket, key = self._progress_key()
+            client.delete_object(bucket, key)
+        except Exception:
+            pass
 
     def _dir_size(self, path: Path) -> int:
         try:

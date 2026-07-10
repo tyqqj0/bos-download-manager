@@ -4,13 +4,10 @@ Workers poll these signals every 5s. Setting a signal causes the worker
 to gracefully cancel its current task (preserving staging for resume).
 """
 
-import os
-
 import redis
 
 _redis = None
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 SIGNAL_PREFIX = "dlm:signal:"
 SIGNAL_TTL = 86400
 
@@ -18,6 +15,7 @@ SIGNAL_TTL = 86400
 def get_redis():
     global _redis
     if _redis is None:
+        from .app import REDIS_URL
         _redis = redis.from_url(REDIS_URL, decode_responses=True)
     return _redis
 

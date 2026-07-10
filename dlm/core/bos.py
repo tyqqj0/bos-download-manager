@@ -20,6 +20,31 @@ def create_bos_client(ak: str, sk: str, endpoint: str) -> BosClient:
     return BosClient(config)
 
 
+def list_prefixes(client: BosClient, bucket: str, prefix: str = "", delimiter: str = "/"):
+    """List sub-directories and files directly under a prefix.
+
+    Returns (dirs, files) where dirs are prefix strings and files are (key, size) tuples.
+    """
+    dirs = []
+    files = []
+    marker = ""
+    while True:
+        response = client.list_objects(
+            bucket, prefix=prefix, delimiter=delimiter, marker=marker, max_keys=1000
+        )
+        if hasattr(response, "common_prefixes") and response.common_prefixes:
+            for p in response.common_prefixes:
+                dirs.append(p.prefix)
+        if response.contents:
+            for obj in response.contents:
+                if obj.key != prefix:
+                    files.append((obj.key, obj.size))
+        if not response.is_truncated:
+            break
+        marker = response.next_marker
+    return dirs, files
+
+
 def get_prefix_size(client: BosClient, bucket: str, prefix: str) -> int:
     """Sum total bytes of all objects under a prefix (paginated)."""
     total = 0

@@ -24,8 +24,8 @@ TAR_WORKERS = 4
 EXCLUDE_PATTERNS = (".incomplete", ".huggingface", ".cache", "__pycache__")
 
 # Tar mode triggers when avg file size < 5MB AND file count >= 100
-SMALL_FILE_THRESHOLD = 5 * 1024 * 1024
-MIN_FILES_FOR_TAR = 100
+SMALL_FILE_THRESHOLD = 50 * 1024 * 1024
+MIN_FILES_FOR_TAR = 50
 
 
 class BOSSDKMover(Mover):
