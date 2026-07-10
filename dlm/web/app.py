@@ -1,4 +1,4 @@
-"""FastAPI application factory — Celery + Redis architecture."""
+"""FastAPI application factory — Temporal workflow architecture."""
 
 import asyncio
 import logging
@@ -31,8 +31,8 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(
         title="DLM Dashboard",
-        description="Dataset Download Manager — Celery + Redis",
-        version="2.0.0",
+        description="Dataset Download Manager — Temporal Workflows",
+        version="3.0.0",
         lifespan=lifespan,
     )
 

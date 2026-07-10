@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dlm"
-version = "2.0.0"
-description = "Dataset download manager — Celery + Redis task queue with multi-server workers"
+version = "3.0.0"
+description = "Dataset download manager — Temporal workflow architecture"
 requires-python = ">=3.9"
 dependencies = [
     "click>=8.0",
@@ -13,7 +13,7 @@ dependencies = [
     "bce-python-sdk>=0.9",
     "pyyaml>=6.0",
     "huggingface_hub>=0.20",
-    "celery[redis]>=5.3",
+    "temporalio>=1.5",
     "redis>=5.0",
 ]
 
