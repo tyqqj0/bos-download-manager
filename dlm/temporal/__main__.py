@@ -41,6 +41,32 @@ def parse_args():
     return parser.parse_args()
 
 
+async def _heartbeat_loop(server_key: str):
+    """Report worker status to S1 dashboard every 15s."""
+    import shutil
+    import requests
+
+    coordinator = os.environ.get("DLM_COORDINATOR", "http://154.85.43.52:8080")
+    staging = Path("/data/staging")
+
+    while True:
+        try:
+            disk_free = shutil.disk_usage(staging).free / (1024 ** 3)
+            requests.post(
+                f"{coordinator}/api/worker-heartbeat",
+                json={
+                    "server_key": server_key,
+                    "hostname": f"{server_key}@temporal",
+                    "disk_free_gb": round(disk_free, 1),
+                    "status": "online",
+                },
+                timeout=5,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(15)
+
+
 async def run_worker(args):
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
@@ -93,7 +119,12 @@ async def run_worker(args):
     )
 
     logger.info("Worker running. Waiting for tasks...")
-    await worker.run()
+    # Start heartbeat loop before worker
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(args.server_key))
+    try:
+        await worker.run()
+    finally:
+        heartbeat_task.cancel()
 
 
 def main():

@@ -50,3 +50,21 @@ async def ping_worker(key: str):
             return {"key": key, "status": "error", "error": str(e)}
 
     return await run_blocking(_do)
+
+
+@router.post("/worker-heartbeat")
+async def worker_heartbeat(body: dict):
+    """Receive worker heartbeat and update dashboard snapshot."""
+    def _do():
+        from ...queue.snapshot import init_db, update_worker
+        init_db()
+        update_worker(
+            hostname=body.get("hostname", ""),
+            server_key=body["server_key"],
+            status=body.get("status", "online"),
+            current_task_id=body.get("current_task_id"),
+            disk_free_gb=body.get("disk_free_gb"),
+        )
+        return {"ok": True}
+
+    return await run_blocking(_do)
