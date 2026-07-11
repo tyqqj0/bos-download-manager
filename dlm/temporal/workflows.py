@@ -57,25 +57,39 @@ class DownloadDatasetWorkflow:
             start_to_close_timeout=timedelta(minutes=5),
         )
 
-        # 3. List files
-        try:
-            file_dicts = await workflow.execute_activity(
-                "list_repo_files",
-                args=[task_input],
-                start_to_close_timeout=timedelta(minutes=10),
-                heartbeat_timeout=timedelta(minutes=3),
-                retry_policy=ACTIVITY_RETRY,
-            )
-        except Exception as e:
-            error_msg = str(e)
-            await workflow.execute_activity(
-                "report_to_dashboard",
-                args=[task_input.id, "failed", None, None, None, None, server_key, error_msg],
-                start_to_close_timeout=timedelta(seconds=30),
-            )
-            return TaskResult(status="failed", error=error_msg)
+        # 3. List files (saves to disk, returns path)
+        if task_input.filelist_path:
+            filelist_path = task_input.filelist_path
+        else:
+            try:
+                filelist_path = await workflow.execute_activity(
+                    "list_repo_files",
+                    args=[task_input],
+                    start_to_close_timeout=timedelta(minutes=30),
+                    heartbeat_timeout=timedelta(minutes=3),
+                    retry_policy=ACTIVITY_RETRY,
+                )
+            except Exception as e:
+                error_msg = str(e)
+                await workflow.execute_activity(
+                    "report_to_dashboard",
+                    args=[task_input.id, "failed", None, None, None, None, server_key, error_msg],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+                return TaskResult(status="failed", error=error_msg)
 
-        if not file_dicts:
+        # 3b. Read file list metadata (count + total size only)
+        filelist_meta = await workflow.execute_activity(
+            "read_filelist",
+            args=[filelist_path],
+            start_to_close_timeout=timedelta(minutes=5),
+        )
+
+        total_file_count = filelist_meta["count"]
+        total_bytes = filelist_meta["total_bytes"]
+        total_gb = total_bytes / (1024 ** 3)
+
+        if total_file_count == 0:
             await workflow.execute_activity(
                 "report_to_dashboard",
                 args=[task_input.id, "failed", None, None, None, None, server_key, "No files found in repo"],
@@ -83,40 +97,24 @@ class DownloadDatasetWorkflow:
             )
             return TaskResult(status="failed", error="No files found in repo")
 
-        # 4. Filter to assigned files (for split tasks)
-        if task_input.assigned_files:
-            assigned_set = set(task_input.assigned_files)
-            file_dicts = [f for f in file_dicts if f["path"] in assigned_set]
-
-        total_bytes = sum(f["size"] for f in file_dicts)
-        total_gb = total_bytes / (1024 ** 3)
-
-        # 5. Load progress (resume support)
+        # 4. Load progress (resume support — each entry = one completed batch)
         completed_paths = await workflow.execute_activity(
             "load_progress",
             args=[task_input],
             start_to_close_timeout=timedelta(seconds=30),
         )
 
-        if completed_paths:
-            completed_set = set(completed_paths)
-            file_dicts = [f for f in file_dicts if f["path"] not in completed_set]
-            # recalculate uploaded bytes from remaining
-            uploaded_bytes = total_bytes - sum(f["size"] for f in file_dicts)
-        else:
-            uploaded_bytes = 0
+        completed_batches = len(completed_paths) if completed_paths else 0
+        start_idx = completed_batches * BATCH_SIZE
+        uploaded_bytes = int(total_bytes * min(start_idx, total_file_count) / total_file_count) if start_idx > 0 else 0
 
-        # 6. Process in batches
-        batch_num = 0
-        all_completed = list(completed_paths) if completed_paths else []
+        # 5. Process in batches (by index into the on-disk file list)
+        batch_num = completed_batches
+        all_batch_markers = list(completed_paths) if completed_paths else []
 
-        # Sort: largest files first for better disk utilization
-        file_dicts.sort(key=lambda f: f["size"], reverse=True)
-
-        while file_dicts:
+        while start_idx < total_file_count:
             batch_num += 1
-            batch = file_dicts[:BATCH_SIZE]
-            file_dicts = file_dicts[BATCH_SIZE:]
+            current_batch_size = min(BATCH_SIZE, total_file_count - start_idx)
 
             pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
 
@@ -130,7 +128,7 @@ class DownloadDatasetWorkflow:
             # Run pipeline for this batch
             result = await workflow.execute_activity(
                 "run_pipeline_batch",
-                args=[task_input, batch],
+                args=[task_input, filelist_path, start_idx, current_batch_size],
                 start_to_close_timeout=timedelta(hours=24),
                 heartbeat_timeout=timedelta(minutes=10),
                 retry_policy=RetryPolicy(
@@ -142,18 +140,18 @@ class DownloadDatasetWorkflow:
                 ),
             )
 
-            # Save progress checkpoint
+            # Update progress
             uploaded_bytes += result["uploaded_bytes"]
-            batch_paths = [f["path"] for f in batch]
-            all_completed.extend(batch_paths)
+            start_idx += current_batch_size
+            all_batch_markers.append(f"batch-{batch_num}-done")
 
             await workflow.execute_activity(
                 "save_progress",
-                args=[task_input.name, all_completed],
+                args=[task_input.name, all_batch_markers],
                 start_to_close_timeout=timedelta(seconds=30),
             )
 
-        # 7. Done!
+        # 6. Done!
         await workflow.execute_activity(
             "clear_progress",
             args=[task_input.name],
@@ -172,7 +170,7 @@ class DownloadDatasetWorkflow:
 
         return TaskResult(
             status="done",
-            files_uploaded=len(all_completed),
+            files_uploaded=total_file_count,
             bytes_uploaded=uploaded_bytes,
         )
 
@@ -188,47 +186,44 @@ class SplitDownloadWorkflow:
 
     @workflow.run
     async def run(self, task_input: TaskInput, worker_count: int = 2) -> TaskResult:
-        # List all files
-        file_dicts = await workflow.execute_activity(
+        # List all files (saves to disk)
+        filelist_path = await workflow.execute_activity(
             "list_repo_files",
             args=[task_input],
-            start_to_close_timeout=timedelta(minutes=10),
+            start_to_close_timeout=timedelta(minutes=30),
             heartbeat_timeout=timedelta(minutes=3),
             retry_policy=ACTIVITY_RETRY,
         )
 
-        if not file_dicts:
+        # Partition into chunks on the worker (avoids sending full list via gRPC)
+        partitions = await workflow.execute_activity(
+            "partition_filelist",
+            args=[filelist_path, worker_count],
+            start_to_close_timeout=timedelta(minutes=5),
+        )
+
+        if not partitions:
             return TaskResult(status="failed", error="No files found")
 
-        # Greedy partition by size
-        file_dicts.sort(key=lambda f: f["size"], reverse=True)
-        chunks: list[list] = [[] for _ in range(worker_count)]
-        chunk_sizes = [0] * worker_count
-
-        for f in file_dicts:
-            min_idx = chunk_sizes.index(min(chunk_sizes))
-            chunks[min_idx].append(f["path"])
-            chunk_sizes[min_idx] += f["size"]
-
-        # Launch child workflows
+        # Launch child workflows — each gets its own filelist partition
         child_handles = []
-        for i, chunk in enumerate(chunks):
+        for i, part in enumerate(partitions):
             child_input = TaskInput(
                 id=f"{task_input.id}-part{i+1}",
-                name=f"{task_input.name}",  # same name — same BOS prefix
+                name=task_input.name,
                 repo_id=task_input.repo_id,
                 source=task_input.source,
                 type=task_input.type,
                 category=task_input.category,
                 priority=task_input.priority,
-                size_gb=chunk_sizes[i] / (1024 ** 3),
-                assigned_files=chunk,
+                size_gb=part["total_bytes"] / (1024 ** 3),
+                filelist_path=part["path"],
             )
             handle = await workflow.start_child_workflow(
                 DownloadDatasetWorkflow.run,
                 args=[child_input],
                 id=f"{task_input.id}-part{i+1}",
-                task_queue=f"download-workers",  # any available worker
+                task_queue="download-workers",
             )
             child_handles.append(handle)
 

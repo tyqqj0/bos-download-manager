@@ -20,8 +20,12 @@ STAGING_PATH = Path("/data/staging")
 
 
 @activity.defn
-async def list_repo_files(task_input: TaskInput) -> list[dict]:
-    """List all files in the HF repo. Returns list of {path, size} dicts."""
+async def list_repo_files(task_input: TaskInput) -> str:
+    """List all files in the HF repo. Saves to disk, returns file path.
+
+    Returns path to a JSON file containing list of {path, size} dicts.
+    This avoids gRPC message size limits for repos with 100k+ files.
+    """
     def _list():
         from huggingface_hub import HfApi
 
@@ -35,12 +39,18 @@ async def list_repo_files(task_input: TaskInput) -> list[dict]:
             if hasattr(item, "size") and item.size and hasattr(item, "rfilename"):
                 files.append({"path": item.rfilename, "size": item.size})
 
-        return files
+        # Save to local file instead of returning via gRPC
+        staging_dir = STAGING_PATH / task_input.name
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        filelist_path = staging_dir / ".filelist.json"
+        filelist_path.write_text(json.dumps(files))
+
+        return str(filelist_path), len(files)
 
     activity.heartbeat("listing repo files...")
-    result = await asyncio.to_thread(_list)
-    activity.heartbeat(f"found {len(result)} files")
-    return result
+    path, count = await asyncio.to_thread(_list)
+    activity.heartbeat(f"found {count} files, saved to {path}")
+    return path
 
 
 @activity.defn
@@ -55,6 +65,63 @@ async def load_progress(task_input: TaskInput) -> list[str]:
     except Exception:
         pass
     return []
+
+
+@activity.defn
+async def read_filelist(filelist_path: str) -> dict:
+    """Read file list metadata from local JSON file (written by list_repo_files).
+
+    Returns {count, total_bytes} — NOT the full list (would exceed gRPC limits).
+    Activities that need the file list read it directly from disk.
+    """
+    path = Path(filelist_path)
+    if not path.exists():
+        return {"count": 0, "total_bytes": 0}
+    data = json.loads(path.read_text())
+    files = data if isinstance(data, list) else []
+    total_bytes = sum(f.get("size", 0) for f in files)
+    return {"count": len(files), "total_bytes": total_bytes}
+
+
+@activity.defn
+async def partition_filelist(filelist_path: str, num_chunks: int) -> list:
+    """Partition a file list into N chunks balanced by size.
+
+    Writes separate filelist files for each chunk and returns metadata:
+    [{path, count, total_bytes}, ...]
+    """
+    path = Path(filelist_path)
+    if not path.exists():
+        return []
+
+    all_files = json.loads(path.read_text())
+    if not all_files:
+        return []
+
+    # Sort largest first for greedy partition
+    all_files.sort(key=lambda f: f.get("size", 0), reverse=True)
+
+    chunks: list[list] = [[] for _ in range(num_chunks)]
+    chunk_sizes = [0] * num_chunks
+
+    for f in all_files:
+        min_idx = chunk_sizes.index(min(chunk_sizes))
+        chunks[min_idx].append(f)
+        chunk_sizes[min_idx] += f.get("size", 0)
+
+    # Write each chunk to its own file
+    results = []
+    parent = path.parent
+    for i, chunk in enumerate(chunks):
+        chunk_path = parent / f".filelist-part{i+1}.json"
+        chunk_path.write_text(json.dumps(chunk))
+        results.append({
+            "path": str(chunk_path),
+            "count": len(chunk),
+            "total_bytes": chunk_sizes[i],
+        })
+
+    return results
 
 
 @activity.defn
@@ -76,17 +143,23 @@ async def clear_progress(task_name: str):
 
 
 @activity.defn
-async def run_pipeline_batch(task_input: TaskInput, file_dicts: list[dict]) -> dict:
+async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
+                              start_idx: int, batch_size: int) -> dict:
     """Run the download+upload pipeline for a batch of files.
 
-    This is the core activity — it handles concurrent download and upload
-    with disk backpressure. Sends heartbeats with progress.
+    Reads the file list from disk (filelist_path) and processes files
+    from start_idx to start_idx + batch_size.
 
     Returns dict with stats.
     """
     from .pipeline import PipelineEngine
 
-    files = [FileInfo(path=f["path"], size=f["size"]) for f in file_dicts]
+    # Read file list from disk (avoids gRPC size limits)
+    filelist = Path(filelist_path)
+    all_files = json.loads(filelist.read_text())
+    batch_dicts = all_files[start_idx:start_idx + batch_size]
+
+    files = [FileInfo(path=f["path"], size=f["size"]) for f in batch_dicts]
     staging_dir = STAGING_PATH / task_input.name
     staging_dir.mkdir(parents=True, exist_ok=True)
 

@@ -18,6 +18,7 @@ class TaskInput:
     priority: int = 5
     size_gb: float = 0
     assigned_files: list = field(default_factory=list)  # for split tasks
+    filelist_path: Optional[str] = None  # pre-computed filelist (skip list_repo_files)
 
 
 @dataclass

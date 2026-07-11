@@ -19,6 +19,8 @@ from .workflows import DownloadDatasetWorkflow, SplitDownloadWorkflow
 from .activities import (
     list_repo_files,
     load_progress,
+    read_filelist,
+    partition_filelist,
     save_progress,
     clear_progress,
     run_pipeline_batch,
@@ -88,12 +90,14 @@ async def run_worker(args):
     logger.info(f"Connecting to Temporal at {args.temporal_host}...")
     client = await Client.connect(args.temporal_host)
 
-    task_queue = args.task_queue or f"download-{args.server_key}"
+    task_queue = args.task_queue or "download-workers"
 
     # Register activities and workflows
     activities = [
         list_repo_files,
         load_progress,
+        read_filelist,
+        partition_filelist,
         save_progress,
         clear_progress,
         run_pipeline_batch,
