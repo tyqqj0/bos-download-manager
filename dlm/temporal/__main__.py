@@ -91,6 +91,11 @@ async def run_worker(args):
     client = await Client.connect(args.temporal_host)
 
     task_queue = args.task_queue or "download-workers"
+    personal_queue = f"download-{args.server_key}"
+
+    # Export server key so activities can report it
+    os.environ["DLM_SERVER_KEY"] = args.server_key
+    os.environ["DLM_WORKER_QUEUE"] = personal_queue
 
     # Register activities and workflows
     activities = [
@@ -111,22 +116,32 @@ async def run_worker(args):
         SplitDownloadWorkflow,
     ]
 
-    logger.info(f"Starting worker: server_key={args.server_key}, queue={task_queue}")
+    logger.info(f"Starting worker: server_key={args.server_key}, queues=[{task_queue}, {personal_queue}]")
     logger.info(f"Registered {len(workflows)} workflows, {len(activities)} activities")
 
-    # Run worker — polls Temporal for tasks automatically
-    worker = Worker(
+    # Shared queue: picks up new workflows — limit to 1 so each worker
+    # only claims one dataset at a time from the shared pool
+    worker_shared = Worker(
         client,
         task_queue=task_queue,
         workflows=workflows,
         activities=activities,
+        max_concurrent_workflow_tasks=1,
     )
 
-    logger.info("Worker running. Waiting for tasks...")
+    # Personal queue: pinned activities (file-local operations)
+    worker_personal = Worker(
+        client,
+        task_queue=personal_queue,
+        workflows=workflows,
+        activities=activities,
+    )
+
+    logger.info("Workers running. Waiting for tasks...")
     # Start heartbeat loop before worker
     heartbeat_task = asyncio.create_task(_heartbeat_loop(args.server_key))
     try:
-        await worker.run()
+        await asyncio.gather(worker_shared.run(), worker_personal.run())
     finally:
         heartbeat_task.cancel()
 

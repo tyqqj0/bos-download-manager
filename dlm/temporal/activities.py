@@ -20,11 +20,11 @@ STAGING_PATH = Path("/data/staging")
 
 
 @activity.defn
-async def list_repo_files(task_input: TaskInput) -> str:
-    """List all files in the HF repo. Saves to disk, returns file path.
+async def list_repo_files(task_input: TaskInput) -> dict:
+    """List all files in the HF repo. Saves to disk, returns metadata.
 
-    Returns path to a JSON file containing list of {path, size} dicts.
-    This avoids gRPC message size limits for repos with 100k+ files.
+    Returns {path, count, total_bytes, worker_queue} — the file list stays on
+    disk to avoid gRPC limits. worker_queue pins subsequent activities to this worker.
     """
     def _list():
         from huggingface_hub import HfApi
@@ -45,12 +45,20 @@ async def list_repo_files(task_input: TaskInput) -> str:
         filelist_path = staging_dir / ".filelist.json"
         filelist_path.write_text(json.dumps(files))
 
-        return str(filelist_path), len(files)
+        total_bytes = sum(f["size"] for f in files)
+        return str(filelist_path), len(files), total_bytes
 
     activity.heartbeat("listing repo files...")
-    path, count = await asyncio.to_thread(_list)
+    path, count, total_bytes = await asyncio.to_thread(_list)
     activity.heartbeat(f"found {count} files, saved to {path}")
-    return path
+
+    worker_queue = os.environ.get("DLM_WORKER_QUEUE", "download-workers")
+    return {
+        "path": path,
+        "count": count,
+        "total_bytes": total_bytes,
+        "worker_queue": worker_queue,
+    }
 
 
 @activity.defn

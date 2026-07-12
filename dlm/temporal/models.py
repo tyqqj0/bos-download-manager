@@ -34,6 +34,7 @@ class PipelineStats:
     total_files: int = 0
     downloaded_files: int = 0
     uploaded_files: int = 0
+    failed_files: int = 0
     total_bytes: int = 0
     uploaded_bytes: int = 0
     speed_mbps: float = 0

@@ -136,7 +136,7 @@ class PipelineEngine:
 
             try:
                 await download_file(
-                    self.task, file_info, local_path,
+                    self.task, file_info, local_path, self.staging_dir,
                 )
                 self.stats.downloaded_files += 1
 
@@ -197,9 +197,13 @@ class PipelineEngine:
 
             except Exception as e:
                 logger.error(f"Upload failed {file_info.path}: {e}")
-                # Re-queue for retry
-                await upload_queue.put((file_info, local_path))
-                await asyncio.sleep(5)
+                if local_path.exists():
+                    # Re-queue for retry only if file still exists
+                    await upload_queue.put((file_info, local_path))
+                    await asyncio.sleep(5)
+                else:
+                    logger.error(f"File missing, skipping upload: {local_path}")
+                    self.stats.failed_files += 1
 
     async def _disk_monitor(self):
         """Monitor disk usage, pause/resume downloads."""

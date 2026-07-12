@@ -16,12 +16,16 @@ ARIA2C_CONNECTIONS = 16
 ARIA2C_MIN_FILE_SIZE = 100 * 1024 * 1024  # 100MB — below this, hf download is fine
 
 
-async def download_file(task: TaskInput, file_info: FileInfo, local_path: Path):
+async def download_file(task: TaskInput, file_info: FileInfo, local_path: Path,
+                        staging_dir: Optional[Path] = None):
     """Download a single file using the best strategy.
 
     Strategy selection:
     - Large file (>100MB) + non-XET: aria2c with 16 connections
     - Everything else: hf download (handles XET, auth, small files)
+
+    staging_dir: base staging directory. Required for hf download which
+    preserves relative paths under --local-dir.
     """
     if local_path.exists() and local_path.stat().st_size == file_info.size:
         logger.debug(f"Already exists: {file_info.path}")
@@ -33,8 +37,10 @@ async def download_file(task: TaskInput, file_info: FileInfo, local_path: Path):
             await _download_aria2c(url, local_path, file_info.path)
             return
 
-    # Fallback: hf download
-    await _download_hf(task, [file_info.path], local_path.parent)
+    # hf download preserves file_info.path under --local-dir,
+    # so we must pass the BASE staging dir, not local_path.parent
+    base_dir = staging_dir if staging_dir else local_path.parent
+    await _download_hf(task, [file_info.path], base_dir)
 
 
 async def download_batch_hf(task: TaskInput, file_paths: list[str], staging_dir: Path):

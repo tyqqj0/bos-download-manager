@@ -50,19 +50,21 @@ class DownloadDatasetWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
 
-        # 2. Clean staging (keep only this task)
-        await workflow.execute_activity(
-            "cleanup_all_staging",
-            args=[task_input.name],
-            start_to_close_timeout=timedelta(minutes=5),
-        )
-
-        # 3. List files (saves to disk, returns path)
+        # 2. List files — returns {path, count, total_bytes, worker_queue}
         if task_input.filelist_path:
+            # Pre-computed filelist (from SplitDownloadWorkflow)
+            filelist_meta = await workflow.execute_activity(
+                "read_filelist",
+                args=[task_input.filelist_path],
+                start_to_close_timeout=timedelta(minutes=5),
+            )
             filelist_path = task_input.filelist_path
+            total_file_count = filelist_meta["count"]
+            total_bytes = filelist_meta["total_bytes"]
+            worker_queue = workflow.info().task_queue
         else:
             try:
-                filelist_path = await workflow.execute_activity(
+                result = await workflow.execute_activity(
                     "list_repo_files",
                     args=[task_input],
                     start_to_close_timeout=timedelta(minutes=30),
@@ -78,15 +80,11 @@ class DownloadDatasetWorkflow:
                 )
                 return TaskResult(status="failed", error=error_msg)
 
-        # 3b. Read file list metadata (count + total size only)
-        filelist_meta = await workflow.execute_activity(
-            "read_filelist",
-            args=[filelist_path],
-            start_to_close_timeout=timedelta(minutes=5),
-        )
+            filelist_path = result["path"]
+            total_file_count = result["count"]
+            total_bytes = result["total_bytes"]
+            worker_queue = result["worker_queue"]
 
-        total_file_count = filelist_meta["count"]
-        total_bytes = filelist_meta["total_bytes"]
         total_gb = total_bytes / (1024 ** 3)
 
         if total_file_count == 0:
@@ -102,13 +100,14 @@ class DownloadDatasetWorkflow:
             "load_progress",
             args=[task_input],
             start_to_close_timeout=timedelta(seconds=30),
+            task_queue=worker_queue,
         )
 
         completed_batches = len(completed_paths) if completed_paths else 0
         start_idx = completed_batches * BATCH_SIZE
         uploaded_bytes = int(total_bytes * min(start_idx, total_file_count) / total_file_count) if start_idx > 0 else 0
 
-        # 5. Process in batches (by index into the on-disk file list)
+        # 5. Process in batches — pinned to the worker that has the filelist
         batch_num = completed_batches
         all_batch_markers = list(completed_paths) if completed_paths else []
 
@@ -125,12 +124,13 @@ class DownloadDatasetWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             )
 
-            # Run pipeline for this batch
+            # Run pipeline on the same worker that has the filelist
             result = await workflow.execute_activity(
                 "run_pipeline_batch",
                 args=[task_input, filelist_path, start_idx, current_batch_size],
                 start_to_close_timeout=timedelta(hours=24),
                 heartbeat_timeout=timedelta(minutes=10),
+                task_queue=worker_queue,
                 retry_policy=RetryPolicy(
                     initial_interval=timedelta(minutes=1),
                     backoff_coefficient=2.0,
@@ -149,6 +149,7 @@ class DownloadDatasetWorkflow:
                 "save_progress",
                 args=[task_input.name, all_batch_markers],
                 start_to_close_timeout=timedelta(seconds=30),
+                task_queue=worker_queue,
             )
 
         # 6. Done!
@@ -156,11 +157,13 @@ class DownloadDatasetWorkflow:
             "clear_progress",
             args=[task_input.name],
             start_to_close_timeout=timedelta(seconds=30),
+            task_queue=worker_queue,
         )
         await workflow.execute_activity(
             "cleanup_staging",
             args=[task_input.name, False],
             start_to_close_timeout=timedelta(minutes=5),
+            task_queue=worker_queue,
         )
         await workflow.execute_activity(
             "report_to_dashboard",
@@ -186,8 +189,8 @@ class SplitDownloadWorkflow:
 
     @workflow.run
     async def run(self, task_input: TaskInput, worker_count: int = 2) -> TaskResult:
-        # List all files (saves to disk)
-        filelist_path = await workflow.execute_activity(
+        # List all files — returns {path, count, total_bytes, worker_queue}
+        result = await workflow.execute_activity(
             "list_repo_files",
             args=[task_input],
             start_to_close_timeout=timedelta(minutes=30),
@@ -195,17 +198,25 @@ class SplitDownloadWorkflow:
             retry_policy=ACTIVITY_RETRY,
         )
 
-        # Partition into chunks on the worker (avoids sending full list via gRPC)
+        filelist_path = result["path"]
+        worker_queue = result["worker_queue"]
+
+        if result["count"] == 0:
+            return TaskResult(status="failed", error="No files found")
+
+        # Partition into chunks — pinned to same worker that has the filelist
         partitions = await workflow.execute_activity(
             "partition_filelist",
             args=[filelist_path, worker_count],
             start_to_close_timeout=timedelta(minutes=5),
+            task_queue=worker_queue,
         )
 
         if not partitions:
             return TaskResult(status="failed", error="No files found")
 
-        # Launch child workflows — each gets its own filelist partition
+        # Launch child workflows — pinned to the worker that has the partition files
+        # NOTE: All children run on the same worker since partition files are local
         child_handles = []
         for i, part in enumerate(partitions):
             child_input = TaskInput(
@@ -223,7 +234,7 @@ class SplitDownloadWorkflow:
                 DownloadDatasetWorkflow.run,
                 args=[child_input],
                 id=f"{task_input.id}-part{i+1}",
-                task_queue="download-workers",
+                task_queue=worker_queue,  # same worker — partition files are local
             )
             child_handles.append(handle)
 
