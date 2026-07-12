@@ -179,26 +179,30 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
         activity.heartbeat(msg)
 
     def progress_fn(downloaded_bytes: int, total_bytes: int, speed_bps: float):
-        """Report speed to dashboard SQLite every 15s."""
+        """Report speed to S1 dashboard via HTTP every 15s."""
         now = time.time()
         if now - last_report_time[0] < 15:
             return
         last_report_time[0] = now
 
         try:
-            from ..queue.snapshot import init_db, update_task_progress
-            init_db()
+            import requests
+            coordinator = os.environ.get("DLM_COORDINATOR", "http://154.85.43.52:8080")
             speed_mbps = speed_bps * 8 / 1_000_000
             pct = downloaded_bytes / total_bytes * 100 if total_bytes > 0 else 0
             dl_gb = downloaded_bytes / (1024 ** 3)
-            update_task_progress(
-                task_input.id,
-                status="downloading",
-                speed_mbps=round(speed_mbps, 1),
-                progress_pct=round(pct, 1),
-                downloaded_gb=round(dl_gb, 2),
-                server=server_key,
-                phase=f"batch ({speed_mbps:.0f}Mbps)",
+            requests.post(
+                f"{coordinator}/api/task-progress",
+                json={
+                    "task_id": task_input.id,
+                    "status": "downloading",
+                    "speed_mbps": round(speed_mbps, 1),
+                    "progress_pct": round(pct, 1),
+                    "downloaded_gb": round(dl_gb, 2),
+                    "server": server_key,
+                    "phase": f"batch ({speed_mbps:.0f}Mbps)",
+                },
+                timeout=5,
             )
         except Exception as e:
             logger.debug(f"Progress report failed: {e}")

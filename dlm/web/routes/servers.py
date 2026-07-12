@@ -68,3 +68,22 @@ async def worker_heartbeat(body: dict):
         return {"ok": True}
 
     return await run_blocking(_do)
+
+
+@router.post("/task-progress")
+async def task_progress(body: dict):
+    """Receive real-time task progress from workers."""
+    def _do():
+        from ...queue.snapshot import init_db, update_task_progress
+        init_db()
+        task_id = body.get("task_id")
+        if not task_id:
+            return {"error": "task_id required"}
+        kwargs = {}
+        for key in ("status", "speed_mbps", "progress_pct", "downloaded_gb", "server", "phase"):
+            if key in body:
+                kwargs[key] = body[key]
+        update_task_progress(task_id, **kwargs)
+        return {"ok": True}
+
+    return await run_blocking(_do)
