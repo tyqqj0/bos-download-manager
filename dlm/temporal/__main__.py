@@ -86,6 +86,10 @@ async def run_worker(args):
     # Ensure staging exists
     Path("/data/staging").mkdir(parents=True, exist_ok=True)
 
+    # HF high-performance download
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    os.environ.setdefault("HF_HUB_CACHE", "/tmp/hf_cache")
+
     # Connect to Temporal
     logger.info(f"Connecting to Temporal at {args.temporal_host}...")
     client = await Client.connect(args.temporal_host)

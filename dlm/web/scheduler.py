@@ -66,6 +66,18 @@ def _build_alerts(tasks: list, workers: list) -> list:
                 "error": t.get("error_class") or t.get("error") or "",
             })
 
+        # Stuck download detection: downloading but no update in 30 minutes
+        if t.get("status") == "downloading":
+            updated_at = t.get("updated_at") or 0
+            if now - updated_at > 1800:
+                alerts.append({
+                    "type": "task_stuck",
+                    "task": t.get("name", ""),
+                    "task_id": t.get("id", ""),
+                    "stale_min": int((now - updated_at) / 60),
+                    "server": t.get("server", ""),
+                })
+
     return alerts
 
 

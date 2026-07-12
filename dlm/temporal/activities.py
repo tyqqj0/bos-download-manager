@@ -160,6 +160,7 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
 
     Returns dict with stats.
     """
+    import time
     from .pipeline import PipelineEngine
 
     # Read file list from disk (avoids gRPC size limits)
@@ -171,10 +172,38 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
     staging_dir = STAGING_PATH / task_input.name
     staging_dir.mkdir(parents=True, exist_ok=True)
 
+    server_key = os.environ.get("DLM_SERVER_KEY", "")
+    last_report_time = [0.0]
+
     def heartbeat_fn(msg: str):
         activity.heartbeat(msg)
 
-    engine = PipelineEngine(task_input, staging_dir, heartbeat_fn)
+    def progress_fn(downloaded_bytes: int, total_bytes: int, speed_bps: float):
+        """Report speed to dashboard SQLite every 15s."""
+        now = time.time()
+        if now - last_report_time[0] < 15:
+            return
+        last_report_time[0] = now
+
+        try:
+            from ..queue.snapshot import init_db, update_task_progress
+            init_db()
+            speed_mbps = speed_bps * 8 / 1_000_000
+            pct = downloaded_bytes / total_bytes * 100 if total_bytes > 0 else 0
+            dl_gb = downloaded_bytes / (1024 ** 3)
+            update_task_progress(
+                task_input.id,
+                status="downloading",
+                speed_mbps=round(speed_mbps, 1),
+                progress_pct=round(pct, 1),
+                downloaded_gb=round(dl_gb, 2),
+                server=server_key,
+                phase=f"batch ({speed_mbps:.0f}Mbps)",
+            )
+        except Exception as e:
+            logger.debug(f"Progress report failed: {e}")
+
+    engine = PipelineEngine(task_input, staging_dir, heartbeat_fn, progress_fn)
     stats = await engine.run(files)
 
     return {

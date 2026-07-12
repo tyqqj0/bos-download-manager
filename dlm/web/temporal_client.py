@@ -39,13 +39,14 @@ async def start_download(task_dict: dict, task_queue: str = "download-workers"):
         size_gb=task_dict.get("size_gb", 0),
     )
 
+    workflow_id = f"dl-{task_dict['id']}"
     handle = await client.start_workflow(
         DownloadDatasetWorkflow.run,
         args=[task_input],
-        id=f"download-{task_dict['id']}",
+        id=workflow_id,
         task_queue=task_queue,
     )
-    logger.info(f"Started workflow download-{task_dict['id']} on queue {task_queue}")
+    logger.info(f"Started workflow {workflow_id} on queue {task_queue}")
     return handle
 
 
@@ -79,7 +80,7 @@ async def start_split_download(task_dict: dict, worker_count: int = 2):
 async def cancel_workflow(task_id: str):
     """Cancel a running workflow."""
     client = await get_client()
-    handle = client.get_workflow_handle(f"download-{task_id}")
+    handle = client.get_workflow_handle(f"dl-{task_id}")
     try:
         await handle.cancel()
     except Exception as e:
