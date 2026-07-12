@@ -127,6 +127,7 @@ async def run_worker(args):
         workflows=workflows,
         activities=activities,
         max_concurrent_workflow_tasks=1,
+        max_concurrent_activities=1,
     )
 
     # Personal queue: pinned activities (file-local operations)
