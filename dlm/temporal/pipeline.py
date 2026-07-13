@@ -1,10 +1,13 @@
-"""Pipeline engine — batch download + concurrent upload with disk backpressure.
+"""Pipeline engine — parallel producer-consumer with disk backpressure.
 
 Architecture:
-  hf download (batch) → [staging dir] → concurrent upload to BOS → delete local
-                              ↕
-                         Disk Monitor
-                         (>80% → pause before next batch)
+  Producer (hf download chunks) → Queue(maxsize=8) → Consumer (BOS upload + delete)
+                                        ↕
+                                   Disk Monitor
+                                   (free < 50GB → pause producer)
+
+Download and upload run concurrently. As soon as one chunk finishes downloading,
+it's queued for upload. If uploads can't keep up and disk fills, downloads pause.
 """
 
 from __future__ import annotations
@@ -22,16 +25,13 @@ from .models import TaskInput, FileInfo, PipelineStats
 logger = logging.getLogger(__name__)
 
 STAGING_PATH = Path("/data/staging")
-DISK_PAUSE_THRESHOLD = 0.80
-DISK_RESUME_THRESHOLD = 0.50
-UPLOAD_CONCURRENCY = 8
-HF_BATCH_SIZE = 500  # max files per hf download invocation (CLI arg limit)
-SPEED_REPORT_INTERVAL = 15  # seconds
-
-
-def _disk_usage_pct() -> float:
-    stat = shutil.disk_usage(STAGING_PATH)
-    return stat.used / stat.total
+CHUNK_MAX_BYTES = 20 * 1024**3  # 20GB per chunk
+CHUNK_MAX_FILES = 500           # CLI arg length limit
+DISK_FREE_MIN_GB = 50           # pause downloads below this
+UPLOAD_CONCURRENCY = 8          # concurrent BOS uploads per chunk
+HF_MAX_WORKERS = 16             # hf download --max-workers
+SPEED_REPORT_INTERVAL = 15      # seconds between speed reports
+QUEUE_MAX_SIZE = 8              # max chunks buffered between download and upload
 
 
 def _disk_free_gb() -> float:
@@ -40,10 +40,11 @@ def _disk_free_gb() -> float:
 
 
 def _dir_size(path: Path) -> int:
+    """Total bytes on disk under path (includes dotfiles like .cache)."""
     total = 0
     try:
         for f in path.rglob("*"):
-            if f.is_file() and not f.name.startswith("."):
+            if f.is_file():
                 total += f.stat().st_size
     except (OSError, PermissionError):
         pass
@@ -51,7 +52,7 @@ def _dir_size(path: Path) -> int:
 
 
 class PipelineEngine:
-    """Runs batch download + upload pipeline."""
+    """Parallel download+upload pipeline with disk backpressure."""
 
     def __init__(
         self,
@@ -65,25 +66,74 @@ class PipelineEngine:
         self.heartbeat_fn = heartbeat_fn
         self.progress_fn = progress_fn
         self.stats = PipelineStats()
-        self._cancel = False
         self._proc: Optional[asyncio.subprocess.Process] = None
+        self._bos_client = None
+        self._bucket = ""
+        self._prefix = ""
 
     async def run(self, files: list[FileInfo]) -> PipelineStats:
-        """Execute pipeline: batch download → concurrent upload → delete."""
+        """Execute parallel pipeline: producer downloads chunks while consumer uploads them."""
         self.stats.total_files = len(files)
         self.stats.total_bytes = sum(f.size for f in files)
 
-        try:
-            # Step 1: Batch download
-            self.stats.phase = "downloading"
-            file_paths = [f.path for f in files]
-            await self._download_batch(file_paths)
-
-            # Step 2: Concurrent upload + delete
-            self.stats.phase = "uploading"
-            await self._upload_all(files)
-
+        chunks = self._make_chunks(files)
+        if not chunks:
             self.stats.phase = "done"
+            return self.stats
+
+        self._init_bos_client()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+        producer_error: list = [None]
+
+        async def producer():
+            try:
+                for i, chunk in enumerate(chunks):
+                    # Backpressure: wait until enough disk free
+                    while _disk_free_gb() < DISK_FREE_MIN_GB:
+                        self.stats.paused = True
+                        self.heartbeat_fn(
+                            f"backpressure: {_disk_free_gb():.0f}GB free, "
+                            f"waiting for uploads to free space"
+                        )
+                        await asyncio.sleep(10)
+                    self.stats.paused = False
+
+                    # Download this chunk
+                    self.stats.phase = "downloading"
+                    file_paths = [f.path for f in chunk]
+                    await self._hf_download(file_paths)
+                    self.stats.downloaded_files += len(chunk)
+                    self._clean_cache()
+
+                    self.heartbeat_fn(
+                        f"downloaded chunk {i+1}/{len(chunks)} "
+                        f"({self.stats.downloaded_files}/{self.stats.total_files} files)"
+                    )
+
+                    # Queue for upload
+                    await queue.put(chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                producer_error[0] = e
+                logger.error(f"Producer error: {e}")
+            finally:
+                await queue.put(None)
+
+        async def consumer():
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    queue.task_done()
+                    break
+                self.stats.phase = "uploading"
+                await self._upload_chunk(chunk)
+                self._clean_cache()
+                queue.task_done()
+
+        try:
+            self.stats.phase = "downloading"
+            await asyncio.gather(producer(), consumer())
         except asyncio.CancelledError:
             if self._proc and self._proc.returncode is None:
                 self._proc.terminate()
@@ -94,37 +144,47 @@ class PipelineEngine:
             logger.info("Pipeline cancelled, staging preserved for resume")
             raise
 
+        if producer_error[0]:
+            raise producer_error[0]
+
+        self.stats.phase = "done"
         return self.stats
 
-    async def _download_batch(self, file_paths: list[str]):
-        """Download all files in batches of HF_BATCH_SIZE using hf download."""
-        for i in range(0, len(file_paths), HF_BATCH_SIZE):
-            # Disk backpressure: wait if too full
-            while _disk_usage_pct() > DISK_PAUSE_THRESHOLD:
-                self.stats.paused = True
-                self.heartbeat_fn(
-                    f"disk {_disk_free_gb():.0f}GB free, waiting... "
-                    f"downloaded {self.stats.downloaded_files}/{self.stats.total_files}"
-                )
-                await asyncio.sleep(10)
-            self.stats.paused = False
+    def _make_chunks(self, files: list[FileInfo]) -> list[list[FileInfo]]:
+        """Partition files into chunks of max 20GB or 500 files."""
+        chunks = []
+        current: list[FileInfo] = []
+        current_bytes = 0
 
-            chunk = file_paths[i:i + HF_BATCH_SIZE]
-            await self._hf_download(chunk)
-            self.stats.downloaded_files += len(chunk)
+        for f in files:
+            # If adding this file would exceed limits AND we have files already, flush
+            if current and (
+                current_bytes + f.size > CHUNK_MAX_BYTES
+                or len(current) >= CHUNK_MAX_FILES
+            ):
+                chunks.append(current)
+                current = []
+                current_bytes = 0
+            current.append(f)
+            current_bytes += f.size
 
-            self.heartbeat_fn(
-                f"downloaded {self.stats.downloaded_files}/{self.stats.total_files} files"
-            )
+        if current:
+            chunks.append(current)
+
+        logger.info(
+            f"Partitioned {len(files)} files into {len(chunks)} chunks "
+            f"(total {self.stats.total_bytes / 1024**3:.1f}GB)"
+        )
+        return chunks
 
     async def _hf_download(self, file_paths: list[str]):
-        """Single hf download invocation for a batch of files."""
+        """Run a single hf download invocation for a batch of files."""
         rtype = "dataset" if self.task.type == "dataset" else "model"
         cmd = [
             "hf", "download", self.task.repo_id,
             "--local-dir", str(self.staging_dir),
             "--repo-type", rtype,
-            "--max-workers", "32",
+            "--max-workers", str(HF_MAX_WORKERS),
         ]
         cmd.extend(file_paths)
 
@@ -150,16 +210,17 @@ class PipelineEngine:
         while self._proc.returncode is None:
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=SPEED_REPORT_INTERVAL)
-                break  # process finished
+                break
             except asyncio.TimeoutError:
-                pass  # still running, report progress
+                pass
 
             current_size = _dir_size(self.staging_dir)
             now = time.time()
             elapsed = now - last_time
             if elapsed > 0:
-                speed_bps = (current_size - last_size) / elapsed
+                speed_bps = max(0, (current_size - last_size) / elapsed)
                 speed_mbps = speed_bps * 8 / 1_000_000
+                self.stats.speed_mbps = speed_mbps
 
                 self.heartbeat_fn(
                     f"downloading {speed_mbps:.0f}Mbps "
@@ -167,39 +228,35 @@ class PipelineEngine:
                 )
 
                 if self.progress_fn:
-                    self.progress_fn(current_size, self.stats.total_bytes, speed_bps)
+                    self.progress_fn(
+                        self.stats.uploaded_bytes + current_size,
+                        self.stats.total_bytes,
+                        speed_bps,
+                    )
 
             last_size = current_size
             last_time = now
 
-        if self._proc.returncode != 0:
+        rc = self._proc.returncode
+        if rc != 0:
             stdout = await self._proc.stdout.read()
             output = stdout.decode(errors="replace")[-500:] if stdout else ""
-            raise RuntimeError(
-                f"hf download failed (rc={self._proc.returncode}): {output}"
-            )
+            self._proc = None
+            raise RuntimeError(f"hf download failed (rc={rc}): {output}")
 
         self._proc = None
 
-    async def _upload_all(self, files: list[FileInfo]):
-        """Upload all downloaded files to BOS with UPLOAD_CONCURRENCY workers."""
-        from ..core.config import load_config
-        from ..core.bos import create_bos_client, upload_file
-        from ..constants import DATA_BUCKET, MODEL_BUCKET
+    async def _upload_chunk(self, chunk: list[FileInfo]):
+        """Upload a chunk of files to BOS with concurrent workers, delete after success."""
+        from ..core.bos import upload_file
 
-        config = load_config()
-        client = create_bos_client(
-            config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
+        self.heartbeat_fn(
+            f"uploading chunk ({len(chunk)} files, "
+            f"{sum(f.size for f in chunk) / 1024**3:.1f}GB)"
         )
 
-        if self.task.type == "model":
-            bucket = MODEL_BUCKET
-            prefix = f"{self.task.name}/"
-        else:
-            bucket = DATA_BUCKET
-            prefix = f"{self.task.category}/{self.task.name}/" if self.task.category else f"{self.task.name}/"
-
         sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+        errors = []
 
         async def _upload_one(file_info: FileInfo):
             local_path = self.staging_dir / file_info.path
@@ -208,36 +265,66 @@ class PipelineEngine:
                 self.stats.failed_files += 1
                 return
 
-            key = prefix + file_info.path
+            key = self._prefix + file_info.path
             async with sem:
                 try:
                     await asyncio.to_thread(
-                        upload_file, client, bucket, key, str(local_path)
+                        upload_file, self._bos_client, self._bucket, key, str(local_path)
                     )
-                    try:
-                        local_path.unlink()
-                    except OSError:
-                        pass
+                    local_path.unlink(missing_ok=True)
                     self.stats.uploaded_files += 1
                     self.stats.uploaded_bytes += file_info.size
                 except Exception as e:
                     logger.error(f"Upload failed {file_info.path}: {e}")
                     self.stats.failed_files += 1
+                    errors.append(str(e))
 
-            # Periodic heartbeat
-            if self.stats.uploaded_files % 50 == 0:
+            if self.stats.uploaded_files % 10 == 0 or self.stats.uploaded_files == self.stats.total_files:
                 self.heartbeat_fn(
                     f"uploaded {self.stats.uploaded_files}/{self.stats.total_files} "
                     f"({self.stats.uploaded_bytes / 1024**3:.1f}GB)"
                 )
+                if self.progress_fn:
+                    self.progress_fn(
+                        self.stats.uploaded_bytes,
+                        self.stats.total_bytes,
+                        0,
+                    )
 
-        tasks = [asyncio.create_task(_upload_one(f)) for f in files]
-        await asyncio.gather(*tasks)
+        tasks = [asyncio.create_task(_upload_one(f)) for f in chunk]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Clean up empty directories
+        # Clean empty directories left after file deletion
         for d in sorted(self.staging_dir.rglob("*"), reverse=True):
-            if d.is_dir():
+            if d.is_dir() and d != self.staging_dir:
                 try:
                     d.rmdir()
                 except OSError:
                     pass
+
+    def _init_bos_client(self):
+        """Initialize BOS client and determine target bucket/prefix."""
+        from ..core.config import load_config
+        from ..core.bos import create_bos_client
+        from ..constants import DATA_BUCKET, MODEL_BUCKET
+
+        config = load_config()
+        self._bos_client = create_bos_client(
+            config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
+        )
+
+        if self.task.type == "model":
+            self._bucket = MODEL_BUCKET
+            self._prefix = f"{self.task.name}/"
+        else:
+            self._bucket = DATA_BUCKET
+            if self.task.category:
+                self._prefix = f"{self.task.category}/{self.task.name}/"
+            else:
+                self._prefix = f"{self.task.name}/"
+
+    def _clean_cache(self):
+        """Remove hf download's .cache directory to prevent unbounded growth."""
+        cache_dir = self.staging_dir / ".cache"
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
