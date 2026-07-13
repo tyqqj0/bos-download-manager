@@ -152,11 +152,14 @@ async def clear_progress(task_name: str):
 
 @activity.defn
 async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
-                              start_idx: int, batch_size: int) -> dict:
+                              start_idx: int, batch_size: int,
+                              prior_bytes: int = 0, total_task_bytes: int = 0) -> dict:
     """Run the download+upload pipeline for a batch of files.
 
     Reads the file list from disk (filelist_path) and processes files
     from start_idx to start_idx + batch_size.
+    prior_bytes: cumulative bytes uploaded in earlier batches (for progress reporting).
+    total_task_bytes: total bytes across ALL batches (for percentage calculation).
 
     Returns dict with stats.
     """
@@ -174,6 +177,7 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
 
     server_key = os.environ.get("DLM_SERVER_KEY", "")
     last_report_time = [0.0]
+    task_total = total_task_bytes if total_task_bytes > 0 else sum(f.size for f in files)
 
     def heartbeat_fn(msg: str):
         activity.heartbeat(msg)
@@ -189,15 +193,16 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
             import requests
             coordinator = os.environ.get("DLM_COORDINATOR", "http://154.85.43.52:8080")
             speed_mbps = speed_bps * 8 / 1_000_000
-            pct = downloaded_bytes / total_bytes * 100 if total_bytes > 0 else 0
-            dl_gb = downloaded_bytes / (1024 ** 3)
+            cumulative = prior_bytes + downloaded_bytes
+            pct = cumulative / task_total * 100 if task_total > 0 else 0
+            dl_gb = cumulative / (1024 ** 3)
             requests.post(
                 f"{coordinator}/api/task-progress",
                 json={
                     "task_id": task_input.id,
                     "status": "downloading",
                     "speed_mbps": round(speed_mbps, 1),
-                    "progress_pct": round(pct, 1),
+                    "progress_pct": round(min(pct, 100), 1),
                     "downloaded_gb": round(dl_gb, 2),
                     "server": server_key,
                     "phase": f"batch ({speed_mbps:.0f}Mbps)",

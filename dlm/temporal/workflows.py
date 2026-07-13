@@ -127,7 +127,8 @@ class DownloadDatasetWorkflow:
             # Run pipeline on the same worker that has the filelist
             result = await workflow.execute_activity(
                 "run_pipeline_batch",
-                args=[task_input, filelist_path, start_idx, current_batch_size],
+                args=[task_input, filelist_path, start_idx, current_batch_size,
+                      uploaded_bytes, total_bytes],
                 start_to_close_timeout=timedelta(hours=24),
                 heartbeat_timeout=timedelta(minutes=10),
                 task_queue=worker_queue,
