@@ -266,6 +266,8 @@ async def report_to_dashboard(task_id: str, status: str, phase: str = None,
         init_db()
 
         if status in ("done", "failed"):
+            if downloaded_gb is not None:
+                update_task_progress(task_id, downloaded_gb=downloaded_gb)
             complete_task(task_id, status)
         else:
             kwargs = {"status": status}

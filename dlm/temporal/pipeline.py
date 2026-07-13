@@ -70,6 +70,8 @@ class PipelineEngine:
         self._bos_client = None
         self._bucket = ""
         self._prefix = ""
+        self._cumulative_downloaded = 0
+        self._download_start_time = 0.0
 
     async def run(self, files: list[FileInfo]) -> PipelineStats:
         """Execute parallel pipeline: producer downloads chunks while consumer uploads them."""
@@ -203,9 +205,8 @@ class PipelineEngine:
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        # Monitor staging dir growth for speed reporting
-        last_size = _dir_size(self.staging_dir)
-        last_time = time.time()
+        chunk_start_size = _dir_size(self.staging_dir)
+        chunk_start_time = time.time()
 
         while self._proc.returncode is None:
             try:
@@ -216,9 +217,10 @@ class PipelineEngine:
 
             current_size = _dir_size(self.staging_dir)
             now = time.time()
-            elapsed = now - last_time
+            elapsed = now - chunk_start_time
             if elapsed > 0:
-                speed_bps = max(0, (current_size - last_size) / elapsed)
+                chunk_downloaded = max(0, current_size - chunk_start_size)
+                speed_bps = chunk_downloaded / elapsed
                 speed_mbps = speed_bps * 8 / 1_000_000
                 self.stats.speed_mbps = speed_mbps
 
@@ -229,13 +231,20 @@ class PipelineEngine:
 
                 if self.progress_fn:
                     self.progress_fn(
-                        self.stats.uploaded_bytes + current_size,
+                        self.stats.uploaded_bytes + self._cumulative_downloaded + chunk_downloaded,
                         self.stats.total_bytes,
                         speed_bps,
                     )
 
-            last_size = current_size
-            last_time = now
+        # After download completes, record cumulative bytes for this chunk
+        final_size = _dir_size(self.staging_dir)
+        chunk_bytes = max(0, final_size - chunk_start_size)
+        self._cumulative_downloaded += chunk_bytes
+
+        # Compute final speed for this chunk
+        total_elapsed = time.time() - chunk_start_time
+        if total_elapsed > 0:
+            self.stats.speed_mbps = (chunk_bytes / total_elapsed) * 8 / 1_000_000
 
         rc = self._proc.returncode
         if rc != 0:
@@ -257,6 +266,8 @@ class PipelineEngine:
 
         sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
         errors = []
+        upload_start = time.time()
+        upload_start_bytes = self.stats.uploaded_bytes
 
         async def _upload_one(file_info: FileInfo):
             local_path = self.staging_dir / file_info.path
@@ -280,15 +291,19 @@ class PipelineEngine:
                     errors.append(str(e))
 
             if self.stats.uploaded_files % 10 == 0 or self.stats.uploaded_files == self.stats.total_files:
+                elapsed = time.time() - upload_start
+                upload_speed_bps = (self.stats.uploaded_bytes - upload_start_bytes) / max(elapsed, 1)
+                self.stats.speed_mbps = upload_speed_bps * 8 / 1_000_000
                 self.heartbeat_fn(
                     f"uploaded {self.stats.uploaded_files}/{self.stats.total_files} "
-                    f"({self.stats.uploaded_bytes / 1024**3:.1f}GB)"
+                    f"({self.stats.uploaded_bytes / 1024**3:.1f}GB, "
+                    f"{self.stats.speed_mbps:.0f}Mbps)"
                 )
                 if self.progress_fn:
                     self.progress_fn(
                         self.stats.uploaded_bytes,
                         self.stats.total_bytes,
-                        0,
+                        upload_speed_bps,
                     )
 
         tasks = [asyncio.create_task(_upload_one(f)) for f in chunk]

@@ -224,7 +224,9 @@ def get_dashboard_summary() -> dict:
         by_status[row["status"]] = row["cnt"]
 
     total_downloaded = conn.execute(
-        "SELECT COALESCE(SUM(downloaded_gb), 0) FROM tasks"
+        "SELECT COALESCE(SUM(CASE "
+        "  WHEN status = 'done' THEN COALESCE(NULLIF(size_gb, 0), downloaded_gb) "
+        "  ELSE downloaded_gb END), 0) FROM tasks"
     ).fetchone()[0]
     total_estimated = conn.execute(
         "SELECT COALESCE(SUM(size_gb), 0) FROM tasks WHERE size_gb > 0"
