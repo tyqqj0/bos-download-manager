@@ -77,12 +77,16 @@ async def diagnose():
     orphaned = []
     try:
         from ..temporal_client import get_client
-        client = await get_client()
+        client = await asyncio.wait_for(get_client(), timeout=5)
         running_ids = set()
-        async for wf in client.list_workflows(
-            'WorkflowType="DownloadDatasetWorkflow" AND ExecutionStatus="Running"'
-        ):
-            running_ids.add(wf.id)
+
+        async def _list_wfs():
+            async for wf in client.list_workflows(
+                'WorkflowType="DownloadDatasetWorkflow" AND ExecutionStatus="Running"'
+            ):
+                running_ids.add(wf.id)
+
+        await asyncio.wait_for(_list_wfs(), timeout=10)
 
         downloading = [t for t in tasks if t.get("status") == "downloading"]
         for t in downloading:
@@ -96,6 +100,8 @@ async def diagnose():
                     "stale_seconds": int(age),
                     "workflow_id": workflow_id,
                 })
+    except asyncio.TimeoutError:
+        orphaned = [{"error": "Temporal query timed out (15s)"}]
     except Exception as e:
         orphaned = [{"error": f"Cannot check Temporal: {e}"}]
 
