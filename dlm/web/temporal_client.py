@@ -10,15 +10,24 @@ from temporalio.client import Client
 logger = logging.getLogger("dlm.web")
 
 _client: Optional[Client] = None
+_client_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 async def get_client() -> Client:
-    """Get or create the Temporal client connection."""
-    global _client
-    if _client is None:
-        host = os.environ.get("TEMPORAL_HOST", "154.85.43.52:7233")
+    """Get or create the Temporal client connection.
+
+    Creates a new client if the event loop has changed (e.g., called from
+    a different context than where the client was first created).
+    """
+    global _client, _client_loop
+    current_loop = asyncio.get_running_loop()
+
+    if _client is None or _client_loop is not current_loop:
+        host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
         logger.info(f"Connecting to Temporal at {host}...")
         _client = await Client.connect(host)
+        _client_loop = current_loop
+
     return _client
 
 
