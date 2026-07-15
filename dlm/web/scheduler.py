@@ -1,4 +1,4 @@
-"""Background scheduler — dashboard refresh and Temporal workflow status sync."""
+"""Background scheduler — dashboard refresh, reconciliation, and transfer sync."""
 
 import asyncio
 import logging
@@ -14,6 +14,7 @@ _executor = ThreadPoolExecutor(max_workers=4)
 DASHBOARD_INTERVAL = 10
 WORKFLOW_SYNC_INTERVAL = 30
 TRANSFER_INTERVAL = 60
+RECONCILE_INTERVAL = 300  # 5 minutes
 
 
 def _build_dashboard() -> dict:
@@ -140,14 +141,19 @@ def _poll_transfers():
 
 
 async def background_scheduler():
-    """Main background loop — refresh dashboard and poll transfers."""
+    """Main background loop — refresh dashboard, reconcile workflows, poll transfers."""
     loop = asyncio.get_event_loop()
     last_transfer_poll = 0
+    last_reconcile = 0
 
     await asyncio.sleep(2)
 
     while True:
         try:
+            # Zero stale speeds before building dashboard
+            from .reconciler import zero_stale_speeds
+            await loop.run_in_executor(_executor, zero_stale_speeds)
+
             dashboard = await loop.run_in_executor(_executor, _build_dashboard)
             cache.set_dashboard(dashboard)
 
@@ -155,6 +161,18 @@ async def background_scheduler():
             if now - last_transfer_poll > TRANSFER_INTERVAL:
                 await loop.run_in_executor(_executor, _poll_transfers)
                 last_transfer_poll = now
+
+            # Reconcile: detect orphaned workflows and re-dispatch
+            if now - last_reconcile > RECONCILE_INTERVAL:
+                try:
+                    from .reconciler import reconcile
+                    report = await reconcile()
+                    if report.get("redispatched") or report.get("errors"):
+                        logger.info(f"Reconciler report: {report}")
+                    cache.set("reconciler_report", report)
+                except Exception as e:
+                    logger.error(f"Reconciler error: {e}")
+                last_reconcile = now
 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
