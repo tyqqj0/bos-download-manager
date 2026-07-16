@@ -1,5 +1,7 @@
 #!/bin/bash
-# scripts/deploy-all.sh — Deploy from S1 to all workers
+# LEGACY — Use scripts/safe-deploy.sh instead.
+# This script does hard-kill without graceful workflow cancellation.
+# Kept for reference only.
 set -euo pipefail
 
 WORKERS=(
