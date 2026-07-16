@@ -40,7 +40,8 @@ def _build_dashboard() -> dict:
     queue_next = [t for t in all_tasks if t.get("status") == "pending"][:5]
     summary["queue_next"] = queue_next
 
-    alerts = _build_alerts(all_tasks, workers)
+    from .alerts import check_alerts
+    alerts = check_alerts(all_tasks, workers)
     summary["alerts"] = alerts
 
     return summary
