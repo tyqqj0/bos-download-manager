@@ -25,10 +25,17 @@ from .models import TaskInput, FileInfo, PipelineStats
 
 logger = logging.getLogger(__name__)
 
+
+class _StallDetected(Exception):
+    """Raised when file download stalls (no size growth for STALL_TIMEOUT)."""
+    pass
+
 DOWNLOAD_WORKERS = 8          # parallel file downloads (ThreadPoolExecutor)
 UPLOAD_CONCURRENCY = 8        # parallel BOS uploads (asyncio.Semaphore)
 DISK_FREE_MIN_GB = 50         # backpressure threshold
-STALL_TIMEOUT = 300           # 5 min no progress → timeout
+STALL_CHECK_INTERVAL = 30    # check file growth every 30s
+STALL_TIMEOUT = 1800          # 30 min no file growth → stall (for large files)
+HTTP_TIMEOUT = 300            # HF_HUB_DOWNLOAD_TIMEOUT: per-read HTTP timeout
 MAX_FILE_RETRIES = 3          # per-file retry limit
 MIRROR_PRIMARY = "https://hf-mirror.com"
 MIRROR_FALLBACK = "https://huggingface.co"
@@ -66,17 +73,19 @@ class PipelineEngine:
     def _download_one_file(self, file_info: FileInfo, cancel_event: "threading.Event | None" = None) -> Optional[Path]:
         """Download a single file with mirror fallback. Runs in thread pool.
 
-        Uses HF_HUB_DOWNLOAD_TIMEOUT env var to enforce HTTP-level timeouts,
-        ensuring threads exit on stall rather than hanging indefinitely.
+        Uses HF_HUB_DOWNLOAD_TIMEOUT env var to enforce HTTP-level read timeouts
+        (per-read, not per-file). Large files that stream data continuously will
+        NOT be killed — only connections with no data for HTTP_TIMEOUT seconds.
         """
         import threading
         from huggingface_hub import hf_hub_download
 
-        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(STALL_TIMEOUT))
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(HTTP_TIMEOUT))
 
         for endpoint in [MIRROR_PRIMARY, MIRROR_FALLBACK]:
             if cancel_event and cancel_event.is_set():
                 return None
+            t0 = time.time()
             try:
                 local_path = hf_hub_download(
                     repo_id=self.task.repo_id,
@@ -87,8 +96,20 @@ class PipelineEngine:
                     token=os.environ.get("HF_TOKEN"),
                     force_download=False,  # resume partial downloads
                 )
+                # Emit download event
+                self._emit_event("file_downloaded", {
+                    "file": file_info.path,
+                    "size_bytes": file_info.size,
+                    "duration_s": round(time.time() - t0, 1),
+                    "endpoint": endpoint,
+                })
                 return Path(local_path)
             except Exception as e:
+                self._emit_event("file_failed", {
+                    "file": file_info.path,
+                    "error": str(e)[:200],
+                    "endpoint": endpoint,
+                })
                 logger.warning(f"Download failed from {endpoint} for {file_info.path}: {e}")
                 continue
         return None  # all mirrors failed
@@ -109,29 +130,30 @@ class PipelineEngine:
                     await asyncio.sleep(10)
                 self.stats.paused = False
 
-                # Download with stall detection and retries
+                # Download with file-growth-based stall detection
                 for attempt in range(MAX_FILE_RETRIES):
                     cancel_event = threading.Event()
                     self._cancel_events.append(cancel_event)
                     try:
-                        local_path = await asyncio.wait_for(
-                            loop.run_in_executor(
-                                self._executor, self._download_one_file, file_info, cancel_event
-                            ),
-                            timeout=STALL_TIMEOUT,
+                        download_future = loop.run_in_executor(
+                            self._executor, self._download_one_file, file_info, cancel_event
+                        )
+                        # Monitor file growth instead of hard timeout
+                        local_path = await self._wait_with_growth_check(
+                            download_future, file_info, cancel_event
                         )
                         if local_path:
                             self.stats.downloaded_files += 1
                             await queue.put(file_info)
                             return
-                        # None means all mirrors failed for this attempt
                         logger.warning(
                             f"All mirrors failed for {file_info.path} (attempt {attempt + 1})"
                         )
-                    except asyncio.TimeoutError:
+                    except _StallDetected:
                         cancel_event.set()
                         logger.warning(
-                            f"Timeout downloading {file_info.path} (attempt {attempt + 1})"
+                            f"Stall detected for {file_info.path} "
+                            f"(no growth for {STALL_TIMEOUT}s, attempt {attempt + 1})"
                         )
                         continue
 
@@ -145,6 +167,54 @@ class PipelineEngine:
         tasks = [asyncio.create_task(download_with_limit(f)) for f in files]
         await asyncio.gather(*tasks, return_exceptions=True)
         await queue.put(None)  # signal consumer to stop
+
+    async def _wait_with_growth_check(
+        self,
+        download_future: asyncio.Future,
+        file_info: FileInfo,
+        cancel_event,
+    ) -> Optional[Path]:
+        """Wait for download to complete, checking file size growth periodically.
+
+        Unlike asyncio.wait_for(timeout=300) which kills legitimate large downloads,
+        this only declares a stall if the file on disk stops growing for STALL_TIMEOUT
+        seconds. A 50GB file downloading at 1MB/s will take 14 hours but won't be killed
+        as long as bytes keep arriving.
+        """
+        last_size = 0
+        last_growth_time = time.time()
+        target_path = self.staging_dir / file_info.path
+
+        while not download_future.done():
+            await asyncio.sleep(STALL_CHECK_INTERVAL)
+            if download_future.done():
+                break
+
+            # Check file size growth (handles .incomplete files too)
+            current_size = 0
+            try:
+                # HF hub may use .incomplete suffix during download
+                for candidate in [target_path, Path(str(target_path) + ".incomplete")]:
+                    if candidate.exists():
+                        current_size = max(current_size, candidate.stat().st_size)
+                # Also check cache directory for this file
+                cache_pattern = self.staging_dir / ".cache" / "**"
+                for p in self.staging_dir.glob(".cache/**/*.incomplete"):
+                    if file_info.path.split("/")[-1] in str(p):
+                        current_size = max(current_size, p.stat().st_size)
+            except OSError:
+                pass
+
+            if current_size > last_size:
+                last_size = current_size
+                last_growth_time = time.time()
+            elif time.time() - last_growth_time > STALL_TIMEOUT:
+                raise _StallDetected(
+                    f"{file_info.path}: no growth for {STALL_TIMEOUT}s "
+                    f"(stuck at {last_size / 1024 / 1024:.1f} MB)"
+                )
+
+        return download_future.result()
 
     async def _consumer(self, queue: asyncio.Queue):
         """Upload files from queue to BOS, delete local file after success."""
@@ -166,6 +236,7 @@ class PipelineEngine:
                     return
                 key = self._prefix + fi.path
                 async with sem:
+                    t0 = time.time()
                     try:
                         await asyncio.to_thread(
                             upload_file,
@@ -177,9 +248,19 @@ class PipelineEngine:
                         local_path.unlink(missing_ok=True)
                         self.stats.uploaded_files += 1
                         self.stats.uploaded_bytes += fi.size
+                        self._emit_event("file_uploaded", {
+                            "file": fi.path,
+                            "size_bytes": fi.size,
+                            "duration_s": round(time.time() - t0, 1),
+                        })
                     except Exception as e:
                         logger.error(f"Upload failed {fi.path}: {e}")
                         self.stats.failed_files += 1
+                        self._emit_event("file_failed", {
+                            "file": fi.path,
+                            "error": str(e)[:200],
+                            "phase": "upload",
+                        })
 
             upload_tasks.append(asyncio.create_task(upload_one(file_info)))
 
@@ -239,6 +320,18 @@ class PipelineEngine:
                 self._prefix = f"{self.task.category}/{self.task.name}/"
             else:
                 self._prefix = f"{self.task.name}/"
+
+    def _emit_event(self, event_type: str, data: dict):
+        """Emit a monitoring event to the event buffer (if available)."""
+        try:
+            from .event_buffer import get_event_buffer
+            buf = get_event_buffer()
+            if buf:
+                data["task_id"] = self.task.id
+                data["task_name"] = self.task.name
+                buf.emit(event_type, data)
+        except Exception:
+            pass  # monitoring should never break downloads
 
     async def run(self, files: list[FileInfo]) -> PipelineStats:
         """Execute parallel pipeline: producer downloads per file, consumer uploads per file."""

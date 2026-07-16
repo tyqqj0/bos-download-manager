@@ -111,6 +111,7 @@ async def background_scheduler():
     loop = asyncio.get_event_loop()
     last_transfer_poll = 0
     last_reconcile = 0
+    last_health_verify = 0
 
     await asyncio.sleep(2)
 
@@ -150,6 +151,20 @@ async def background_scheduler():
                     logger.error(f"Auto-dispatch error: {e}")
 
                 last_reconcile = now
+
+            # Layer 3: SSH health verification (every 5 min)
+            if now - last_health_verify > RECONCILE_INTERVAL:
+                try:
+                    from .health_verifier import verify_all_workers
+                    verify_report = await verify_all_workers()
+                    cache.set("health_verify_report", verify_report)
+                    if verify_report.get("anomalies"):
+                        logger.warning(
+                            f"Health verify anomalies: {verify_report['anomalies']}"
+                        )
+                except Exception as e:
+                    logger.error(f"Health verify error: {e}")
+                last_health_verify = now
 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")

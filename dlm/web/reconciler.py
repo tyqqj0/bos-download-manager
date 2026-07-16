@@ -233,4 +233,13 @@ def zero_stale_speeds():
         "WHERE status = 'downloading' AND speed_mbps > 0 AND updated_at < ?",
         (threshold,),
     )
+    # Also zero upload_speed_mbps if column exists
+    try:
+        conn.execute(
+            "UPDATE tasks SET upload_speed_mbps = 0 "
+            "WHERE status = 'downloading' AND upload_speed_mbps > 0 AND updated_at < ?",
+            (threshold,),
+        )
+    except Exception:
+        pass  # column may not exist yet
     conn.commit()

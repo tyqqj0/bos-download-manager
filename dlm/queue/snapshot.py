@@ -192,17 +192,46 @@ def get_tasks_by_status(status: str) -> list:
 
 
 def update_worker(hostname: str, server_key: str, status: str = "online",
-                  current_task_id: str = None, disk_free_gb: float = None):
-    """Update worker heartbeat in snapshot."""
+                  current_task_id: str = None, disk_free_gb: float = None,
+                  download_process_alive: bool = None, download_process_pid: int = None,
+                  https_connections: int = None, files_last_5min: int = None,
+                  staging_size_mb: int = None, event_buffer_pending: int = None):
+    """Update worker heartbeat in snapshot (supports sidecar extra fields)."""
     conn = _conn()
+
+    # Ensure extended columns exist (added by sidecar heartbeats)
+    for col, col_type in [
+        ("download_process_alive", "INTEGER"),
+        ("download_process_pid", "INTEGER"),
+        ("https_connections", "INTEGER"),
+        ("files_last_5min", "INTEGER"),
+        ("staging_size_mb", "INTEGER"),
+        ("event_buffer_pending", "INTEGER"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {col_type}")
+        except Exception:
+            pass  # column already exists
+
     conn.execute(
-        "INSERT INTO workers (hostname, server_key, status, current_task_id, disk_free_gb, last_seen) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
+        "INSERT INTO workers (hostname, server_key, status, current_task_id, "
+        "disk_free_gb, download_process_alive, download_process_pid, "
+        "https_connections, files_last_5min, staging_size_mb, event_buffer_pending, last_seen) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(hostname) DO UPDATE SET "
         "server_key=excluded.server_key, status=excluded.status, "
         "current_task_id=excluded.current_task_id, disk_free_gb=excluded.disk_free_gb, "
+        "download_process_alive=excluded.download_process_alive, "
+        "download_process_pid=excluded.download_process_pid, "
+        "https_connections=excluded.https_connections, "
+        "files_last_5min=excluded.files_last_5min, "
+        "staging_size_mb=excluded.staging_size_mb, "
+        "event_buffer_pending=excluded.event_buffer_pending, "
         "last_seen=excluded.last_seen",
-        (hostname, server_key, status, current_task_id, disk_free_gb, time.time()),
+        (hostname, server_key, status, current_task_id, disk_free_gb,
+         1 if download_process_alive else (0 if download_process_alive is False else None),
+         download_process_pid, https_connections, files_last_5min,
+         staging_size_mb, event_buffer_pending, time.time()),
     )
     conn.commit()
 
@@ -232,20 +261,36 @@ def get_dashboard_summary() -> dict:
         "SELECT COALESCE(SUM(size_gb), 0) FROM tasks WHERE size_gb > 0"
     ).fetchone()[0]
 
-    active = conn.execute(
-        "SELECT id, name, server, progress_pct, downloaded_gb, size_gb, "
-        "speed_mbps, phase FROM tasks WHERE status = 'downloading' "
-        "ORDER BY updated_at DESC"
-    ).fetchall()
+    # Check if upload_speed_mbps column exists
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+    has_upload_speed = "upload_speed_mbps" in cols
 
-    aggregate_speed = sum(r["speed_mbps"] or 0 for r in active)
+    if has_upload_speed:
+        active = conn.execute(
+            "SELECT id, name, server, progress_pct, downloaded_gb, size_gb, "
+            "speed_mbps, upload_speed_mbps, phase FROM tasks WHERE status = 'downloading' "
+            "ORDER BY updated_at DESC"
+        ).fetchall()
+    else:
+        active = conn.execute(
+            "SELECT id, name, server, progress_pct, downloaded_gb, size_gb, "
+            "speed_mbps, phase FROM tasks WHERE status = 'downloading' "
+            "ORDER BY updated_at DESC"
+        ).fetchall()
+
+    aggregate_dl_speed = sum(r["speed_mbps"] or 0 for r in active)
+    aggregate_ul_speed = sum(
+        (r["upload_speed_mbps"] or 0) for r in active
+    ) if has_upload_speed else 0.0
 
     return {
         "total_tasks": total,
         "by_status": by_status,
         "total_downloaded_tb": round(total_downloaded / 1000, 2),
         "total_estimated_tb": round(total_estimated / 1000, 2),
-        "aggregate_speed_mbps": round(aggregate_speed, 1),
+        "aggregate_speed_mbps": round(aggregate_dl_speed, 1),
+        "aggregate_download_speed_mbps": round(aggregate_dl_speed, 1),
+        "aggregate_upload_speed_mbps": round(aggregate_ul_speed, 1),
         "active_downloads": [dict(r) for r in active],
         "updated_at": time.time(),
     }

@@ -1,0 +1,16 @@
+[Unit]
+Description=DLM Sidecar Monitor (%i)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m dlm.sidecar.monitor --server-key %i
+WorkingDirectory=/root/code/bos-download-manager
+Restart=always
+RestartSec=5
+Environment=DLM_COORDINATOR=http://154.85.43.52:8080
+EnvironmentFile=-/root/.env
+
+[Install]
+WantedBy=multi-user.target

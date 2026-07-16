@@ -143,12 +143,18 @@ async def run_worker(args):
     )
 
     logger.info("Workers running. Waiting for tasks...")
-    # Start heartbeat loop before worker
+    # Start heartbeat loop and event buffer
     heartbeat_task = asyncio.create_task(_heartbeat_loop(args.server_key))
+
+    from .event_buffer import init_event_buffer
+    event_buf = init_event_buffer(args.server_key)
+    await event_buf.start()
+
     try:
         await asyncio.gather(worker_shared.run(), worker_personal.run())
     finally:
         heartbeat_task.cancel()
+        await event_buf.stop()
 
 
 def main():

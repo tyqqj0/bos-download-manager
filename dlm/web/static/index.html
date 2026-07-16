@@ -79,8 +79,10 @@
                 </div>
                 <!-- Speed -->
                 <div class="text-right pl-4 border-l border-gray-700">
-                    <div class="text-lg font-bold text-blue-400" x-text="formatSpeed(dashboard.aggregate_speed_mbps || 0)"></div>
-                    <div class="text-xs text-gray-500">total speed</div>
+                    <div class="text-lg font-bold text-blue-400" x-text="formatSpeed(dashboard.aggregate_download_speed_mbps || dashboard.aggregate_speed_mbps || 0)"></div>
+                    <div class="text-xs text-gray-500">download</div>
+                    <div class="text-sm font-bold text-green-400 mt-0.5" x-text="formatSpeed(dashboard.aggregate_upload_speed_mbps || 0)"></div>
+                    <div class="text-xs text-gray-500">upload</div>
                 </div>
             </div>
             <!-- Status pills -->
@@ -121,7 +123,8 @@
                                 <span class="text-xs text-gray-500 bg-gray-700/50 px-1.5 py-0.5 rounded" x-text="dl.phase || 'downloading'" x-show="dl.phase"></span>
                             </div>
                             <div class="flex items-center gap-4 text-xs">
-                                <span class="font-mono text-blue-300" x-text="formatSpeed(dl.speed_mbps)"></span>
+                                <span class="font-mono text-blue-300" x-text="'↓' + formatSpeed(dl.speed_mbps)"></span>
+                                <span class="font-mono text-green-300" x-show="dl.upload_speed_mbps > 0" x-text="'↑' + formatSpeed(dl.upload_speed_mbps)"></span>
                                 <span class="text-gray-400" x-text="dl.eta_seconds ? `ETA ${formatEta(dl.eta_seconds)}` : ''"></span>
                             </div>
                         </div>
@@ -164,9 +167,9 @@
                 <div class="bg-gray-800 rounded-lg p-3 space-y-1.5 min-h-[60px]">
                     <template x-for="(al, i) in (dashboard.alerts || [])" :key="i">
                         <div class="flex items-center gap-2 text-xs">
-                            <span class="text-yellow-400" x-show="al.type === 'worker_offline' || al.type === 'disk_low'">&#9888;</span>
-                            <span class="text-red-400" x-show="al.type === 'task_failed_repeat'">&#10007;</span>
-                            <span class="text-gray-300" x-text="formatAlert(al)"></span>
+                            <span class="text-red-400" x-show="al.severity === 'critical'">&#x26A0;</span>
+                            <span class="text-yellow-400" x-show="al.severity === 'warning'">&#9888;</span>
+                            <span class="text-gray-300" x-text="al.message"></span>
                         </div>
                     </template>
                     <div x-show="!(dashboard.alerts || []).length" class="text-xs text-gray-600">No alerts</div>

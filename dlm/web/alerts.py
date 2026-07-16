@@ -3,9 +3,15 @@
 Alerts are de-duplicated: only logs on state transitions (new alert or resolved).
 The /api/dashboard already returns alerts; this module enhances them with severity
 and adds persistent file logging.
+
+Three-layer cross-referencing:
+- Layer 1 (sidecar heartbeat) for process/disk status
+- Layer 2 (event buffer) for download activity
+- Layer 3 (SSH verify) for ground truth
 """
 
 import logging
+import socket
 import time
 from pathlib import Path
 from typing import Optional
@@ -44,6 +50,23 @@ def _get_alert_logger() -> logging.Logger:
     return _alert_logger
 
 
+def s1_self_check() -> bool:
+    """Check if S1 itself has network connectivity.
+
+    Returns True if at least one external target is reachable.
+    Used to distinguish 'all workers dead' from 'S1 is disconnected'.
+    """
+    targets = [("8.8.8.8", 53), ("1.1.1.1", 53), ("114.114.114.114", 53)]
+    for host, port in targets:
+        try:
+            sock = socket.create_connection((host, port), timeout=3)
+            sock.close()
+            return True
+        except (OSError, socket.timeout):
+            continue
+    return False
+
+
 def check_alerts(tasks: list, workers: list) -> list[dict]:
     """Evaluate alert conditions. Returns list of active alerts with severity.
 
@@ -57,14 +80,22 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
     alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
     real_workers = [w for w in workers if w.get("server_key", "").startswith("w")]
 
-    # CRITICAL: All workers offline
+    # CRITICAL: All workers offline — but check if S1 itself is the problem
     if real_workers and not any(w in alive_workers for w in real_workers):
-        key = "all_workers_dead"
-        new_alerts[key] = {
-            "severity": CRITICAL,
-            "type": "all_workers_dead",
-            "message": "All workers are offline",
-        }
+        if s1_self_check():
+            key = "all_workers_dead"
+            new_alerts[key] = {
+                "severity": CRITICAL,
+                "type": "all_workers_dead",
+                "message": "All workers are offline",
+            }
+        else:
+            key = "s1_network_degraded"
+            new_alerts[key] = {
+                "severity": CRITICAL,
+                "type": "s1_network_degraded",
+                "message": "S1 network degraded — cannot reach workers (S1 issue, not workers)",
+            }
 
     # CRITICAL: Disk full on any active worker (<10GB)
     for w in alive_workers:
@@ -93,6 +124,17 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                     "message": f"Worker {w.get('server_key', '')} offline for {int(offline_sec/60)}min",
                 }
 
+    # WARNING: Download process dead but worker online (from sidecar)
+    for w in alive_workers:
+        if w.get("download_process_alive") == 0:
+            key = f"process_dead:{w.get('server_key', '')}"
+            new_alerts[key] = {
+                "severity": WARNING,
+                "type": "download_process_dead",
+                "server": w.get("server_key", ""),
+                "message": f"Download process dead on {w.get('server_key', '')} (sidecar still reporting)",
+            }
+
     # WARNING: Task stuck > 1 hour
     for t in tasks:
         if t.get("status") == "downloading":
@@ -120,6 +162,23 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 "retry_count": t.get("retry_count", 0),
                 "message": f"Task {t.get('name', '')} failed {t.get('retry_count', 0)} times",
             }
+
+    # WARNING: Event delivery broken (Layer 3 sees activity but no events arriving)
+    from .cache import cache
+    verify_report = cache.get("health_verify_report")
+    if verify_report and isinstance(verify_report, dict):
+        for anomaly in verify_report.get("anomalies", []):
+            atype = anomaly.get("type", "")
+            server = anomaly.get("server", "")
+            if atype in ("download_stalled_confirmed", "layer2_delivery_broken",
+                         "process_dead_undetected"):
+                key = f"{atype}:{server}"
+                new_alerts[key] = {
+                    "severity": WARNING,
+                    "type": atype,
+                    "server": server,
+                    "message": anomaly.get("message", ""),
+                }
 
     # Log state transitions
     al = _get_alert_logger()
