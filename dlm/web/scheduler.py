@@ -47,41 +47,6 @@ def _build_dashboard() -> dict:
     return summary
 
 
-def _build_alerts(tasks: list, workers: list) -> list:
-    alerts = []
-    now = time.time()
-
-    for w in workers:
-        if now - (w.get("last_seen") or 0) > 180 and w.get("status") != "offline":
-            alerts.append({
-                "type": "worker_offline",
-                "server": w.get("server_key", w.get("hostname", "")),
-                "duration_min": int((now - (w.get("last_seen") or now)) / 60),
-            })
-
-    for t in tasks:
-        if t.get("status") == "failed" and (t.get("retry_count") or 0) >= 5:
-            alerts.append({
-                "type": "task_failed_repeat",
-                "task": t.get("name", ""),
-                "count": t.get("retry_count", 0),
-                "error": t.get("error_class") or t.get("error") or "",
-            })
-
-        # Stuck download detection: downloading but no update in 30 minutes
-        if t.get("status") == "downloading":
-            updated_at = t.get("updated_at") or 0
-            if now - updated_at > 1800:
-                alerts.append({
-                    "type": "task_stuck",
-                    "task": t.get("name", ""),
-                    "task_id": t.get("id", ""),
-                    "stale_min": int((now - updated_at) / 60),
-                    "server": t.get("server", ""),
-                })
-
-    return alerts
-
 
 def _poll_transfers():
     """Check status of in-progress D-Robotics transfers."""

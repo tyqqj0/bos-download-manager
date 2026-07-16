@@ -58,15 +58,25 @@ class PipelineEngine:
         self.progress_fn = progress_fn
         self.stats = PipelineStats()
         self._executor: Optional[ThreadPoolExecutor] = None
+        self._cancel_events: list = []
         self._bos_client = None
         self._bucket = ""
         self._prefix = ""
 
-    def _download_one_file(self, file_info: FileInfo) -> Optional[Path]:
-        """Download a single file with mirror fallback. Runs in thread pool."""
+    def _download_one_file(self, file_info: FileInfo, cancel_event: "threading.Event | None" = None) -> Optional[Path]:
+        """Download a single file with mirror fallback. Runs in thread pool.
+
+        Uses HF_HUB_DOWNLOAD_TIMEOUT env var to enforce HTTP-level timeouts,
+        ensuring threads exit on stall rather than hanging indefinitely.
+        """
+        import threading
         from huggingface_hub import hf_hub_download
 
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(STALL_TIMEOUT))
+
         for endpoint in [MIRROR_PRIMARY, MIRROR_FALLBACK]:
+            if cancel_event and cancel_event.is_set():
+                return None
             try:
                 local_path = hf_hub_download(
                     repo_id=self.task.repo_id,
@@ -85,7 +95,9 @@ class PipelineEngine:
 
     async def _producer(self, files: list[FileInfo], queue: asyncio.Queue):
         """Download files using thread pool, put completed FileInfo onto queue."""
-        loop = asyncio.get_event_loop()
+        import threading
+
+        loop = asyncio.get_running_loop()
         sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
 
         async def download_with_limit(file_info: FileInfo):
@@ -99,10 +111,12 @@ class PipelineEngine:
 
                 # Download with stall detection and retries
                 for attempt in range(MAX_FILE_RETRIES):
+                    cancel_event = threading.Event()
+                    self._cancel_events.append(cancel_event)
                     try:
                         local_path = await asyncio.wait_for(
                             loop.run_in_executor(
-                                self._executor, self._download_one_file, file_info
+                                self._executor, self._download_one_file, file_info, cancel_event
                             ),
                             timeout=STALL_TIMEOUT,
                         )
@@ -115,6 +129,7 @@ class PipelineEngine:
                             f"All mirrors failed for {file_info.path} (attempt {attempt + 1})"
                         )
                     except asyncio.TimeoutError:
+                        cancel_event.set()
                         logger.warning(
                             f"Timeout downloading {file_info.path} (attempt {attempt + 1})"
                         )
@@ -245,6 +260,8 @@ class PipelineEngine:
                 self._speed_reporter(),
             )
         except asyncio.CancelledError:
+            for evt in self._cancel_events:
+                evt.set()
             self._executor.shutdown(wait=False, cancel_futures=True)
             logger.info("Pipeline cancelled, staging preserved for resume")
             raise

@@ -193,8 +193,12 @@ async def auto_dispatch_pending() -> dict:
             except Exception as e:
                 err_msg = str(e).lower()
                 if "already started" in err_msg:
-                    # Race condition with manual dispatch — harmless
-                    pass
+                    # Workflow already running (raced with manual dispatch) — revert
+                    conn.execute(
+                        "UPDATE tasks SET status = 'downloading', server = NULL WHERE id = ?",
+                        (task["id"],),
+                    )
+                    conn.commit()
                 else:
                     # Revert the status change
                     conn.execute(

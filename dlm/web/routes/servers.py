@@ -100,9 +100,14 @@ async def cleanup_server_staging(key: str):
         if not server:
             return {"error": f"Unknown server: {key}"}
 
+        import re
+        import shlex
+
         cleaned = []
         for name in safe_to_clean:
-            staging_dir = f"/data/staging/{name}"
+            if not re.match(r'^[A-Za-z0-9_.\-/]+$', name):
+                continue  # skip names with shell metacharacters
+            staging_dir = shlex.quote(f"/data/staging/{name}")
             try:
                 ssh_exec(server.host, server.user, f"rm -rf {staging_dir}")
                 cleaned.append(name)
