@@ -111,72 +111,101 @@ class DownloadDatasetWorkflow:
         batch_num = completed_batches
         all_batch_markers = list(completed_paths) if completed_paths else []
 
-        while start_idx < total_file_count:
-            batch_num += 1
-            current_batch_size = min(BATCH_SIZE, total_file_count - start_idx)
+        try:
+            while start_idx < total_file_count:
+                batch_num += 1
+                current_batch_size = min(BATCH_SIZE, total_file_count - start_idx)
 
-            pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
+                pct = (uploaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
 
+                await workflow.execute_activity(
+                    "report_to_dashboard",
+                    args=[task_input.id, "downloading", f"batch {batch_num}",
+                          round(pct, 1), None, round(uploaded_bytes / 1024**3, 2), server_key, None],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+
+                # Run pipeline on the same worker that has the filelist
+                result = await workflow.execute_activity(
+                    "run_pipeline_batch",
+                    args=[task_input, filelist_path, start_idx, current_batch_size,
+                          uploaded_bytes, total_bytes],
+                    start_to_close_timeout=timedelta(hours=24),
+                    heartbeat_timeout=timedelta(minutes=10),
+                    task_queue=worker_queue,
+                    retry_policy=RetryPolicy(
+                        initial_interval=timedelta(minutes=1),
+                        backoff_coefficient=2.0,
+                        maximum_interval=timedelta(minutes=30),
+                        maximum_attempts=3,
+                        non_retryable_error_types=NON_RETRYABLE_ERRORS,
+                    ),
+                )
+
+                # Update progress
+                uploaded_bytes += result["uploaded_bytes"]
+                start_idx += current_batch_size
+                all_batch_markers.append(f"batch-{batch_num}-done")
+
+                await workflow.execute_activity(
+                    "save_progress",
+                    args=[task_input.name, all_batch_markers],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    task_queue=worker_queue,
+                )
+
+            # 6. Done!
+            await workflow.execute_activity(
+                "clear_progress",
+                args=[task_input.name],
+                start_to_close_timeout=timedelta(seconds=30),
+                task_queue=worker_queue,
+            )
+            await workflow.execute_activity(
+                "cleanup_staging",
+                args=[task_input.name, False],
+                start_to_close_timeout=timedelta(minutes=5),
+                task_queue=worker_queue,
+            )
             await workflow.execute_activity(
                 "report_to_dashboard",
-                args=[task_input.id, "downloading", f"batch {batch_num}",
-                      round(pct, 1), None, round(uploaded_bytes / 1024**3, 2), server_key, None],
+                args=[task_input.id, "done", None, 100, 0, round(total_gb, 2), server_key, None],
                 start_to_close_timeout=timedelta(seconds=30),
             )
 
-            # Run pipeline on the same worker that has the filelist
-            result = await workflow.execute_activity(
-                "run_pipeline_batch",
-                args=[task_input, filelist_path, start_idx, current_batch_size,
-                      uploaded_bytes, total_bytes],
-                start_to_close_timeout=timedelta(hours=24),
-                heartbeat_timeout=timedelta(minutes=10),
-                task_queue=worker_queue,
-                retry_policy=RetryPolicy(
-                    initial_interval=timedelta(minutes=1),
-                    backoff_coefficient=2.0,
-                    maximum_interval=timedelta(minutes=30),
-                    maximum_attempts=3,
-                    non_retryable_error_types=NON_RETRYABLE_ERRORS,
-                ),
+            return TaskResult(
+                status="done",
+                files_uploaded=total_file_count,
+                bytes_uploaded=uploaded_bytes,
             )
 
-            # Update progress
-            uploaded_bytes += result["uploaded_bytes"]
-            start_idx += current_batch_size
-            all_batch_markers.append(f"batch-{batch_num}-done")
-
-            await workflow.execute_activity(
-                "save_progress",
-                args=[task_input.name, all_batch_markers],
-                start_to_close_timeout=timedelta(seconds=30),
-                task_queue=worker_queue,
-            )
-
-        # 6. Done!
-        await workflow.execute_activity(
-            "clear_progress",
-            args=[task_input.name],
-            start_to_close_timeout=timedelta(seconds=30),
-            task_queue=worker_queue,
-        )
-        await workflow.execute_activity(
-            "cleanup_staging",
-            args=[task_input.name, False],
-            start_to_close_timeout=timedelta(minutes=5),
-            task_queue=worker_queue,
-        )
-        await workflow.execute_activity(
-            "report_to_dashboard",
-            args=[task_input.id, "done", None, 100, 0, round(total_gb, 2), server_key, None],
-            start_to_close_timeout=timedelta(seconds=30),
-        )
-
-        return TaskResult(
-            status="done",
-            files_uploaded=total_file_count,
-            bytes_uploaded=uploaded_bytes,
-        )
+        except Exception as e:
+            error_msg = str(e)[:500]
+            # Report failure to dashboard
+            try:
+                await workflow.execute_activity(
+                    "report_to_dashboard",
+                    args=[task_input.id, "failed", None, None, None, None, server_key, error_msg],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+            except Exception:
+                pass
+            # Clean staging — preserve .progress.json + .filelist.json for resume.
+            # Use aggressive timeout: worker may be dead.
+            try:
+                await workflow.execute_activity(
+                    "cleanup_staging",
+                    args=[task_input.name, True],  # keep_progress=True
+                    start_to_close_timeout=timedelta(seconds=30),
+                    task_queue=worker_queue,
+                    retry_policy=RetryPolicy(
+                        maximum_attempts=2,
+                        initial_interval=timedelta(seconds=5),
+                    ),
+                )
+            except Exception:
+                pass  # best effort — worker may be dead
+            return TaskResult(status="failed", error=error_msg)
 
 
 @workflow.defn
@@ -190,31 +219,44 @@ class SplitDownloadWorkflow:
 
     @workflow.run
     async def run(self, task_input: TaskInput, worker_count: int = 2) -> TaskResult:
-        # List all files — returns {path, count, total_bytes, worker_queue}
-        result = await workflow.execute_activity(
-            "list_repo_files",
-            args=[task_input],
-            start_to_close_timeout=timedelta(minutes=30),
-            heartbeat_timeout=timedelta(minutes=3),
-            retry_policy=ACTIVITY_RETRY,
-        )
+        try:
+            # List all files — returns {path, count, total_bytes, worker_queue}
+            result = await workflow.execute_activity(
+                "list_repo_files",
+                args=[task_input],
+                start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=3),
+                retry_policy=ACTIVITY_RETRY,
+            )
 
-        filelist_path = result["path"]
-        worker_queue = result["worker_queue"]
+            filelist_path = result["path"]
+            worker_queue = result["worker_queue"]
 
-        if result["count"] == 0:
-            return TaskResult(status="failed", error="No files found")
+            if result["count"] == 0:
+                return TaskResult(status="failed", error="No files found")
 
-        # Partition into chunks — pinned to same worker that has the filelist
-        partitions = await workflow.execute_activity(
-            "partition_filelist",
-            args=[filelist_path, worker_count],
-            start_to_close_timeout=timedelta(minutes=5),
-            task_queue=worker_queue,
-        )
+            # Partition into chunks — pinned to same worker that has the filelist
+            partitions = await workflow.execute_activity(
+                "partition_filelist",
+                args=[filelist_path, worker_count],
+                start_to_close_timeout=timedelta(minutes=5),
+                task_queue=worker_queue,
+            )
 
-        if not partitions:
-            return TaskResult(status="failed", error="No files found")
+            if not partitions:
+                return TaskResult(status="failed", error="No files found")
+
+        except Exception as e:
+            error_msg = str(e)[:500]
+            try:
+                await workflow.execute_activity(
+                    "report_to_dashboard",
+                    args=[task_input.id, "failed", None, None, None, None, None, error_msg],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+            except Exception:
+                pass
+            return TaskResult(status="failed", error=error_msg)
 
         # Launch child workflows — pinned to the worker that has the partition files
         # NOTE: All children run on the same worker since partition files are local

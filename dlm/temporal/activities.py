@@ -230,16 +230,19 @@ async def cleanup_staging(task_name: str, keep_progress: bool = False):
     if not staging_dir.exists():
         return
 
-    progress_file = staging_dir / ".progress.json"
-    progress_data = None
-    if keep_progress and progress_file.exists():
-        progress_data = progress_file.read_text()
+    preserved = {}
+    if keep_progress:
+        for fname in [".progress.json", ".filelist.json"]:
+            fpath = staging_dir / fname
+            if fpath.exists():
+                preserved[fname] = fpath.read_text()
 
     shutil.rmtree(staging_dir, ignore_errors=True)
 
-    if progress_data:
+    if preserved:
         staging_dir.mkdir(parents=True, exist_ok=True)
-        progress_file.write_text(progress_data)
+        for fname, content in preserved.items():
+            (staging_dir / fname).write_text(content)
 
     activity.heartbeat(f"cleaned staging for {task_name}")
 
