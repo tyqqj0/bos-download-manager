@@ -102,8 +102,10 @@ class EventBuffer:
         if success:
             self._retry_count = 0
         else:
-            # Put events back at the front for retry
-            for event in reversed(batch):
+            # Put events back — but respect maxlen by dropping oldest if full
+            remaining_capacity = MAX_BUFFER_SIZE - len(self._buffer)
+            keep = batch[-remaining_capacity:] if remaining_capacity < len(batch) else batch
+            for event in reversed(keep):
                 self._buffer.appendleft(event)
             # Backoff
             backoff_idx = min(self._retry_count, len(RETRY_BACKOFF) - 1)

@@ -199,19 +199,21 @@ def update_worker(hostname: str, server_key: str, status: str = "online",
     """Update worker heartbeat in snapshot (supports sidecar extra fields)."""
     conn = _conn()
 
-    # Ensure extended columns exist (added by sidecar heartbeats)
-    for col, col_type in [
-        ("download_process_alive", "INTEGER"),
-        ("download_process_pid", "INTEGER"),
-        ("https_connections", "INTEGER"),
-        ("files_last_5min", "INTEGER"),
-        ("staging_size_mb", "INTEGER"),
-        ("event_buffer_pending", "INTEGER"),
-    ]:
-        try:
-            conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {col_type}")
-        except Exception:
-            pass  # column already exists
+    # Ensure extended columns exist — only run once per thread
+    if not getattr(_local, "workers_schema_migrated", False):
+        for col, col_type in [
+            ("download_process_alive", "INTEGER"),
+            ("download_process_pid", "INTEGER"),
+            ("https_connections", "INTEGER"),
+            ("files_last_5min", "INTEGER"),
+            ("staging_size_mb", "INTEGER"),
+            ("event_buffer_pending", "INTEGER"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass  # column already exists
+        _local.workers_schema_migrated = True
 
     conn.execute(
         "INSERT INTO workers (hostname, server_key, status, current_task_id, "
