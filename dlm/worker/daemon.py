@@ -1,3 +1,7 @@
+# DEPRECATED: This daemon was for the BOS state.json polling architecture.
+# The current system uses Temporal workflows (see dlm/temporal/).
+# Kept for reference only — do not run in production.
+
 """DLM Worker Daemon — main loop that polls BOS state for tasks."""
 
 import os

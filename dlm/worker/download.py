@@ -1,3 +1,7 @@
+# DEPRECATED: This was the Celery-based download task.
+# The current system uses Temporal workflows (see dlm/temporal/).
+# Kept for reference only — do not run in production.
+
 """Celery task: download a dataset and upload to BOS.
 
 Wraps the existing TaskRunner with Celery lifecycle management:

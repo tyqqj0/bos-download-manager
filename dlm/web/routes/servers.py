@@ -70,6 +70,50 @@ async def worker_heartbeat(body: dict):
     return await run_blocking(_do)
 
 
+@router.post("/servers/{key}/cleanup")
+async def cleanup_server_staging(key: str):
+    """Clean staging directory on a worker for done/failed/revoked tasks.
+
+    Only removes staging dirs whose task is done, failed, or revoked.
+    Never touches staging for active (downloading/pending) tasks.
+    """
+    def _do():
+        from ...queue.snapshot import get_all_tasks, init_db
+        from ...core.servers import load_servers
+        from ...core.ssh import ssh_exec
+
+        init_db()
+        tasks = get_all_tasks()
+
+        # Find tasks that are safe to clean (done/failed/revoked)
+        safe_to_clean = [
+            t["name"] for t in tasks
+            if t.get("status") in ("done", "failed", "revoked")
+            and t.get("server") == key
+        ]
+
+        if not safe_to_clean:
+            return {"cleaned": [], "message": "Nothing to clean"}
+
+        servers = load_servers()
+        server = servers.get(key)
+        if not server:
+            return {"error": f"Unknown server: {key}"}
+
+        cleaned = []
+        for name in safe_to_clean:
+            staging_dir = f"/data/staging/{name}"
+            try:
+                ssh_exec(server.host, server.user, f"rm -rf {staging_dir}")
+                cleaned.append(name)
+            except Exception:
+                pass  # best effort
+
+        return {"cleaned": cleaned, "count": len(cleaned)}
+
+    return await run_blocking(_do)
+
+
 @router.post("/task-progress")
 async def task_progress(body: dict):
     """Receive real-time task progress from workers."""

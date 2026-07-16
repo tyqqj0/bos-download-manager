@@ -43,6 +43,7 @@ def create_app() -> FastAPI:
     from .routes.doctor import router as doctor_router
     from .routes.transfer import router as transfer_router
     from .routes.storage import router as storage_router
+    from .routes.workflows import router as workflows_router
 
     app.include_router(queue_router, prefix="/api")
     app.include_router(tasks_router, prefix="/api")
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
     app.include_router(doctor_router, prefix="/api")
     app.include_router(transfer_router, prefix="/api")
     app.include_router(storage_router, prefix="/api")
+    app.include_router(workflows_router, prefix="/api")
 
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
