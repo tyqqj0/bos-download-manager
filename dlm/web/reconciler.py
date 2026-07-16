@@ -120,6 +120,98 @@ async def reconcile() -> dict:
     return report
 
 
+async def auto_dispatch_pending() -> dict:
+    """Auto-dispatch pending tasks to idle workers.
+
+    Idle = worker heartbeat alive (last_seen < 180s) but no running workflow.
+    Dispatch one pending task per idle worker, priority order.
+
+    Uses optimistic locking: UPDATE tasks SET status='downloading' WHERE status='pending' AND id=?
+    to prevent TOCTOU race with concurrent dispatches.
+    """
+    from ..queue.snapshot import get_tasks_by_status, get_workers, _conn, init_db
+    from .temporal_client import get_client, start_download
+
+    init_db()
+    report = {"dispatched": [], "errors": []}
+
+    try:
+        # 1. Find alive workers
+        workers = get_workers()
+        now = time.time()
+        alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
+        if not alive_workers:
+            return report
+
+        # 2. Find busy workers via SQLite downloading tasks (simpler and more reliable
+        #    than querying Temporal, which may timeout or miss recently-started workflows)
+        downloading = get_tasks_by_status("downloading")
+        busy_servers = {t.get("server") for t in downloading if t.get("server")}
+
+        idle_workers = [
+            w for w in alive_workers
+            if w.get("server_key") not in busy_servers
+        ]
+
+        if not idle_workers:
+            return report
+
+        # 3. Get pending tasks (priority order)
+        pending = get_tasks_by_status("pending")
+        if not pending:
+            return report
+        pending.sort(key=lambda t: (t.get("priority", 5), t.get("created_at", "")))
+
+        # 4. Dispatch: one task per idle worker (with optimistic locking)
+        conn = _conn()
+        for worker in idle_workers:
+            if not pending:
+                break
+            task = pending.pop(0)
+            server_key = worker.get("server_key", "")
+
+            # Optimistic lock: only claim if still pending
+            cursor = conn.execute(
+                "UPDATE tasks SET status = 'downloading', server = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (server_key, time.time(), task["id"]),
+            )
+            conn.commit()
+
+            if cursor.rowcount == 0:
+                continue  # someone else claimed it
+
+            # Start workflow
+            queue = f"download-{server_key}"
+            try:
+                await start_download(task, task_queue=queue)
+                report["dispatched"].append({
+                    "task": task.get("name", task["id"]),
+                    "worker": server_key,
+                })
+                logger.info(f"Auto-dispatch: {task.get('name')} → {server_key}")
+            except Exception as e:
+                err_msg = str(e).lower()
+                if "already started" in err_msg:
+                    # Race condition with manual dispatch — harmless
+                    pass
+                else:
+                    # Revert the status change
+                    conn.execute(
+                        "UPDATE tasks SET status = 'pending', server = NULL WHERE id = ?",
+                        (task["id"],),
+                    )
+                    conn.commit()
+                    report["errors"].append(f"Dispatch failed for {task.get('name')}: {e}")
+                    logger.error(f"Auto-dispatch failed for {task['id']}: {e}")
+
+    except Exception as e:
+        report["errors"].append(f"Auto-dispatch error: {e}")
+        logger.error(f"Auto-dispatch error: {e}")
+
+    return report
+
+
 def zero_stale_speeds():
     """Zero out speed_mbps for tasks that haven't reported in SPEED_STALE_THRESHOLD.
 

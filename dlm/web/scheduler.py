@@ -172,6 +172,17 @@ async def background_scheduler():
                     cache.set("reconciler_report", report)
                 except Exception as e:
                     logger.error(f"Reconciler error: {e}")
+
+                # Auto-dispatch pending tasks to idle workers
+                try:
+                    from .reconciler import auto_dispatch_pending
+                    dispatch_report = await auto_dispatch_pending()
+                    if dispatch_report.get("dispatched"):
+                        logger.info(f"Auto-dispatch: {dispatch_report['dispatched']}")
+                    cache.set("auto_dispatch_report", dispatch_report)
+                except Exception as e:
+                    logger.error(f"Auto-dispatch error: {e}")
+
                 last_reconcile = now
 
         except Exception as e:
