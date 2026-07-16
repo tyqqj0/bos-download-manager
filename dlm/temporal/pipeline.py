@@ -191,7 +191,7 @@ class PipelineEngine:
         cmd.extend(file_paths)
 
         env = os.environ.copy()
-        env["HF_XET_HIGH_PERFORMANCE"] = "1"
+        env["HF_ENDPOINT"] = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
         env["HF_HUB_CACHE"] = "/tmp/hf_cache"
         if os.environ.get("HF_TOKEN"):
             env["HF_TOKEN"] = os.environ["HF_TOKEN"]
