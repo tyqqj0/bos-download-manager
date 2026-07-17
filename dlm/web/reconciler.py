@@ -180,7 +180,6 @@ async def auto_dispatch_pending() -> dict:
                 continue
 
             task = pending.pop(0)
-            server_key = worker.get("server_key", "")
 
             # Optimistic lock: only claim if still pending
             cursor = conn.execute(

@@ -161,9 +161,11 @@ class PipelineEngine:
                         )
                     except _StallDetected:
                         cancel_event.set()
-                        # Clean up .incomplete residue to prevent disk leak
+                        # Clean up .incomplete residue for THIS specific file only
                         filename = file_info.path.split("/")[-1]
-                        for p in self.staging_dir.rglob(f"*{filename}*.incomplete"):
+                        for p in self.staging_dir.rglob(f"{filename}.incomplete"):
+                            p.unlink(missing_ok=True)
+                        for p in self.staging_dir.rglob(f".cache/**/{filename}.incomplete"):
                             p.unlink(missing_ok=True)
                         logger.warning(
                             f"Stall detected for {file_info.path} "
@@ -244,9 +246,10 @@ class PipelineEngine:
         while True:
             # Backpressure: wait for a slot before pulling from queue
             while len(pending) >= MAX_PENDING_UPLOADS:
-                done, pending = await asyncio.wait(
+                done, _ = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_COMPLETED
                 )
+                pending -= done
                 for t in done:
                     exc = t.exception()
                     if exc:
@@ -258,7 +261,6 @@ class PipelineEngine:
 
             task = asyncio.create_task(self._upload_one(file_info, sem))
             pending.add(task)
-            task.add_done_callback(pending.discard)
 
         # Drain remaining uploads
         if pending:
@@ -279,10 +281,15 @@ class PipelineEngine:
                     pass
 
     async def _upload_one(self, fi: FileInfo, sem: asyncio.Semaphore):
-        """Upload a single file to BOS with retry. Deletes local file on success or final failure."""
+        """Upload a single file to BOS with retry.
+
+        Deletes local file on success. On final failure, keeps file on disk
+        (Temporal batch-level retry will re-attempt the whole batch) but counts
+        it as failed for stats.
+        """
         from ..core.bos import upload_file
 
-        MAX_UPLOAD_RETRIES = 3
+        MAX_UPLOAD_RETRIES = 5
         local_path = self.staging_dir / fi.path
 
         if not local_path.exists():
@@ -314,17 +321,17 @@ class PipelineEngine:
                     return
                 except Exception as e:
                     if attempt < MAX_UPLOAD_RETRIES - 1:
+                        wait = min(2 ** attempt, 30)
                         logger.warning(
                             f"Upload retry {attempt + 1}/{MAX_UPLOAD_RETRIES} "
-                            f"for {fi.path}: {e}"
+                            f"for {fi.path}: {e} (wait {wait}s)"
                         )
-                        await asyncio.sleep(2 ** attempt)
+                        await asyncio.sleep(wait)
                         continue
-                    # All retries exhausted — delete file to prevent disk leak
+                    # All retries exhausted — keep file for batch-level retry
                     logger.error(
                         f"Upload failed x{MAX_UPLOAD_RETRIES} for {fi.path}: {e}"
                     )
-                    local_path.unlink(missing_ok=True)
                     self.stats.failed_files += 1
                     self._emit_event("file_failed", {
                         "file": fi.path,

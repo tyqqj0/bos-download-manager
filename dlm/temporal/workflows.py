@@ -96,12 +96,17 @@ class DownloadDatasetWorkflow:
             return TaskResult(status="failed", error="No files found in repo")
 
         # 3. Preflight: verify enough disk space to run (pipeline needs ~25GB working room)
-        disk_ok = await workflow.execute_activity(
-            "check_disk_space",
-            args=[25],
-            start_to_close_timeout=timedelta(seconds=10),
-            task_queue=worker_queue,
-        )
+        try:
+            disk_ok = await workflow.execute_activity(
+                "check_disk_space",
+                args=[25],
+                start_to_close_timeout=timedelta(seconds=10),
+                schedule_to_close_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+                task_queue=worker_queue,
+            )
+        except Exception:
+            disk_ok = True  # activity unavailable (old worker) — proceed cautiously
         if not disk_ok:
             error_msg = f"Insufficient disk space on {server_key} (need 25GB free)"
             await workflow.execute_activity(
