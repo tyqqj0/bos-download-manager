@@ -18,7 +18,7 @@ RECONCILE_INTERVAL = 300  # 5 minutes
 STALE_THRESHOLD = 600     # 10 minutes without update = suspicious
 DEAD_THRESHOLD = 1800     # 30 minutes without update = definitely dead
 SPEED_STALE_THRESHOLD = 300  # 5 minutes without update = zero out speed
-MIN_DISPATCH_DISK_GB = 30  # worker needs >= 30GB free to accept new tasks
+MIN_DISPATCH_DISK_GB = 70  # must exceed pipeline backpressure threshold (~60GB for 200GB disk)
 
 
 async def reconcile() -> dict:
@@ -54,10 +54,11 @@ async def reconcile() -> dict:
     try:
         client = await get_client()
         running_ids = set()
-        async for wf in client.list_workflows(
-            'WorkflowType="DownloadDatasetWorkflow" AND ExecutionStatus="Running"'
-        ):
-            running_ids.add(wf.id)
+        for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow"]:
+            async for wf in client.list_workflows(
+                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
+            ):
+                running_ids.add(wf.id)
         report["running_workflows"] = len(running_ids)
     except Exception as e:
         report["errors"].append(f"Failed to query Temporal: {e}")
@@ -71,8 +72,14 @@ async def reconcile() -> dict:
         updated_at = task.get("updated_at") or 0
         stale_seconds = now - updated_at
 
-        # Check if workflow exists
-        if workflow_id not in running_ids:
+        # Check if any workflow exists for this task (normal, split, or child)
+        has_workflow = (
+            workflow_id in running_ids
+            or f"split-download-{task_id}" in running_ids
+            or any(wid.startswith(f"{task_id}-part") for wid in running_ids)
+        )
+
+        if not has_workflow:
             report["orphaned"].append({
                 "task_id": task_id,
                 "name": task.get("name", ""),
@@ -104,13 +111,14 @@ async def reconcile() -> dict:
                         logger.error(f"Reconciler: re-dispatch failed for {task_id}: {e}")
 
         # Detect stale progress (workflow exists but no updates)
-        elif stale_seconds > STALE_THRESHOLD:
-            report["stale"].append({
-                "task_id": task_id,
-                "name": task.get("name", ""),
-                "server": task.get("server", ""),
-                "stale_seconds": int(stale_seconds),
-            })
+        else:
+            if stale_seconds > STALE_THRESHOLD:
+                report["stale"].append({
+                    "task_id": task_id,
+                    "name": task.get("name", ""),
+                    "server": task.get("server", ""),
+                    "stale_seconds": int(stale_seconds),
+                })
 
     if report["redispatched"]:
         logger.warning(

@@ -175,31 +175,6 @@ class DownloadDatasetWorkflow:
                     task_queue=worker_queue,
                 )
 
-            # 6. Done!
-            await workflow.execute_activity(
-                "clear_progress",
-                args=[task_input.name],
-                start_to_close_timeout=timedelta(seconds=30),
-                task_queue=worker_queue,
-            )
-            await workflow.execute_activity(
-                "cleanup_staging",
-                args=[task_input.name, False],
-                start_to_close_timeout=timedelta(minutes=5),
-                task_queue=worker_queue,
-            )
-            await workflow.execute_activity(
-                "report_to_dashboard",
-                args=[task_input.id, "done", None, 100, 0, round(total_gb, 2), server_key, None],
-                start_to_close_timeout=timedelta(seconds=30),
-            )
-
-            return TaskResult(
-                status="done",
-                files_uploaded=total_file_count,
-                bytes_uploaded=uploaded_bytes,
-            )
-
         except Exception as e:
             error_msg = str(e)[:500]
             # Report failure to dashboard
@@ -228,9 +203,43 @@ class DownloadDatasetWorkflow:
                 pass  # best effort — worker may be dead
             return TaskResult(status="failed", error=error_msg)
 
+        # 6. Done — these run only on success (except returns early above).
+        # Each wrapped in its own try/except: cleanup/report failures must not
+        # turn a successful download into a "failed" task.
+        try:
+            await workflow.execute_activity(
+                "clear_progress",
+                args=[task_input.name],
+                start_to_close_timeout=timedelta(seconds=30),
+                task_queue=worker_queue,
+            )
+        except Exception:
+            pass
 
-@workflow.defn
-class SplitDownloadWorkflow:
+        try:
+            await workflow.execute_activity(
+                "cleanup_staging",
+                args=[task_input.name, False],
+                start_to_close_timeout=timedelta(minutes=5),
+                task_queue=worker_queue,
+            )
+        except Exception:
+            pass
+
+        try:
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_input.id, "done", None, 100, 0, round(total_gb, 2), server_key, None],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+        except Exception:
+            pass
+
+        return TaskResult(
+            status="done",
+            files_uploaded=total_file_count,
+            bytes_uploaded=uploaded_bytes,
+        )
     """Split a large dataset across multiple workers.
 
     Divides files into N chunks (greedy by size) and runs
@@ -309,12 +318,31 @@ class SplitDownloadWorkflow:
         failed = [r for r in results if r.status == "failed"]
 
         if failed:
+            error_msg = f"{len(failed)}/{worker_count} parts failed"
+            try:
+                await workflow.execute_activity(
+                    "report_to_dashboard",
+                    args=[task_input.id, "failed", None, None, None, None, None, error_msg],
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+            except Exception:
+                pass
             return TaskResult(
                 status="failed",
                 files_uploaded=total_files,
                 bytes_uploaded=total_bytes,
-                error=f"{len(failed)}/{worker_count} parts failed",
+                error=error_msg,
             )
+
+        total_gb = total_bytes / (1024 ** 3)
+        try:
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_input.id, "done", None, 100, 0, round(total_gb, 2), None, None],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+        except Exception:
+            pass
 
         return TaskResult(
             status="done",

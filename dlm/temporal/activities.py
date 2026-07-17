@@ -215,6 +215,12 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
     engine = PipelineEngine(task_input, staging_dir, heartbeat_fn, progress_fn)
     stats = await engine.run(files)
 
+    if stats.failed_files > 0:
+        raise RuntimeError(
+            f"Batch incomplete: {stats.failed_files}/{stats.total_files} files failed "
+            f"(downloaded={stats.downloaded_files}, uploaded={stats.uploaded_files})"
+        )
+
     return {
         "downloaded_files": stats.downloaded_files,
         "uploaded_files": stats.uploaded_files,

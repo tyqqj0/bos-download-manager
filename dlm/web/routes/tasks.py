@@ -138,13 +138,10 @@ class AddTaskRequest(BaseModel):
 
 @router.post("/tasks")
 async def add_task(req: AddTaskRequest):
-    """Add a new download task via the queue system."""
+    """Add a new download task — saves to pending, auto_dispatch picks it up."""
     def _do():
         from ...core.parser import parse_repo
         from ...queue.snapshot import get_all_tasks, upsert_task, init_db
-        from ...worker.download import download_dataset
-        from ...transfer.tasks import transfer_to_juicefs
-        from celery import chain
         import uuid
         from datetime import datetime, timezone
 
@@ -195,13 +192,6 @@ async def add_task(req: AddTaskRequest):
         }
 
         upsert_task(task_meta)
-
-        if not req.no_dispatch:
-            chain(
-                download_dataset.s(task_meta),
-                transfer_to_juicefs.s(),
-            ).apply_async(priority=priority_int, task_id=task_id)
-
         return {"task": _task_for_frontend(task_meta)}
 
     result = await run_blocking(_do)
@@ -212,10 +202,9 @@ async def add_task(req: AddTaskRequest):
 
 @router.post("/tasks/{task_id}/retry")
 async def retry_task(task_id: str):
-    """Retry a failed task via the queue system."""
+    """Retry a failed task — sets to pending for auto_dispatch to pick up."""
     def _do():
         from ...queue.snapshot import get_task, upsert_task, init_db
-        from ...worker.download import download_dataset
         init_db()
 
         task = get_task(task_id)
@@ -227,20 +216,13 @@ async def retry_task(task_id: str):
         task["status"] = "pending"
         task["error"] = None
         task["error_class"] = None
-        task["phase"] = "queued"
+        task["phase"] = None
         task["speed_mbps"] = 0
+        task["server"] = None
         task["retry_count"] = (task.get("retry_count") or 0) + 1
         upsert_task(task)
 
-        priority = task.get("priority", 5)
-        if isinstance(priority, str):
-            priority = PRIORITY_TO_INT.get(priority, 5)
-
-        download_dataset.apply_async(
-            args=[task], priority=priority, task_id=task_id,
-        )
-
-        return {"status": "dispatched", "server": "auto"}
+        return {"status": "pending", "message": "Task queued for auto-dispatch"}
 
     result = await run_blocking(_do)
     if "error" in result:
@@ -251,52 +233,58 @@ async def retry_task(task_id: str):
 @router.post("/tasks/{task_id}/skip")
 async def skip_task(task_id: str):
     """Skip/revoke a task."""
+    from ..temporal_client import cancel_workflow
+
     def _do():
         from ...queue.snapshot import get_task, update_task_progress, init_db
-        from ...queue.app import app as celery_app
         init_db()
 
         task = get_task(task_id)
         if not task:
             return {"error": f"Task not found: {task_id}"}
 
-        if task.get("status") == "downloading":
-            celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
-
-        celery_app.control.revoke(task_id, terminate=False)
         update_task_progress(task_id, status="revoked", phase=None, speed_mbps=0)
-
         return {"id": task_id, "status": "skipped"}
 
     result = await run_blocking(_do)
     if "error" in result:
         raise HTTPException(400, result["error"])
+
+    # Cancel Temporal workflow (best effort)
+    try:
+        await cancel_workflow(task_id)
+    except Exception:
+        pass
+
     return result
 
 
 @router.delete("/tasks/{task_id}")
 async def delete_task(task_id: str):
     """Delete a task."""
+    from ..temporal_client import cancel_workflow
+
     def _do():
         from ...queue.snapshot import get_task, delete_task, init_db
-        from ...queue.app import app as celery_app
         init_db()
 
         task = get_task(task_id)
         if not task:
             return {"error": f"Task not found: {task_id}"}
 
-        if task.get("status") == "downloading":
-            celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
-
-        celery_app.control.revoke(task_id, terminate=False)
         delete_task(task_id)
-
         return {"id": task_id, "deleted": True}
 
     result = await run_blocking(_do)
     if "error" in result:
         raise HTTPException(400, result["error"])
+
+    # Cancel Temporal workflow (best effort)
+    try:
+        await cancel_workflow(task_id)
+    except Exception:
+        pass
+
     return result
 
 
@@ -323,10 +311,10 @@ async def batch_action(req: BatchRequest):
     if req.action not in ("retry", "skip"):
         raise HTTPException(400, f"Invalid action: {req.action}")
 
+    from ..temporal_client import cancel_workflow
+
     def _do():
         from ...queue.snapshot import get_task, upsert_task, update_task_progress, init_db
-        from ...queue.app import app as celery_app
-        from ...worker.download import download_dataset
         init_db()
 
         results = []
@@ -337,7 +325,6 @@ async def batch_action(req: BatchRequest):
                 continue
 
             if req.action == "skip":
-                celery_app.control.revoke(tid, terminate=task.get("status") == "downloading")
                 update_task_progress(tid, status="revoked", phase=None, speed_mbps=0)
                 results.append({"id": tid, "status": "skipped"})
 
@@ -350,13 +337,18 @@ async def batch_action(req: BatchRequest):
                 task["error"] = None
                 task["retry_count"] = (task.get("retry_count") or 0) + 1
                 upsert_task(task)
-
-                priority = task.get("priority", 5)
-                if isinstance(priority, str):
-                    priority = PRIORITY_TO_INT.get(priority, 5)
-                download_dataset.apply_async(args=[task], priority=priority, task_id=tid)
-                results.append({"id": tid, "status": "dispatched"})
+                results.append({"id": tid, "status": "pending"})
 
         return {"results": results}
 
-    return await run_blocking(_do)
+    result = await run_blocking(_do)
+
+    # Cancel Temporal workflows for skipped tasks (best effort)
+    if req.action == "skip":
+        for tid in req.task_ids:
+            try:
+                await cancel_workflow(tid)
+            except Exception:
+                pass
+
+    return result

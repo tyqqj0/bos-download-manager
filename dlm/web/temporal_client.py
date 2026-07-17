@@ -87,13 +87,15 @@ async def start_split_download(task_dict: dict, worker_count: int = 2):
 
 
 async def cancel_workflow(task_id: str):
-    """Cancel a running workflow."""
+    """Cancel running workflow(s) for a task — handles both normal and split patterns."""
     client = await get_client()
-    handle = client.get_workflow_handle(f"dl-{task_id}")
-    try:
-        await handle.cancel()
-    except Exception as e:
-        logger.warning(f"Cancel failed for {task_id}: {e}")
+    for wf_id in [f"dl-{task_id}", f"split-download-{task_id}"]:
+        try:
+            handle = client.get_workflow_handle(wf_id)
+            await handle.cancel()
+            logger.info(f"Cancelled workflow {wf_id}")
+        except Exception:
+            pass
 
 
 async def list_running_workflows() -> list:
