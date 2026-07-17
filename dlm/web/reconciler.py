@@ -18,6 +18,7 @@ RECONCILE_INTERVAL = 300  # 5 minutes
 STALE_THRESHOLD = 600     # 10 minutes without update = suspicious
 DEAD_THRESHOLD = 1800     # 30 minutes without update = definitely dead
 SPEED_STALE_THRESHOLD = 300  # 5 minutes without update = zero out speed
+MIN_DISPATCH_DISK_GB = 30  # worker needs >= 30GB free to accept new tasks
 
 
 async def reconcile() -> dict:
@@ -167,6 +168,17 @@ async def auto_dispatch_pending() -> dict:
         for worker in idle_workers:
             if not pending:
                 break
+
+            # Disk capacity check: skip workers with insufficient free space
+            worker_disk = worker.get("disk_free_gb") or 0
+            server_key = worker.get("server_key", "")
+            if worker_disk < MIN_DISPATCH_DISK_GB:
+                logger.warning(
+                    f"Auto-dispatch: skip {server_key} "
+                    f"(only {worker_disk:.1f}GB free < {MIN_DISPATCH_DISK_GB}GB required)"
+                )
+                continue
+
             task = pending.pop(0)
             server_key = worker.get("server_key", "")
 

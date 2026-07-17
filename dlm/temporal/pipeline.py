@@ -1,13 +1,13 @@
 """Pipeline engine — per-file producer-consumer with Python API downloads.
 
 Architecture:
-  Producer (ThreadPoolExecutor, 8 workers)  Queue(maxsize=64)  Consumer (asyncio, 8 concurrent)
-  ─────────────────────────────────────────  ───────────────    ───────────────────────────────
+  Producer (ThreadPoolExecutor, 8 workers)  Queue(maxsize=16)  Consumer (asyncio, 12 max pending)
+  ─────────────────────────────────────────  ───────────────    ─────────────────────────────────
   hf_hub_download() per file                [FileInfo, ...]    BOS upload + unlink per file
     mirror fallback per file                                   asyncio.Semaphore(8)
-    stall detection: 300s timeout
+    stall detection: file-growth based                         3 retries, delete on final failure
     max 3 retries per file
-    backpressure: pause if disk < 50GB free
+    backpressure: pause if disk < 30% free (dynamic)
 """
 
 from __future__ import annotations
@@ -32,7 +32,8 @@ class _StallDetected(Exception):
 
 DOWNLOAD_WORKERS = 8          # parallel file downloads (ThreadPoolExecutor)
 UPLOAD_CONCURRENCY = 8        # parallel BOS uploads (asyncio.Semaphore)
-DISK_FREE_MIN_GB = 50         # backpressure threshold
+DISK_FREE_MIN_PCT = 0.30      # keep 30% disk free (dynamic threshold)
+DISK_FREE_ABSOLUTE_MIN_GB = 20  # absolute minimum free space
 STALL_CHECK_INTERVAL = 30    # check file growth every 30s
 STALL_TIMEOUT = 1800          # 30 min no file growth → stall (for large files)
 HTTP_TIMEOUT = 300            # HF_HUB_DOWNLOAD_TIMEOUT: per-read HTTP timeout
@@ -40,13 +41,21 @@ MAX_FILE_RETRIES = 3          # per-file retry limit
 MIRROR_PRIMARY = "https://hf-mirror.com"
 MIRROR_FALLBACK = "https://huggingface.co"
 SPEED_REPORT_INTERVAL = 15    # seconds between progress reports
-QUEUE_MAX_SIZE = 64           # max files buffered between download and upload
+QUEUE_MAX_SIZE = 16           # max files buffered between download and upload
+MAX_PENDING_UPLOADS = UPLOAD_CONCURRENCY + 4  # max in-flight upload tasks before backpressure
 STAGING_PATH = Path("/data/staging")
 
 
 def _disk_free_gb() -> float:
     stat = shutil.disk_usage(STAGING_PATH)
     return stat.free / (1024 ** 3)
+
+
+def _disk_free_threshold_gb() -> float:
+    """Dynamic backpressure threshold: max(30% of total disk, 20GB)."""
+    stat = shutil.disk_usage(STAGING_PATH)
+    total_gb = stat.total / (1024 ** 3)
+    return max(total_gb * DISK_FREE_MIN_PCT, DISK_FREE_ABSOLUTE_MIN_GB)
 
 
 class PipelineEngine:
@@ -124,9 +133,10 @@ class PipelineEngine:
         async def download_with_limit(file_info: FileInfo):
             async with sem:
                 # Backpressure: wait for disk space
-                while _disk_free_gb() < DISK_FREE_MIN_GB:
+                threshold = _disk_free_threshold_gb()
+                while _disk_free_gb() < threshold:
                     self.stats.paused = True
-                    self.heartbeat_fn(f"backpressure: {_disk_free_gb():.0f}GB free")
+                    self.heartbeat_fn(f"backpressure: {_disk_free_gb():.0f}GB free < {threshold:.0f}GB threshold")
                     await asyncio.sleep(10)
                 self.stats.paused = False
 
@@ -151,6 +161,10 @@ class PipelineEngine:
                         )
                     except _StallDetected:
                         cancel_event.set()
+                        # Clean up .incomplete residue to prevent disk leak
+                        filename = file_info.path.split("/")[-1]
+                        for p in self.staging_dir.rglob(f"*{filename}*.incomplete"):
+                            p.unlink(missing_ok=True)
                         logger.warning(
                             f"Stall detected for {file_info.path} "
                             f"(no growth for {STALL_TIMEOUT}s, attempt {attempt + 1})"
@@ -217,58 +231,43 @@ class PipelineEngine:
         return download_future.result()
 
     async def _consumer(self, queue: asyncio.Queue):
-        """Upload files from queue to BOS, delete local file after success."""
-        from ..core.bos import upload_file
+        """Upload files from queue to BOS, delete local file after success.
 
+        Backpressure: limits in-flight upload tasks to MAX_PENDING_UPLOADS.
+        When the cap is hit, waits for at least one upload to finish before
+        pulling the next file from the queue — this is what makes queue.put()
+        in the producer actually block, limiting disk accumulation.
+        """
         sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
-        upload_tasks = []
+        pending: set = set()
 
         while True:
+            # Backpressure: wait for a slot before pulling from queue
+            while len(pending) >= MAX_PENDING_UPLOADS:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in done:
+                    exc = t.exception()
+                    if exc:
+                        logger.error(f"Upload task error: {exc}")
+
             file_info = await queue.get()
             if file_info is None:
                 break
 
-            async def upload_one(fi: FileInfo):
-                local_path = self.staging_dir / fi.path
-                if not local_path.exists():
-                    logger.warning(f"File not found for upload: {local_path}")
-                    self.stats.failed_files += 1
-                    return
-                key = self._prefix + fi.path
-                async with sem:
-                    t0 = time.time()
-                    try:
-                        await asyncio.to_thread(
-                            upload_file,
-                            self._bos_client,
-                            self._bucket,
-                            key,
-                            str(local_path),
-                        )
-                        local_path.unlink(missing_ok=True)
-                        self.stats.uploaded_files += 1
-                        self.stats.uploaded_bytes += fi.size
-                        self._emit_event("file_uploaded", {
-                            "file": fi.path,
-                            "size_bytes": fi.size,
-                            "duration_s": round(time.time() - t0, 1),
-                        })
-                    except Exception as e:
-                        logger.error(f"Upload failed {fi.path}: {e}")
-                        self.stats.failed_files += 1
-                        self._emit_event("file_failed", {
-                            "file": fi.path,
-                            "error": str(e)[:200],
-                            "phase": "upload",
-                        })
+            task = asyncio.create_task(self._upload_one(file_info, sem))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
 
-            upload_tasks.append(asyncio.create_task(upload_one(file_info)))
+        # Drain remaining uploads
+        if pending:
+            done, _ = await asyncio.wait(pending)
+            for t in done:
+                exc = t.exception()
+                if exc:
+                    logger.error(f"Upload task error: {exc}")
 
-        # Wait for all in-flight uploads to complete
-        if upload_tasks:
-            await asyncio.gather(*upload_tasks, return_exceptions=True)
-
-        # Signal speed reporter to exit (checked in _speed_reporter loop condition)
         self.stats.phase = "done"
 
         # Clean up empty directories left after file deletions
@@ -278,6 +277,60 @@ class PipelineEngine:
                     d.rmdir()
                 except OSError:
                     pass
+
+    async def _upload_one(self, fi: FileInfo, sem: asyncio.Semaphore):
+        """Upload a single file to BOS with retry. Deletes local file on success or final failure."""
+        from ..core.bos import upload_file
+
+        MAX_UPLOAD_RETRIES = 3
+        local_path = self.staging_dir / fi.path
+
+        if not local_path.exists():
+            logger.warning(f"File not found for upload: {local_path}")
+            self.stats.failed_files += 1
+            return
+
+        key = self._prefix + fi.path
+
+        async with sem:
+            for attempt in range(MAX_UPLOAD_RETRIES):
+                t0 = time.time()
+                try:
+                    await asyncio.to_thread(
+                        upload_file,
+                        self._bos_client,
+                        self._bucket,
+                        key,
+                        str(local_path),
+                    )
+                    local_path.unlink(missing_ok=True)
+                    self.stats.uploaded_files += 1
+                    self.stats.uploaded_bytes += fi.size
+                    self._emit_event("file_uploaded", {
+                        "file": fi.path,
+                        "size_bytes": fi.size,
+                        "duration_s": round(time.time() - t0, 1),
+                    })
+                    return
+                except Exception as e:
+                    if attempt < MAX_UPLOAD_RETRIES - 1:
+                        logger.warning(
+                            f"Upload retry {attempt + 1}/{MAX_UPLOAD_RETRIES} "
+                            f"for {fi.path}: {e}"
+                        )
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    # All retries exhausted — delete file to prevent disk leak
+                    logger.error(
+                        f"Upload failed x{MAX_UPLOAD_RETRIES} for {fi.path}: {e}"
+                    )
+                    local_path.unlink(missing_ok=True)
+                    self.stats.failed_files += 1
+                    self._emit_event("file_failed", {
+                        "file": fi.path,
+                        "error": str(e)[:200],
+                        "phase": "upload",
+                    })
 
     async def _speed_reporter(self):
         """Periodically report speed and progress until pipeline is done."""

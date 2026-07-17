@@ -294,3 +294,13 @@ async def report_to_dashboard(task_id: str, status: str, phase: str = None,
             update_task_progress(task_id, **kwargs)
 
     await asyncio.to_thread(_update)
+
+
+@activity.defn
+async def check_disk_space(min_free_gb: int = 25) -> bool:
+    """Preflight check: verify worker has enough disk space to start a pipeline."""
+    free_gb = shutil.disk_usage(STAGING_PATH).free / (1024 ** 3)
+    if free_gb < min_free_gb:
+        logger.warning(f"Disk preflight failed: {free_gb:.1f}GB free < {min_free_gb}GB required")
+        return False
+    return True

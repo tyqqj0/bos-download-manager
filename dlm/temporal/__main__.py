@@ -27,6 +27,7 @@ from .activities import (
     cleanup_staging,
     cleanup_all_staging,
     report_to_dashboard,
+    check_disk_space,
 )
 
 
@@ -113,6 +114,7 @@ async def run_worker(args):
         cleanup_staging,
         cleanup_all_staging,
         report_to_dashboard,
+        check_disk_space,
     ]
 
     workflows = [
