@@ -240,6 +240,10 @@ class DownloadDatasetWorkflow:
             files_uploaded=total_file_count,
             bytes_uploaded=uploaded_bytes,
         )
+
+
+@workflow.defn
+class SplitDownloadWorkflow:
     """Split a large dataset across multiple workers.
 
     Divides files into N chunks (greedy by size) and runs
