@@ -205,7 +205,10 @@ async def retry_task(body: dict):
     await _run_blocking(do_update)
 
     # auto_dispatch will pick this up and assign to an idle worker
-    return {"ok": True, "task_id": task_id, "status": "pending"}@router.post("/queue/reorder")
+    return {"ok": True, "task_id": task_id, "status": "pending"}
+
+
+@router.post("/queue/reorder")
 async def reorder_task(body: dict):
     """Change a task's priority."""
     task_id = body.get("task_id", "")
