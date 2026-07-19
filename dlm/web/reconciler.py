@@ -157,10 +157,14 @@ async def auto_dispatch_pending() -> dict:
         downloading = get_tasks_by_status("downloading")
         busy_servers = {t.get("server") for t in downloading if t.get("server")}
 
-        idle_workers = [
-            w for w in alive_workers
-            if w.get("server_key") not in busy_servers
-        ]
+        # Deduplicate by server_key (heartbeat can register multiple entries)
+        seen_keys = set()
+        idle_workers = []
+        for w in alive_workers:
+            key = w.get("server_key")
+            if key and key not in busy_servers and key not in seen_keys:
+                seen_keys.add(key)
+                idle_workers.append(w)
 
         if not idle_workers:
             return report
