@@ -120,17 +120,7 @@ async def add_to_queue(body: dict):
         snapshot.upsert_task(task_meta)
     await _run_blocking(do_save)
 
-    # Start Temporal workflow
-    from ..temporal_client import start_download, start_split_download
-    try:
-        if split_workers >= 2:
-            await start_split_download(task_meta, worker_count=split_workers)
-        else:
-            await start_download(task_meta)
-    except Exception as e:
-        logger.error(f"Failed to start workflow: {e}")
-        return {"error": f"Failed to start workflow: {e}"}
-
+    # Task saved as "pending" — auto_dispatch will assign to an idle worker
     return {"ok": True, "task_id": task_id, "name": name, "priority": priority}
 
 
@@ -182,9 +172,7 @@ async def resume_task(body: dict):
         snapshot.update_task_progress(task_id, status="pending", phase="resuming", speed_mbps=0, error=None)
     await _run_blocking(do_update)
 
-    from ..temporal_client import start_download
-    await start_download(task)
-
+    # auto_dispatch will pick this up and assign to an idle worker
     return {"ok": True, "task_id": task_id, "status": "pending"}
 
 
@@ -216,13 +204,8 @@ async def retry_task(body: dict):
         conn.commit()
     await _run_blocking(do_update)
 
-    from ..temporal_client import start_download
-    await start_download(task)
-
-    return {"ok": True, "task_id": task_id, "status": "pending"}
-
-
-@router.post("/queue/reorder")
+    # auto_dispatch will pick this up and assign to an idle worker
+    return {"ok": True, "task_id": task_id, "status": "pending"}@router.post("/queue/reorder")
 async def reorder_task(body: dict):
     """Change a task's priority."""
     task_id = body.get("task_id", "")

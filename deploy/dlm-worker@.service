@@ -6,13 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/code/bos-download-manager
-ExecStartPre=-/usr/bin/pkill -f "ssh.*-L.*7233:localhost:7233"
-ExecStartPre=/bin/sleep 1
-ExecStartPre=/usr/bin/ssh -f -N -o ServerAliveInterval=30 -o ServerAliveCountMax=5 -o ExitOnForwardFailure=yes -o ConnectTimeout=10 -L 7233:localhost:7233 root@154.85.43.52
-ExecStartPre=/bin/sleep 2
-ExecStart=/bin/bash -c 'set -a; [ -f /root/.env ] && source /root/.env; [ -f .env ] && source .env; set +a; exec python3 -m dlm.temporal --server-key %i --temporal-host localhost:7233'
+EnvironmentFile=-/root/.env
+ExecStart=/bin/bash -c 'set -a; [ -f /root/.env ] && source /root/.env; [ -f .env ] && source .env; set +a; exec python3 -m dlm.temporal --server-key %i --temporal-host 154.85.43.52:7233'
 Restart=always
-RestartSec=30
+RestartSec=10
 StandardOutput=append:/var/log/dlm-worker.log
 StandardError=append:/var/log/dlm-worker.log
 

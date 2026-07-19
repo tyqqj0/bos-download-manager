@@ -137,11 +137,14 @@ async def run_worker(args):
     )
 
     # Personal queue: pinned activities (file-local operations)
+    # max_concurrent limits prevent multiple workflows on same worker (defense in depth)
     worker_personal = Worker(
         client,
         task_queue=personal_queue,
         workflows=workflows,
         activities=activities,
+        max_concurrent_workflow_tasks=1,
+        max_concurrent_activities=2,
     )
 
     logger.info("Workers running. Waiting for tasks...")
