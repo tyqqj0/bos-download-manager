@@ -25,7 +25,11 @@ async def list_repo_files(task_input: TaskInput) -> dict:
 
     Returns {path, count, total_bytes, worker_queue} — the file list stays on
     disk to avoid gRPC limits. worker_queue pins subsequent activities to this worker.
+
+    Sends periodic heartbeats while listing to avoid Temporal timeout on large repos.
     """
+    file_count = [0]
+
     def _list():
         from huggingface_hub import HfApi
 
@@ -38,6 +42,7 @@ async def list_repo_files(task_input: TaskInput) -> dict:
         ):
             if hasattr(item, "size") and item.size and hasattr(item, "rfilename"):
                 files.append({"path": item.rfilename, "size": item.size})
+                file_count[0] = len(files)
 
         # Save to local file instead of returning via gRPC
         staging_dir = STAGING_PATH / task_input.name
@@ -48,8 +53,17 @@ async def list_repo_files(task_input: TaskInput) -> dict:
         total_bytes = sum(f["size"] for f in files)
         return str(filelist_path), len(files), total_bytes
 
+    async def _heartbeat_while_listing():
+        while True:
+            await asyncio.sleep(30)
+            activity.heartbeat(f"listing: {file_count[0]} files found...")
+
     activity.heartbeat("listing repo files...")
-    path, count, total_bytes = await asyncio.to_thread(_list)
+    heartbeat_task = asyncio.create_task(_heartbeat_while_listing())
+    try:
+        path, count, total_bytes = await asyncio.to_thread(_list)
+    finally:
+        heartbeat_task.cancel()
     activity.heartbeat(f"found {count} files, saved to {path}")
 
     worker_queue = os.environ.get("DLM_WORKER_QUEUE", "download-workers")

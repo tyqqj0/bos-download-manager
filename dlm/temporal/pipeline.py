@@ -30,16 +30,22 @@ class _StallDetected(Exception):
     """Raised when file download stalls (no size growth for STALL_TIMEOUT)."""
     pass
 
-DOWNLOAD_WORKERS = 8          # parallel file downloads (ThreadPoolExecutor)
+
+class _AccessDenied(Exception):
+    """Raised for 403/gated repo errors — no point retrying."""
+    pass
+
+
+DOWNLOAD_WORKERS = 4          # parallel file downloads (was 8, reduced to limit disk pressure)
 UPLOAD_CONCURRENCY = 8        # parallel BOS uploads (asyncio.Semaphore)
 DISK_FREE_MIN_PCT = 0.30      # keep 30% disk free (dynamic threshold)
 DISK_FREE_ABSOLUTE_MIN_GB = 20  # absolute minimum free space
-STALL_CHECK_INTERVAL = 30    # check file growth every 30s
-STALL_TIMEOUT = 1800          # 30 min no file growth → stall (for large files)
+STALL_CHECK_INTERVAL = 15    # check file growth every 15s (was 30)
+STALL_TIMEOUT = 600           # 10 min no file growth → stall (was 1800s/30min)
 HTTP_TIMEOUT = 300            # HF_HUB_DOWNLOAD_TIMEOUT: per-read HTTP timeout
 MAX_FILE_RETRIES = 3          # per-file retry limit
-MIRROR_PRIMARY = "https://hf-mirror.com"
-MIRROR_FALLBACK = "https://huggingface.co"
+MIRROR_PRIMARY = "https://huggingface.co"
+MIRROR_FALLBACK = None        # hf-mirror.com broken (308 redirect), disabled
 SPEED_REPORT_INTERVAL = 15    # seconds between progress reports
 QUEUE_MAX_SIZE = 16           # max files buffered between download and upload
 MAX_PENDING_UPLOADS = UPLOAD_CONCURRENCY + 4  # max in-flight upload tasks before backpressure
@@ -91,7 +97,11 @@ class PipelineEngine:
 
         os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(HTTP_TIMEOUT))
 
-        for endpoint in [MIRROR_PRIMARY, MIRROR_FALLBACK]:
+        endpoints = [MIRROR_PRIMARY]
+        if MIRROR_FALLBACK:
+            endpoints.append(MIRROR_FALLBACK)
+
+        for endpoint in endpoints:
             if cancel_event and cancel_event.is_set():
                 return None
             t0 = time.time()
@@ -114,9 +124,13 @@ class PipelineEngine:
                 })
                 return Path(local_path)
             except Exception as e:
+                err_str = str(e)
+                # 403/gated repo: no point retrying or trying other mirrors
+                if "403" in err_str or "gated" in err_str.lower() or "restricted" in err_str.lower():
+                    raise _AccessDenied(f"Access denied for {file_info.path}: {err_str[:200]}")
                 self._emit_event("file_failed", {
                     "file": file_info.path,
-                    "error": str(e)[:200],
+                    "error": err_str[:200],
                     "endpoint": endpoint,
                 })
                 logger.warning(f"Download failed from {endpoint} for {file_info.path}: {e}")
@@ -159,6 +173,11 @@ class PipelineEngine:
                         logger.warning(
                             f"All mirrors failed for {file_info.path} (attempt {attempt + 1})"
                         )
+                    except _AccessDenied as e:
+                        cancel_event.set()
+                        self.stats.failed_files += 1
+                        logger.error(str(e))
+                        return
                     except _StallDetected:
                         cancel_event.set()
                         # Clean up .incomplete residue for THIS specific file only
@@ -181,7 +200,12 @@ class PipelineEngine:
 
         # Launch all downloads concurrently (semaphore limits to DOWNLOAD_WORKERS at a time)
         tasks = [asyncio.create_task(download_with_limit(f)) for f in files]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Count any unhandled exceptions as failures (prevents silent file drops)
+        for r in results:
+            if isinstance(r, Exception):
+                self.stats.failed_files += 1
+                logger.error(f"Unhandled download error: {r}")
         await queue.put(None)  # signal consumer to stop
 
     async def _wait_with_growth_check(
@@ -205,6 +229,16 @@ class PipelineEngine:
             await asyncio.sleep(STALL_CHECK_INTERVAL)
             if download_future.done():
                 break
+
+            # Emergency disk check: abort if critically low
+            free_gb = _disk_free_gb()
+            if free_gb < DISK_FREE_ABSOLUTE_MIN_GB:
+                cancel_event.set()
+                logger.warning(
+                    f"Disk critically low ({free_gb:.0f}GB free), "
+                    f"aborting download: {file_info.path}"
+                )
+                raise _StallDetected(f"Disk full abort: {file_info.path}")
 
             # Check file size growth (handles .incomplete files too)
             current_size = 0
