@@ -163,6 +163,30 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 "message": f"Task {t.get('name', '')} failed {t.get('retry_count', 0)} times",
             }
 
+    # WARNING: Worker online but idle — no downloading task assigned
+    # Catches split-workflow failures where children die but worker stays alive
+    downloading_tasks = [t for t in tasks if t.get("status") == "downloading"]
+    busy_servers = {t.get("server") for t in downloading_tasks if t.get("server")}
+    idle_seen = set()
+    for w in alive_workers:
+        wkey = w.get("server_key", "")
+        if not wkey or wkey in idle_seen:
+            continue
+        idle_seen.add(wkey)
+        if wkey not in busy_servers:
+            key = f"idle_worker:{wkey}"
+            new_alerts[key] = {
+                "severity": WARNING,
+                "type": "idle_worker",
+                "server": wkey,
+                "disk_free_gb": w.get("disk_free_gb"),
+                "message": (
+                    f"Worker {wkey} online but idle — no downloading task. "
+                    f"Disk: {w.get('disk_free_gb', '?')}GB free. "
+                    f"Check for failed split workflow."
+                ),
+            }
+
     # WARNING: Event delivery broken (Layer 3 sees activity but no events arriving)
     from .cache import cache
     verify_report = cache.get("health_verify_report")

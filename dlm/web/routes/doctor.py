@@ -81,17 +81,26 @@ async def diagnose():
         running_ids = set()
 
         async def _list_wfs():
-            async for wf in client.list_workflows(
-                'WorkflowType="DownloadDatasetWorkflow" AND ExecutionStatus="Running"'
-            ):
-                running_ids.add(wf.id)
+            for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow"]:
+                async for wf in client.list_workflows(
+                    f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
+                ):
+                    running_ids.add(wf.id)
 
         await asyncio.wait_for(_list_wfs(), timeout=10)
 
         downloading = [t for t in tasks if t.get("status") == "downloading"]
         for t in downloading:
-            workflow_id = f"dl-{t['id']}"
-            if workflow_id not in running_ids:
+            task_id = t["id"]
+            workflow_id = f"dl-{task_id}"
+            # Match all known workflow ID patterns
+            has_workflow = (
+                workflow_id in running_ids
+                or f"split-download-{task_id}" in running_ids
+                or any(wid.startswith(f"{task_id}-part") for wid in running_ids)
+                or any(wid.startswith(f"{workflow_id}-") for wid in running_ids)
+            )
+            if not has_workflow:
                 age = now - (t.get("updated_at") or 0)
                 orphaned.append({
                     "task_id": t["id"],
@@ -105,13 +114,34 @@ async def diagnose():
     except Exception as e:
         orphaned = [{"error": f"Cannot check Temporal: {e}"}]
 
-    # 6. Get last reconciler report
+    # 6. Idle workers — online but no downloading task and no running workflow
+    idle_workers = []
+    downloading_tasks = [t for t in tasks if t.get("status") == "downloading"]
+    busy_servers = {t.get("server") for t in downloading_tasks if t.get("server")}
+    alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < WORKER_TIMEOUT]
+    idle_seen = set()
+    for w in alive_workers:
+        wkey = w.get("server_key", "")
+        if not wkey or wkey in idle_seen:
+            continue
+        idle_seen.add(wkey)
+        queue_name = f"download-{wkey}"
+        has_wf = any(wid for wid in running_ids if queue_name in str(wid)) if running_ids else False
+        if wkey not in busy_servers and not has_wf:
+            idle_workers.append({
+                "server_key": wkey,
+                "disk_free_gb": w.get("disk_free_gb"),
+                "message": "Online but no task and no workflow — possible failed split",
+            })
+
+    # 7. Get last reconciler + idle worker reports
     from ..cache import cache
     reconciler_report = cache.get("reconciler_report")
+    idle_report = cache.get("idle_worker_report")
 
     total_issues = (
         len(offline_workers) + len(stuck) + len(failed_repeat)
-        + len(orphaned) + len(disk_full)
+        + len(orphaned) + len(disk_full) + len(idle_workers)
     )
 
     return {
@@ -120,9 +150,11 @@ async def diagnose():
         "offline_workers": offline_workers,
         "stuck_tasks": stuck,
         "orphaned_tasks": orphaned,
+        "idle_workers": idle_workers,
         "disk_full": disk_full,
         "failed_repeat": failed_repeat,
         "reconciler": reconciler_report,
+        "idle_worker_detail": idle_report,
     }
 
 

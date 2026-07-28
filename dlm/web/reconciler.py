@@ -72,11 +72,17 @@ async def reconcile() -> dict:
         updated_at = task.get("updated_at") or 0
         stale_seconds = now - updated_at
 
-        # Check if any workflow exists for this task (normal, split, or child)
+        # Check if any workflow exists for this task — match all known ID patterns:
+        #   dl-{id}            (normal)
+        #   split-download-{id} (split parent)
+        #   {id}-part*          (split child)
+        #   dl-{id}-bj*         (manual split per worker)
+        #   dl-{id}-w*          (manual split per worker)
         has_workflow = (
             workflow_id in running_ids
             or f"split-download-{task_id}" in running_ids
             or any(wid.startswith(f"{task_id}-part") for wid in running_ids)
+            or any(wid.startswith(f"{workflow_id}-") for wid in running_ids)
         )
 
         if not has_workflow:
@@ -176,6 +182,7 @@ async def auto_dispatch_pending() -> dict:
         pending.sort(key=lambda t: (t.get("priority", 5), t.get("created_at", "")))
 
         # 4. Dispatch: one task per idle worker (with optimistic locking)
+        #    Source routing: ModelScope → bj* workers, HuggingFace → w* workers
         conn = _conn()
         for worker in idle_workers:
             if not pending:
@@ -191,7 +198,21 @@ async def auto_dispatch_pending() -> dict:
                 )
                 continue
 
-            task = pending.pop(0)
+            is_bj = server_key.startswith("bj")
+
+            # Find first compatible task for this worker
+            task = None
+            for i, t in enumerate(pending):
+                source = t.get("source", "hf")
+                if is_bj and source != "modelscope":
+                    continue  # BJ workers only handle ModelScope
+                if not is_bj and source == "modelscope":
+                    continue  # HK workers skip ModelScope (too slow)
+                task = pending.pop(i)
+                break
+
+            if task is None:
+                continue
 
             # Optimistic lock: only claim if still pending
             cursor = conn.execute(
@@ -231,6 +252,101 @@ async def auto_dispatch_pending() -> dict:
     except Exception as e:
         report["errors"].append(f"Auto-dispatch error: {e}")
         logger.error(f"Auto-dispatch error: {e}")
+
+    return report
+
+
+IDLE_WORKER_THRESHOLD = 600  # 10 minutes idle = suspicious
+
+
+async def detect_idle_workers() -> dict:
+    """Find workers that are online but have no running workflow.
+
+    Catches the failure mode where split child workflows fail silently
+    and the worker sits idle while the dashboard shows "downloading".
+    """
+    from ..queue.snapshot import get_tasks_by_status, get_workers, init_db
+    from .temporal_client import get_client
+
+    init_db()
+    report = {"idle_workers": [], "failed_splits": [], "errors": []}
+
+    try:
+        workers = get_workers()
+        now = time.time()
+        alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
+
+        if not alive_workers:
+            return report
+
+        downloading = get_tasks_by_status("downloading")
+        busy_servers = {t.get("server") for t in downloading if t.get("server")}
+
+        # Query Temporal for running workflows per task queue
+        client = await get_client()
+        running_by_queue = {}
+        for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow"]:
+            async for wf in client.list_workflows(
+                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
+            ):
+                running_by_queue.setdefault(wf.task_queue, []).append(wf.id)
+
+        # Also check for recently-failed workflows on each task queue
+        recently_failed = {}
+        try:
+            async for wf in client.list_workflows(
+                'ExecutionStatus="Completed" AND CloseTime > "2d"'
+            ):
+                recently_failed.setdefault(wf.task_queue, []).append({
+                    "id": wf.id,
+                    "close_time": str(wf.close_time),
+                })
+        except Exception:
+            pass
+
+        # Deduplicate workers by server_key
+        seen_keys = set()
+        for w in alive_workers:
+            key = w.get("server_key", "")
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            queue_name = f"download-{key}"
+            has_running_wf = bool(running_by_queue.get(queue_name))
+            has_downloading_task = key in busy_servers
+
+            if not has_running_wf and not has_downloading_task:
+                last_seen = w.get("last_seen") or 0
+                idle_duration = now - last_seen
+                entry = {
+                    "server_key": key,
+                    "disk_free_gb": w.get("disk_free_gb"),
+                    "idle_since": last_seen,
+                }
+
+                # Check if this worker had a recently-failed workflow
+                failed = recently_failed.get(queue_name, [])
+                if failed:
+                    entry["recent_failures"] = failed[:3]
+                    report["failed_splits"].append({
+                        "server_key": key,
+                        "failed_workflows": failed[:3],
+                    })
+
+                report["idle_workers"].append(entry)
+
+                if failed:
+                    logger.warning(
+                        f"Idle worker {key}: online but no workflow. "
+                        f"Recent failures: {[f['id'] for f in failed[:3]]}"
+                    )
+                else:
+                    logger.info(f"Idle worker {key}: online, no workflow, no recent failures")
+
+    except Exception as e:
+        report["errors"].append(f"Idle worker detection error: {e}")
+        logger.error(f"Idle worker detection error: {e}")
 
     return report
 

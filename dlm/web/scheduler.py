@@ -150,6 +150,23 @@ async def background_scheduler():
                 except Exception as e:
                     logger.error(f"Auto-dispatch error: {e}")
 
+                # Detect idle workers (online but no workflow — failed splits)
+                try:
+                    from .reconciler import detect_idle_workers
+                    idle_report = await detect_idle_workers()
+                    cache.set("idle_worker_report", idle_report)
+                    if idle_report.get("idle_workers"):
+                        logger.warning(
+                            f"Idle workers detected: "
+                            f"{[w['server_key'] for w in idle_report['idle_workers']]}"
+                        )
+                    if idle_report.get("failed_splits"):
+                        logger.error(
+                            f"Failed split workflows: {idle_report['failed_splits']}"
+                        )
+                except Exception as e:
+                    logger.error(f"Idle worker detection error: {e}")
+
                 last_reconcile = now
 
             # Layer 3: SSH health verification (every 5 min)

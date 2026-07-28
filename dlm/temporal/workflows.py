@@ -52,7 +52,7 @@ class DownloadDatasetWorkflow:
 
         # 2. List files — returns {path, count, total_bytes, worker_queue}
         if task_input.filelist_path:
-            # Pre-computed filelist (from SplitDownloadWorkflow)
+            # Pre-computed filelist (from SplitDownloadWorkflow, same worker)
             filelist_meta = await workflow.execute_activity(
                 "read_filelist",
                 args=[task_input.filelist_path],
@@ -147,11 +147,13 @@ class DownloadDatasetWorkflow:
                 )
 
                 # Run pipeline on the same worker that has the filelist
+                # 7-day timeout: large batches (500 files × 40GB each = 20TB)
+                # can take days at 150-300 GB/hr. Heartbeat (10min) catches stalls.
                 result = await workflow.execute_activity(
                     "run_pipeline_batch",
                     args=[task_input, filelist_path, start_idx, current_batch_size,
                           uploaded_bytes, total_bytes],
-                    start_to_close_timeout=timedelta(hours=24),
+                    start_to_close_timeout=timedelta(days=7),
                     heartbeat_timeout=timedelta(minutes=10),
                     task_queue=worker_queue,
                     retry_policy=RetryPolicy(
@@ -248,11 +250,17 @@ class SplitDownloadWorkflow:
 
     Divides files into N chunks (greedy by size) and runs
     DownloadDatasetWorkflow as child workflows — one per chunk.
-    Each child runs on a different worker's task queue.
+
+    worker_queues: list of task queue names (e.g. ["download-bj1", "download-bj2"]).
+    If provided, partitions are distributed round-robin across these queues
+    and partition files are replicated to each target worker.
+    If empty/None, all children run on the listing worker (legacy behavior).
     """
 
     @workflow.run
-    async def run(self, task_input: TaskInput, worker_count: int = 2) -> TaskResult:
+    async def run(self, task_input: TaskInput, worker_queues: Optional[list] = None) -> TaskResult:
+        worker_count = len(worker_queues) if worker_queues else 2
+
         try:
             # List all files — returns {path, count, total_bytes, worker_queue}
             result = await workflow.execute_activity(
@@ -264,17 +272,17 @@ class SplitDownloadWorkflow:
             )
 
             filelist_path = result["path"]
-            worker_queue = result["worker_queue"]
+            listing_queue = result["worker_queue"]
 
             if result["count"] == 0:
                 return TaskResult(status="failed", error="No files found")
 
-            # Partition into chunks — pinned to same worker that has the filelist
+            # Partition into chunks — on the worker that has the filelist
             partitions = await workflow.execute_activity(
                 "partition_filelist",
                 args=[filelist_path, worker_count],
                 start_to_close_timeout=timedelta(minutes=5),
-                task_queue=worker_queue,
+                task_queue=listing_queue,
             )
 
             if not partitions:
@@ -292,10 +300,16 @@ class SplitDownloadWorkflow:
                 pass
             return TaskResult(status="failed", error=error_msg)
 
-        # Launch child workflows — pinned to the worker that has the partition files
-        # NOTE: All children run on the same worker since partition files are local
+        # Determine target queue for each partition
+        if not worker_queues:
+            target_queues = [listing_queue] * len(partitions)
+        else:
+            target_queues = [worker_queues[i % len(worker_queues)] for i in range(len(partitions))]
+
+        # Launch child workflows — each on its target worker queue
         child_handles = []
         for i, part in enumerate(partitions):
+            target_q = target_queues[i]
             child_input = TaskInput(
                 id=f"{task_input.id}-part{i+1}",
                 name=task_input.name,
@@ -305,13 +319,14 @@ class SplitDownloadWorkflow:
                 category=task_input.category,
                 priority=task_input.priority,
                 size_gb=part["total_bytes"] / (1024 ** 3),
-                filelist_path=part["path"],
+                filelist_path=part["path"] if target_q == listing_queue else None,
+                assigned_files=part.get("files", []) if target_q != listing_queue else [],
             )
             handle = await workflow.start_child_workflow(
                 DownloadDatasetWorkflow.run,
                 args=[child_input],
                 id=f"{task_input.id}-part{i+1}",
-                task_queue=worker_queue,  # same worker — partition files are local
+                task_queue=target_q,
             )
             child_handles.append(handle)
 
