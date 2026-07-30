@@ -26,7 +26,10 @@ async def reconcile() -> dict:
 
     Returns a report of actions taken.
     """
-    from ..queue.snapshot import get_tasks_by_status, update_task_progress, init_db
+    from ..queue.snapshot import (
+        get_tasks_by_status, update_task_progress, get_shards_by_task,
+        complete_task, init_db,
+    )
     from .temporal_client import get_client, start_download
 
     init_db()
@@ -83,6 +86,30 @@ async def reconcile() -> dict:
         )
 
         if not has_workflow:
+            # Before re-dispatching, check if all shards are already done.
+            # This handles the case where the parent ShardedDownloadWorkflow
+            # died but all child ShardWorkerWorkflows completed successfully.
+            shards = get_shards_by_task(task_id)
+            if shards:
+                done_shards = [s for s in shards if s.get("status") == "done"]
+                failed_shards = [s for s in shards if s.get("status") == "failed"]
+                if len(done_shards) == len(shards):
+                    complete_task(task_id, "done")
+                    report.setdefault("auto_completed", []).append(task.get("name", task_id))
+                    logger.info(
+                        f"Reconciler: auto-completed {task.get('name', task_id)} "
+                        f"— all {len(shards)} shards done, parent workflow dead"
+                    )
+                    continue
+                if len(done_shards) + len(failed_shards) == len(shards) and failed_shards:
+                    complete_task(task_id, "failed")
+                    report.setdefault("auto_failed", []).append(task.get("name", task_id))
+                    logger.warning(
+                        f"Reconciler: marked {task.get('name', task_id)} failed "
+                        f"— {len(failed_shards)}/{len(shards)} shards failed, parent dead"
+                    )
+                    continue
+
             report["orphaned"].append({
                 "task_id": task_id,
                 "name": task.get("name", ""),
@@ -369,7 +396,7 @@ async def detect_idle_workers() -> dict:
 
 
 def zero_stale_speeds():
-    """Zero out speed_mbps for tasks that haven't reported in SPEED_STALE_THRESHOLD.
+    """Zero out speed_mbps for tasks and shards that haven't reported recently.
 
     Called by the dashboard builder to prevent showing stale speed values.
     """
@@ -394,4 +421,13 @@ def zero_stale_speeds():
         )
     except Exception:
         pass  # column may not exist yet
+    # Zero stale shard speeds too — prevents ghost speed in dashboard
+    try:
+        conn.execute(
+            "UPDATE shards SET speed_mbps = 0 "
+            "WHERE status = 'running' AND speed_mbps > 0 AND updated_at < ?",
+            (threshold,),
+        )
+    except Exception:
+        pass
     conn.commit()
