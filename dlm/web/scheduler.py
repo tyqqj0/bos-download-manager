@@ -19,9 +19,25 @@ RECONCILE_INTERVAL = 300  # 5 minutes
 
 def _build_dashboard() -> dict:
     """Build dashboard from SQLite snapshot."""
-    from ..queue.snapshot import get_dashboard_summary, get_all_tasks, get_workers
+    from ..queue.snapshot import get_dashboard_summary, get_all_tasks, get_workers, get_shards_by_task
     summary = get_dashboard_summary()
     workers = get_workers()
+
+    # Fix sharded task aggregation: override task-level speed/progress with
+    # shard aggregates so per-shard progress_fn writes don't confuse the dashboard.
+    for dl in summary.get("active_downloads", []):
+        shards = get_shards_by_task(dl["id"])
+        if len(shards) > 1:
+            done_bytes = sum(s.get("done_bytes", 0) for s in shards)
+            total_bytes = sum(s.get("total_bytes", 0) for s in shards)
+            speed = sum(s.get("speed_mbps", 0) for s in shards)
+            dl["speed_mbps"] = round(speed, 1)
+            dl["progress_pct"] = round(done_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0
+            dl["downloaded_gb"] = round(done_bytes / (1024 ** 3), 2)
+    # Recalc aggregate speed from corrected values
+    summary["aggregate_speed_mbps"] = round(
+        sum(dl.get("speed_mbps", 0) for dl in summary.get("active_downloads", [])), 1)
+    summary["aggregate_download_speed_mbps"] = summary["aggregate_speed_mbps"]
 
     now = time.time()
     active_workers = [w for w in workers if now - (w.get("last_seen") or 0) < 180]

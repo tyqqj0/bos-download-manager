@@ -54,6 +54,8 @@ def _task_for_frontend(t: dict) -> dict:
         "completed_at": t.get("completed_at"),
         "transfer_status": t.get("transfer_status"),
         "transfer_error": t.get("transfer_error"),
+        "total_shards": t.get("total_shards", 0) or 0,
+        "done_shards": t.get("done_shards", 0) or 0,
     }
 
 

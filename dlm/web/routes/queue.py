@@ -357,6 +357,10 @@ async def report_shard_progress(body: dict):
             done_bytes=body.get("done_bytes", shard.get("done_bytes", 0)),
             speed_mbps=body.get("speed_mbps", 0),
         )
+        # Auto-aggregate into task table so dashboard stays current
+        task_id = shard.get("task_id")
+        if task_id:
+            _aggregate_task(task_id)
         return {"ok": True, "shard_id": shard_id}
     return await _run_blocking(do_update)
 
@@ -431,6 +435,33 @@ async def assign_shard_server_api(body: dict):
     return await _run_blocking(do_assign)
 
 
+def _aggregate_task(task_id: str) -> dict:
+    """Aggregate shard progress into task-level fields. Must be called inside a blocking executor."""
+    shards = snapshot.get_shards_by_task(task_id)
+    if not shards:
+        return {"ok": True, "shards": 0}
+    done_bytes = sum(s.get("done_bytes", 0) for s in shards)
+    total_bytes = sum(s.get("total_bytes", 0) for s in shards)
+    speed = sum(s.get("speed_mbps", 0) for s in shards)
+    done_shards = sum(1 for s in shards if s.get("status") == "done")
+
+    pct = round(done_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0
+    downloaded_gb = done_bytes / (1024 ** 3)
+    size_gb = total_bytes / (1024 ** 3)
+
+    snapshot.update_task_progress(
+        task_id, speed_mbps=speed, progress_pct=pct,
+        downloaded_gb=round(downloaded_gb, 2),
+    )
+    conn = snapshot._conn()
+    conn.execute(
+        "UPDATE tasks SET done_shards = ?, total_shards = ?, size_gb = ? WHERE id = ?",
+        (done_shards, len(shards), round(size_gb, 2), task_id),
+    )
+    conn.commit()
+    return {"ok": True, "done_shards": done_shards, "total_shards": len(shards)}
+
+
 @router.post("/shards/aggregate")
 async def aggregate_task_api(body: dict):
     """Aggregate shard progress into task-level. Called by aggregate_task_from_shards activity."""
@@ -440,31 +471,7 @@ async def aggregate_task_api(body: dict):
 
     def do_aggregate():
         snapshot.init_db()
-        shards = snapshot.get_shards_by_task(task_id)
-        if not shards:
-            return {"ok": True, "shards": 0}
-        total_files = sum(s.get("total_files", 0) for s in shards)
-        done_files = sum(s.get("done_files", 0) for s in shards)
-        done_bytes = sum(s.get("done_bytes", 0) for s in shards)
-        total_bytes = sum(s.get("total_bytes", 0) for s in shards)
-        speed = sum(s.get("speed_mbps", 0) for s in shards)
-        done_shards = sum(1 for s in shards if s.get("status") == "done")
-
-        pct = round(done_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0
-        downloaded_gb = done_bytes / (1024 ** 3)
-        size_gb = total_bytes / (1024 ** 3)
-
-        snapshot.update_task_progress(
-            task_id, speed_mbps=speed, progress_pct=pct,
-            downloaded_gb=round(downloaded_gb, 2),
-        )
-        conn = snapshot._conn()
-        conn.execute(
-            "UPDATE tasks SET done_shards = ?, total_shards = ?, size_gb = ? WHERE id = ?",
-            (done_shards, len(shards), round(size_gb, 2), task_id),
-        )
-        conn.commit()
-        return {"ok": True, "done_shards": done_shards, "total_shards": len(shards)}
+        return _aggregate_task(task_id)
     return await _run_blocking(do_aggregate)
 
 

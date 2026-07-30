@@ -232,6 +232,14 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
     def heartbeat_fn(msg: str):
         activity.heartbeat(msg)
 
+    # Detect shard mode: shard workers use "TaskName/shard-N" naming
+    is_shard = "/shard-" in task_input.name
+    shard_id = None
+    if is_shard:
+        parts = task_input.name.rsplit("/shard-", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            shard_id = f"s-{task_input.id}-{parts[1]}"
+
     def progress_fn(downloaded_bytes: int, total_bytes: int, speed_bps: float):
         """Report speed to S1 dashboard via HTTP every 15s."""
         now = time.time()
@@ -244,21 +252,34 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
             coordinator = os.environ.get("DLM_COORDINATOR", "http://154.85.43.52:8080")
             speed_mbps = speed_bps * 8 / 1_000_000
             cumulative = prior_bytes + downloaded_bytes
-            pct = cumulative / task_total * 100 if task_total > 0 else 0
-            dl_gb = cumulative / (1024 ** 3)
-            requests.post(
-                f"{coordinator}/api/task-progress",
-                json={
-                    "task_id": task_input.id,
-                    "status": "downloading",
-                    "speed_mbps": round(speed_mbps, 1),
-                    "progress_pct": round(min(pct, 100), 1),
-                    "downloaded_gb": round(dl_gb, 2),
-                    "server": server_key,
-                    "phase": f"batch ({speed_mbps:.0f}Mbps)",
-                },
-                timeout=5,
-            )
+
+            if shard_id:
+                # Shard mode: report to shard-progress (auto-aggregates to task)
+                requests.post(
+                    f"{coordinator}/api/shard-progress",
+                    json={
+                        "shard_id": shard_id,
+                        "done_bytes": cumulative,
+                        "speed_mbps": round(speed_mbps, 1),
+                    },
+                    timeout=5,
+                )
+            else:
+                pct = cumulative / task_total * 100 if task_total > 0 else 0
+                dl_gb = cumulative / (1024 ** 3)
+                requests.post(
+                    f"{coordinator}/api/task-progress",
+                    json={
+                        "task_id": task_input.id,
+                        "status": "downloading",
+                        "speed_mbps": round(speed_mbps, 1),
+                        "progress_pct": round(min(pct, 100), 1),
+                        "downloaded_gb": round(dl_gb, 2),
+                        "server": server_key,
+                        "phase": f"batch ({speed_mbps:.0f}Mbps)",
+                    },
+                    timeout=5,
+                )
         except Exception as e:
             logger.debug(f"Progress report failed: {e}")
 
