@@ -112,13 +112,29 @@ async def list_repo_files(task_input: TaskInput) -> dict:
 
 
 @activity.defn
-async def load_progress(task_input: TaskInput) -> list[str]:
-    """Load list of already-uploaded file paths from local progress file."""
+async def load_progress(task_input: TaskInput, filelist_md5: str = "") -> list[str]:
+    """Load batch-progress markers from the local progress file.
+
+    Markers are positional (batch index based), so they are only valid for the
+    exact filelist that produced them. When filelist_md5 is given, a stored
+    hash mismatch — or the legacy bare-list format, which carries no hash —
+    invalidates the markers (file removed, empty list returned).
+    """
     progress_file = STAGING_PATH / task_input.name / ".progress.json"
     try:
         if progress_file.exists():
             data = json.loads(progress_file.read_text())
+            if isinstance(data, dict):
+                if not filelist_md5 or data.get("filelist_md5") == filelist_md5:
+                    batches = data.get("batches", [])
+                    return batches if isinstance(batches, list) else []
+                progress_file.unlink(missing_ok=True)
+                return []
             if isinstance(data, list):
+                if filelist_md5:
+                    # legacy format cannot be trusted against a hashed filelist
+                    progress_file.unlink(missing_ok=True)
+                    return []
                 return data
     except Exception:
         pass
@@ -139,6 +155,81 @@ async def read_filelist(filelist_path: str) -> dict:
     files = data if isinstance(data, list) else []
     total_bytes = sum(f.get("size", 0) for f in files)
     return {"count": len(files), "total_bytes": total_bytes}
+
+
+@activity.defn
+async def filter_filelist_against_bos(filelist_path: str, task_input: TaskInput) -> dict:
+    """Remove files already uploaded to BOS (same key + size) from the filelist.
+
+    One paginated list of the task's target prefix — never per-file requests.
+    Writes the filtered list to a NEW file (.filelist.filtered.json) so a stale
+    original can never be mistaken for a filtered one. Must run on the worker
+    that holds filelist_path (pin via task_queue).
+    """
+    from ..core.config import load_config
+    from ..core.bos import create_bos_client
+    from ..constants import DATA_BUCKET, MODEL_BUCKET
+
+    def _filter():
+        config = load_config()
+        bos = create_bos_client(
+            config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
+        )
+        # Mirror pipeline._init_bos_client key layout exactly
+        if task_input.type == "model":
+            bucket, prefix = MODEL_BUCKET, f"{task_input.name}/"
+        else:
+            bucket = DATA_BUCKET
+            if task_input.category:
+                prefix = f"{task_input.category}/{task_input.name}/"
+            else:
+                prefix = f"{task_input.name}/"
+
+        existing = {}
+        marker = ""
+        while True:
+            resp = bos.list_objects(
+                bucket, prefix=prefix, marker=marker, max_keys=1000
+            )
+            for obj in getattr(resp, "contents", None) or []:
+                existing[obj.key[len(prefix):]] = obj.size
+            if not getattr(resp, "is_truncated", False):
+                break
+            marker = resp.next_marker
+
+        path = Path(filelist_path)
+        files = json.loads(path.read_text())
+        remaining = []
+        skipped_bytes = 0
+        for f in files:
+            if existing.get(f.get("path")) == f.get("size"):
+                skipped_bytes += f.get("size", 0)
+            else:
+                remaining.append(f)
+
+        filtered_path = path.with_name(".filelist.filtered.json")
+        filtered_path.write_text(json.dumps(remaining))
+        return {
+            "filtered_path": str(filtered_path),
+            "skipped_files": len(files) - len(remaining),
+            "skipped_bytes": skipped_bytes,
+            "remaining_files": len(remaining),
+            "remaining_bytes": sum(f.get("size", 0) for f in remaining),
+        }
+
+    activity.heartbeat("listing BOS objects for resume filter...")
+    result = await asyncio.to_thread(_filter)
+    logger.info(
+        "BOS resume filter for %s: skipped %d files (%.1f GB), %d remaining (%.1f GB)",
+        task_input.name, result["skipped_files"],
+        result["skipped_bytes"] / (1024 ** 3),
+        result["remaining_files"], result["remaining_bytes"] / (1024 ** 3),
+    )
+    activity.heartbeat(
+        f"skipped {result['skipped_files']} files already on BOS, "
+        f"{result['remaining_files']} remaining"
+    )
+    return result
 
 
 @activity.defn
@@ -183,11 +274,16 @@ async def partition_filelist(filelist_path: str, num_chunks: int) -> list:
 
 
 @activity.defn
-async def save_progress(task_name: str, completed_paths: list[str]):
-    """Save completed file paths to local progress file."""
+async def save_progress(task_name: str, completed_paths: list[str], filelist_md5: str = ""):
+    """Save progress markers. With filelist_md5, writes the hash-guarded format."""
     progress_file = STAGING_PATH / task_name / ".progress.json"
     progress_file.parent.mkdir(parents=True, exist_ok=True)
-    progress_file.write_text(json.dumps(completed_paths))
+    if filelist_md5:
+        progress_file.write_text(json.dumps(
+            {"filelist_md5": filelist_md5, "batches": completed_paths}
+        ))
+    else:
+        progress_file.write_text(json.dumps(completed_paths))
 
 
 @activity.defn
@@ -420,16 +516,20 @@ async def partition_files_greedy(
     endpoint = os.environ.get("BOS_ENDPOINT", "https://bj.bcebos.com")
     bos = create_bos_client(ak, sk, endpoint)
 
+    import hashlib
+
     task_name = Path(staging_dir).name
     for i, shard_files in enumerate(shards):
         shard_filelist = sdir / f".filelist-shard-{i}.json"
-        shard_filelist.write_text(json.dumps(shard_files))
+        content = json.dumps(shard_files)
+        shard_filelist.write_text(content)
 
         bos_key = f"download-manager/filelists/{task_name}/shard-{i}.json"
         upload_file(bos, META_BUCKET, bos_key, str(shard_filelist))
 
         results.append({
             "filelist_key": bos_key,
+            "filelist_md5": hashlib.md5(content.encode()).hexdigest(),
             "total_files": len(shard_files),
             "total_bytes": shard_sizes[i],
         })
@@ -508,15 +608,31 @@ async def report_shard_progress(shard_id: str, done_files: int = 0,
 
 
 @activity.defn
-async def query_idle_workers(source: str) -> list[str]:
-    """Query idle workers via S1 API."""
+async def query_idle_workers(source: str, exclude_task: str = "") -> list[str]:
+    """Query idle workers via S1 API.
+
+    exclude_task: the calling task's own id — its claim/shards must not
+    count as busy, or the dispatching worker excludes itself from the pool.
+    """
     import requests
     resp = requests.get(
         f"{_coordinator()}/api/shards/idle-workers",
-        params={"source": source},
+        params={"source": source, "exclude_task": exclude_task},
         timeout=30,
     )
     return resp.json().get("workers", [])
+
+
+@activity.defn
+async def report_resume_info(task_id: str, skipped_files: int, skipped_gb: float):
+    """Persist BOS resume-filter results on the task row via S1 API."""
+    import requests
+    requests.post(
+        f"{_coordinator()}/api/shards/resume-info",
+        json={"task_id": task_id, "skipped_files": skipped_files,
+              "skipped_gb": skipped_gb},
+        timeout=30,
+    )
 
 
 @activity.defn

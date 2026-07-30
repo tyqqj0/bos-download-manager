@@ -30,7 +30,7 @@ async def reconcile() -> dict:
         get_tasks_by_status, update_task_progress, get_shards_by_task,
         complete_task, init_db,
     )
-    from .temporal_client import get_client, start_download
+    from .temporal_client import get_client, start_sharded_download
 
     init_db()
     report = {
@@ -121,13 +121,13 @@ async def reconcile() -> dict:
             # (gives time for workflows that just started to appear)
             if stale_seconds > DEAD_THRESHOLD:
                 try:
-                    server = task.get("server", "")
-                    queue = f"download-{server}" if server else "download-workers"
-                    await start_download(task, task_queue=queue)
+                    # Unified sharded path — the legacy DownloadDatasetWorkflow
+                    # has no BOS resume filter and must not be reachable here.
+                    await start_sharded_download(task)
                     report["redispatched"].append(task.get("name", task_id))
                     logger.info(
                         f"Reconciler: re-dispatched {task.get('name', task_id)} "
-                        f"to {queue} (orphaned {stale_seconds:.0f}s)"
+                        f"as sharded (orphaned {stale_seconds:.0f}s)"
                     )
                 except Exception as e:
                     err_msg = str(e)
@@ -209,9 +209,24 @@ async def auto_dispatch_pending() -> dict:
             return report
         pending.sort(key=lambda t: (t.get("priority", 5), t.get("created_at", "")))
 
-        # 4. Dispatch: one task per idle worker (with optimistic locking)
-        #    Source routing: ModelScope → bj* workers, HuggingFace → w* workers
+        # 4. Coordinator-race guard: a downloading task with no shard rows means
+        #    its sharded coordinator is still listing/filtering — its workers
+        #    look idle but will be claimed shortly. Don't dispatch that source
+        #    until shards exist. Age cap: a coordinator dead >15min stops
+        #    blocking its source (reconcile() will clean it up).
         conn = _conn()
+        listing_cutoff = time.time() - 900
+        rows = conn.execute(
+            "SELECT DISTINCT t.source FROM tasks t "
+            "WHERE t.status = 'downloading' "
+            "AND (t.updated_at IS NULL OR t.updated_at > ?) "
+            "AND NOT EXISTS (SELECT 1 FROM shards s WHERE s.task_id = t.id)",
+            (listing_cutoff,),
+        ).fetchall()
+        sources_in_listing = {r[0] for r in rows}
+
+        # 5. Dispatch: unified sharded path for all sources.
+        #    Source routing: ModelScope → bj* workers, HuggingFace → w* workers
         for worker in idle_workers:
             if not pending:
                 break
@@ -226,18 +241,14 @@ async def auto_dispatch_pending() -> dict:
                 )
                 continue
 
-            # TEMPORARY BLACKLIST (2026-07-30): bj1-4 running manual AgiBotWorld-Beta
-            # split downloads — auto_dispatch must not assign new tasks to them.
-            # Remove after AgiBotWorld-Beta completes (~44.75TB, est. 2026-08-01).
-            if server_key in ("bj1", "bj2", "bj3", "bj4"):
-                continue
-
             is_bj = server_key.startswith("bj")
 
             # Find first compatible task for this worker
             task = None
             for i, t in enumerate(pending):
                 source = t.get("source", "hf")
+                if source in sources_in_listing:
+                    continue  # a coordinator for this source is still partitioning
                 if is_bj and source != "modelscope":
                     continue  # BJ workers only handle ModelScope
                 if not is_bj and source == "modelscope":
@@ -248,36 +259,32 @@ async def auto_dispatch_pending() -> dict:
             if task is None:
                 continue
 
-            # Optimistic lock: only claim if still pending
+            # Optimistic lock: claim status only. server stays NULL — the
+            # coordinator assigns servers per shard, and a task-level server
+            # would count this worker as busy in its own idle query.
             cursor = conn.execute(
-                "UPDATE tasks SET status = 'downloading', server = ?, updated_at = ? "
+                "UPDATE tasks SET status = 'downloading', server = NULL, updated_at = ? "
                 "WHERE id = ? AND status = 'pending'",
-                (server_key, time.time(), task["id"]),
+                (time.time(), task["id"]),
             )
             conn.commit()
 
             if cursor.rowcount == 0:
                 continue  # someone else claimed it
 
-            # Start workflow — bj workers use legacy single-worker, w* use sharded
-            queue = f"download-{server_key}"
             try:
-                if is_bj:
-                    await start_download(task, task_queue=queue)
-                else:
-                    await start_sharded_download(task)
+                await start_sharded_download(task)
+                sources_in_listing.add(task.get("source", "hf"))
                 report["dispatched"].append({
                     "task": task.get("name", task["id"]),
-                    "worker": server_key,
-                    "mode": "legacy" if is_bj else "sharded",
+                    "worker": "sharded",
+                    "mode": "sharded",
                 })
-                logger.info(f"Auto-dispatch: {task.get('name')} → {server_key} ({'legacy' if is_bj else 'sharded'})")
-                if not is_bj:
-                    break  # sharded workflow grabs all idle workers — only start one per cycle
+                logger.info(f"Auto-dispatch: {task.get('name')} → sharded coordinator")
             except Exception as e:
                 err_msg = str(e).lower()
                 if "already started" in err_msg:
-                    # Workflow already running (raced with manual dispatch) — keep server assignment
+                    # Workflow already running (raced with manual dispatch) — keep claim
                     pass
                 else:
                     # Revert the status change

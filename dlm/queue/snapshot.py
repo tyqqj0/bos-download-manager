@@ -104,6 +104,8 @@ def init_db():
         ("done_shards", "INTEGER", "0"),
         ("max_workers", "INTEGER", "0"),
         ("shard_strategy", "TEXT", "'auto'"),
+        ("resume_skipped_files", "INTEGER", "0"),
+        ("resume_skipped_gb", "REAL", "0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")
@@ -121,11 +123,17 @@ def upsert_task(task: dict):
         "progress_pct", "speed_mbps", "phase", "error", "error_class",
         "retry_count", "celery_task_id", "transfer_status", "transfer_task_id",
         "transfer_error", "created_at", "started_at", "completed_at", "updated_at",
+        "max_workers",
     ]
     values = [task.get(c) for c in columns]
     placeholders = ", ".join(["?"] * len(columns))
     col_str = ", ".join(columns)
-    updates = ", ".join(f"{c}=excluded.{c}" for c in columns if c != "id")
+    # COALESCE keeps the stored max_workers when a caller omits it from the dict
+    updates = ", ".join(
+        f"{c}=COALESCE(excluded.{c}, tasks.{c})" if c == "max_workers"
+        else f"{c}=excluded.{c}"
+        for c in columns if c != "id"
+    )
 
     conn.execute(
         f"INSERT INTO tasks ({col_str}) VALUES ({placeholders}) "

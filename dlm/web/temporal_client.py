@@ -101,6 +101,7 @@ async def start_sharded_download(task_dict: dict):
         category=task_dict.get("category", ""),
         priority=task_dict.get("priority", 5),
         size_gb=task_dict.get("size_gb", 0),
+        shard_count=int(task_dict.get("max_workers") or 0),
     )
 
     workflow_id = f"sharded-{task_dict['id']}"
@@ -143,6 +144,52 @@ async def cancel_workflow(task_id: str):
                 pass
     except Exception:
         pass
+
+
+async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> bool:
+    """Terminate all workflows for a task and wait until they are closed.
+
+    Unlike cancel_workflow (async cancel, returns immediately), this blocks
+    until Temporal reports every handle closed — required before requeuing a
+    task under the same workflow ID (e.g. /queue/reshard). Returns True when
+    everything closed within the timeout.
+    """
+    import time as _time
+    from temporalio.client import WorkflowExecutionStatus
+
+    client = await get_client()
+    handles = []
+    for wf_id in (f"dl-{task_id}", f"split-download-{task_id}", f"sharded-{task_id}"):
+        handles.append(client.get_workflow_handle(wf_id))
+    try:
+        from ..queue.snapshot import get_shards_by_task, init_db
+        init_db()
+        for shard in get_shards_by_task(task_id):
+            handles.append(client.get_workflow_handle(f"shard-{shard['id']}"))
+    except Exception:
+        pass
+
+    for handle in handles:
+        try:
+            await handle.terminate(reason=f"reshard/requeue of {task_id}")
+        except Exception:
+            pass  # not found / already closed
+
+    deadline = _time.monotonic() + timeout_s
+    open_statuses = {WorkflowExecutionStatus.RUNNING}
+    while _time.monotonic() < deadline:
+        still_open = 0
+        for handle in handles:
+            try:
+                desc = await handle.describe()
+                if desc.status in open_statuses:
+                    still_open += 1
+            except Exception:
+                pass  # not found = closed
+        if still_open == 0:
+            return True
+        await asyncio.sleep(2)
+    return False
 
 
 async def list_running_workflows() -> list:

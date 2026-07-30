@@ -19,6 +19,7 @@ class TaskInput:
     size_gb: float = 0
     assigned_files: list = field(default_factory=list)  # for split tasks
     filelist_path: Optional[str] = None  # pre-computed filelist (skip list_repo_files)
+    shard_count: int = 0  # user-requested shard count (0 = auto)
 
 
 @dataclass
@@ -63,6 +64,7 @@ class ShardInput:
     category: str = ""
     shard_index: int = 0
     filelist_key: str = ""
+    filelist_md5: str = ""  # content hash guarding stale batch-progress markers
     priority: int = 5
     size_bytes: int = 0
 

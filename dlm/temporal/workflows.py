@@ -412,11 +412,12 @@ class ShardWorkerWorkflow:
             )
             return ShardResult(shard_id=shard_id, status="failed", error="disk_full")
 
-        # Load progress for resume
+        # Load progress for resume — md5-guarded: markers from a different
+        # filelist (re-partition, resume filter) are discarded, not trusted
         shard_task = TaskInput(id=shard_input.task_id, name=shard_name, repo_id=shard_input.repo_id)
         completed = await workflow.execute_activity(
             "load_progress",
-            args=[shard_task],
+            args=[shard_task, shard_input.filelist_md5],
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=ACTIVITY_RETRY,
         )
@@ -492,7 +493,7 @@ class ShardWorkerWorkflow:
 
                 await workflow.execute_activity(
                     "save_progress",
-                    args=[shard_name, batch_markers],
+                    args=[shard_name, batch_markers, shard_input.filelist_md5],
                     start_to_close_timeout=timedelta(seconds=30),
                 )
 
@@ -585,9 +586,11 @@ class ShardedDownloadWorkflow:
             )
             return TaskResult(status="failed", error=error_msg)
 
-        total_bytes = filelist_result.get("total_bytes", 0)
         total_files = filelist_result.get("count", 0)
         filelist_path = filelist_result["path"]
+        # Later activities read filelist_path from local disk — they MUST run
+        # on the worker that produced it, pinned via its personal queue.
+        listing_queue = filelist_result.get("worker_queue", "download-workers")
 
         if total_files == 0:
             await workflow.execute_activity(
@@ -597,15 +600,51 @@ class ShardedDownloadWorkflow:
             )
             return TaskResult(status="done")
 
-        # Step 2: Find idle workers
-        idle_workers = await workflow.execute_activity(
-            "query_idle_workers",
-            args=[task_input.source],
+        # Step 1b: BOS-aware resume — drop files already uploaded (key + size
+        # match under the task's target prefix). One paginated BOS list.
+        filter_result = await workflow.execute_activity(
+            "filter_filelist_against_bos",
+            args=[filelist_path, task_input],
+            task_queue=listing_queue,
+            start_to_close_timeout=timedelta(minutes=15),
+            heartbeat_timeout=timedelta(minutes=3),
+            retry_policy=ACTIVITY_RETRY,
+        )
+        skipped_files = filter_result["skipped_files"]
+        skipped_gb = filter_result["skipped_bytes"] / (1024 ** 3)
+        total_files = filter_result["remaining_files"]
+        total_bytes = filter_result["remaining_bytes"]
+        filtered_path = filter_result["filtered_path"]
+
+        # Persist the filter result on the task row (phase gets overwritten fast)
+        await workflow.execute_activity(
+            "report_resume_info",
+            args=[task_id, skipped_files, skipped_gb],
             start_to_close_timeout=timedelta(seconds=30),
         )
 
-        # Step 3: Determine shard count
-        if total_bytes < AUTO_SHARD_THRESHOLD or len(idle_workers) <= 1:
+        if total_files == 0:
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_id, "done",
+                      f"all {skipped_files} files already on BOS", 100, 0,
+                      round(skipped_gb, 2), None, None],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            return TaskResult(status="done")
+
+        # Step 2: Find idle workers (exclude this task's own claim/shards)
+        idle_workers = await workflow.execute_activity(
+            "query_idle_workers",
+            args=[task_input.source, task_id],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        # Step 3: Determine shard count — user-requested wins, capped by idle
+        requested = getattr(task_input, "shard_count", 0) or 0
+        if requested > 0:
+            num_shards = max(1, min(requested, len(idle_workers) or 1))
+        elif total_bytes < AUTO_SHARD_THRESHOLD or len(idle_workers) <= 1:
             num_shards = 1
         else:
             num_shards = min(
@@ -615,14 +654,12 @@ class ShardedDownloadWorkflow:
 
         staging_dir = f"/data/staging/{task_input.name}"
 
-        # Step 4: Partition files
-        if num_shards == 1:
-            num_shards = 1
-
-        # Partition + upload filelists to BOS (always, even for 1 shard)
+        # Step 4: Partition + upload filelists to BOS (always, even for 1 shard).
+        # Pinned: reads the filtered filelist from the listing worker's disk.
         raw_parts = await workflow.execute_activity(
             "partition_files_greedy",
-            args=[filelist_path, num_shards, staging_dir],
+            args=[filtered_path, num_shards, staging_dir],
+            task_queue=listing_queue,
             start_to_close_timeout=timedelta(minutes=10),
             retry_policy=ACTIVITY_RETRY,
         )
@@ -635,10 +672,14 @@ class ShardedDownloadWorkflow:
             start_to_close_timeout=timedelta(seconds=60),
         )
 
+        phase_msg = f"dispatching {num_shards} shards"
+        if requested > 0:
+            phase_msg += f" (requested={requested} got={num_shards})"
+        if skipped_files > 0:
+            phase_msg += f", skipped {skipped_files} files ({skipped_gb:.1f} GB) already on BOS"
         await workflow.execute_activity(
             "report_to_dashboard",
-            args=[task_id, "downloading", f"dispatching {num_shards} shards",
-                  0, 0, 0, None, None],
+            args=[task_id, "downloading", phase_msg, 0, 0, 0, None, None],
             start_to_close_timeout=timedelta(seconds=30),
         )
 
@@ -660,6 +701,7 @@ class ShardedDownloadWorkflow:
                 category=task_input.category,
                 shard_index=i,
                 filelist_key=partition["filelist_key"],
+                filelist_md5=partition.get("filelist_md5", ""),
                 priority=task_input.priority,
                 size_bytes=partition["total_bytes"],
             )

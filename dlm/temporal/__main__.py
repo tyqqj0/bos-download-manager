@@ -41,6 +41,8 @@ from .activities import (
     aggregate_task_from_shards,
     assign_shard_server,
     download_shard_filelist,
+    filter_filelist_against_bos,
+    report_resume_info,
 )
 
 
@@ -137,6 +139,8 @@ async def run_worker(args):
         aggregate_task_from_shards,
         assign_shard_server,
         download_shard_filelist,
+        filter_filelist_against_bos,
+        report_resume_info,
     ]
 
     workflows = [

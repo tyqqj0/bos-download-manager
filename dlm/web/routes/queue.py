@@ -1,6 +1,7 @@
 """Queue management API — Temporal-based dispatch."""
 
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -68,7 +69,7 @@ async def add_to_queue(body: dict):
         category: str (optional)
         priority: int — 0 (highest) to 9 (lowest)
         source: str — "hf" or "modelscope"
-        split_workers: int (optional) — split across N workers for large datasets
+        shard_count: int (optional) — target shard count (0 = auto). Alias: split_workers.
     """
     from ...core.parser import parse_repo
 
@@ -82,7 +83,7 @@ async def add_to_queue(body: dict):
     task_type = body.get("type", parsed.get("type", "dataset"))
     category = body.get("category", "")
     priority = max(0, min(9, int(body.get("priority", 5))))
-    split_workers = int(body.get("split_workers", 0))
+    shard_count = int(body.get("shard_count", body.get("split_workers", 0)) or 0)
 
     task_id = _next_task_id()
 
@@ -99,6 +100,7 @@ async def add_to_queue(body: dict):
         "downloaded_gb": 0,
         "progress_pct": 0,
         "speed_mbps": 0,
+        "max_workers": shard_count,
         "created_at": _now(),
     }
 
@@ -246,7 +248,7 @@ async def preempt_for_task(body: dict):
     if not urgent_id:
         return {"error": "urgent_task_id is required"}
 
-    from ..temporal_client import cancel_workflow, start_download
+    from ..temporal_client import cancel_workflow, start_sharded_download
 
     def do_read():
         snapshot.init_db()
@@ -292,23 +294,23 @@ async def preempt_for_task(body: dict):
         except Exception:
             pass
 
-    # 2) Claim the urgent task for this server
-    import time
+    # 2) Claim the urgent task. server=NULL: the sharded coordinator assigns
+    #    servers per shard; a task-level claim would wrongly mark one worker
+    #    busy in the idle query. target_server only influences victim choice.
     def do_claim():
         conn = snapshot._conn()
         conn.execute(
-            "UPDATE tasks SET status = 'downloading', server = ?, priority = 0, updated_at = ? "
+            "UPDATE tasks SET status = 'downloading', server = NULL, priority = 0, updated_at = ? "
             "WHERE id = ?",
-            (server, time.time(), urgent_id),
+            (time.time(), urgent_id),
         )
         conn.commit()
         return snapshot.get_task(urgent_id)
     task = await _run_blocking(do_claim)
 
-    # 3) Start the workflow
-    queue = f"download-{server}"
+    # 3) Start the workflow (unified sharded path — BOS resume filter included)
     try:
-        await start_download(task, task_queue=queue)
+        await start_sharded_download(task)
     except Exception as e:
         if "already started" not in str(e).lower():
             def do_revert():
@@ -462,6 +464,32 @@ def _aggregate_task(task_id: str) -> dict:
     return {"ok": True, "done_shards": done_shards, "total_shards": len(shards)}
 
 
+@router.post("/shards/resume-info")
+async def report_resume_info_api(body: dict):
+    """Persist BOS resume-filter results on the task row (acceptance evidence).
+
+    Called by the report_resume_info activity — phase messages get overwritten
+    within seconds, this record survives.
+    """
+    task_id = body.get("task_id", "")
+    if not task_id:
+        return {"error": "task_id required"}
+
+    def do_update():
+        snapshot.init_db()
+        conn = snapshot._conn()
+        conn.execute(
+            "UPDATE tasks SET resume_skipped_files = ?, resume_skipped_gb = ?, updated_at = ? "
+            "WHERE id = ?",
+            (int(body.get("skipped_files", 0)),
+             round(float(body.get("skipped_gb", 0)), 2),
+             time.time(), task_id),
+        )
+        conn.commit()
+        return {"ok": True, "task_id": task_id}
+    return await _run_blocking(do_update)
+
+
 @router.post("/shards/aggregate")
 async def aggregate_task_api(body: dict):
     """Aggregate shard progress into task-level. Called by aggregate_task_from_shards activity."""
@@ -476,8 +504,13 @@ async def aggregate_task_api(body: dict):
 
 
 @router.get("/shards/idle-workers")
-async def query_idle_workers_api(source: str = "hf"):
-    """Return idle worker keys for a given source. Called by query_idle_workers activity."""
+async def query_idle_workers_api(source: str = "hf", exclude_task: str = ""):
+    """Return idle worker keys for a given source. Called by query_idle_workers activity.
+
+    exclude_task: task_id whose own claim/shards must not count as busy —
+    without it, the dispatching task's claimed server is excluded from its
+    own shard pool (6 idle workers would yield only 5 shards).
+    """
     import time
 
     def do_query():
@@ -487,9 +520,15 @@ async def query_idle_workers_api(source: str = "hf"):
         alive = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
 
         running = snapshot.get_running_shards()
-        busy_from_shards = {s["server"] for s in running if s.get("server")}
+        busy_from_shards = {
+            s["server"] for s in running
+            if s.get("server") and s.get("task_id") != exclude_task
+        }
         downloading = snapshot.get_tasks_by_status("downloading")
-        busy_from_tasks = {t.get("server") for t in downloading if t.get("server")}
+        busy_from_tasks = {
+            t.get("server") for t in downloading
+            if t.get("server") and t.get("id") != exclude_task
+        }
         busy = busy_from_shards | busy_from_tasks
 
         seen = set()
@@ -509,6 +548,56 @@ async def query_idle_workers_api(source: str = "hf"):
             idle.append(key)
         return {"workers": idle}
     return await _run_blocking(do_query)
+
+
+@router.post("/queue/reshard")
+async def reshard_task(body: dict):
+    """Change a task's shard count via lossless restart.
+
+    Terminates the running workflows, waits for them to close, deletes the old
+    shard rows, and requeues the task with the new max_workers. The BOS resume
+    filter makes the restart cheap — already-uploaded files are skipped.
+
+    Body: task_id, shard_count
+    """
+    from ..temporal_client import terminate_workflow_and_wait
+
+    task_id = body.get("task_id", "")
+    shard_count = int(body.get("shard_count", 0) or 0)
+    if not task_id or shard_count < 1:
+        return {"error": "task_id and shard_count >= 1 required"}
+
+    def do_check():
+        snapshot.init_db()
+        task = snapshot.get_task(task_id)
+        if not task:
+            return None, f"task {task_id} not found"
+        if task.get("status") not in ("downloading", "pending", "paused"):
+            return None, f"task status={task.get('status')}, expected downloading/pending/paused"
+        return task, None
+    task, error = await _run_blocking(do_check)
+    if error:
+        return {"error": error}
+
+    closed = await terminate_workflow_and_wait(task_id)
+    if not closed:
+        return {"error": "workflows did not close within timeout — task state unchanged, retry later"}
+
+    def do_requeue():
+        conn = snapshot._conn()
+        conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
+        conn.execute(
+            "UPDATE tasks SET status = 'pending', server = NULL, max_workers = ?, "
+            "speed_mbps = 0, updated_at = ? WHERE id = ?",
+            (shard_count, time.time(), task_id),
+        )
+        conn.commit()
+        return {
+            "ok": True, "task_id": task_id, "shard_count": shard_count,
+            "note": "requeued; auto_dispatch restarts it with the new shard count, "
+                    "BOS filter skips already-uploaded files",
+        }
+    return await _run_blocking(do_requeue)
 
 
 @router.delete("/queue/{task_id}")

@@ -15,6 +15,7 @@ DASHBOARD_INTERVAL = 10
 WORKFLOW_SYNC_INTERVAL = 30
 TRANSFER_INTERVAL = 60
 RECONCILE_INTERVAL = 300  # 5 minutes
+DISPATCH_INTERVAL = 30  # pending-task dispatch cadence (one sharded task per source per cycle)
 
 
 def _build_dashboard() -> dict:
@@ -135,6 +136,7 @@ async def background_scheduler():
     loop = asyncio.get_event_loop()
     last_transfer_poll = 0
     last_reconcile = 0
+    last_dispatch = 0
     last_health_verify = 0
 
     await asyncio.sleep(2)
@@ -153,6 +155,19 @@ async def background_scheduler():
                 await loop.run_in_executor(_executor, _poll_transfers)
                 last_transfer_poll = now
 
+            # Auto-dispatch pending tasks to idle workers (own 30s cadence —
+            # decoupled from the 5-min reconcile so new tasks start promptly)
+            if now - last_dispatch > DISPATCH_INTERVAL:
+                try:
+                    from .reconciler import auto_dispatch_pending
+                    dispatch_report = await auto_dispatch_pending()
+                    if dispatch_report.get("dispatched"):
+                        logger.info(f"Auto-dispatch: {dispatch_report['dispatched']}")
+                    cache.set("auto_dispatch_report", dispatch_report)
+                except Exception as e:
+                    logger.error(f"Auto-dispatch error: {e}")
+                last_dispatch = now
+
             # Reconcile: detect orphaned workflows and re-dispatch
             if now - last_reconcile > RECONCILE_INTERVAL:
                 try:
@@ -163,16 +178,6 @@ async def background_scheduler():
                     cache.set("reconciler_report", report)
                 except Exception as e:
                     logger.error(f"Reconciler error: {e}")
-
-                # Auto-dispatch pending tasks to idle workers
-                try:
-                    from .reconciler import auto_dispatch_pending
-                    dispatch_report = await auto_dispatch_pending()
-                    if dispatch_report.get("dispatched"):
-                        logger.info(f"Auto-dispatch: {dispatch_report['dispatched']}")
-                    cache.set("auto_dispatch_report", dispatch_report)
-                except Exception as e:
-                    logger.error(f"Auto-dispatch error: {e}")
 
                 # Detect idle workers (online but no workflow — failed splits)
                 try:
