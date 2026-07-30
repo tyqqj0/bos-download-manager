@@ -115,15 +115,38 @@ async def start_sharded_download(task_dict: dict):
     return handle
 
 
+async def _find_running_workflow_ids(client, task_id: str) -> list:
+    """All RUNNING workflow IDs containing task_id — catches suffixed legacy
+    IDs (e.g. dl-{task_id}-bjN-v3) that fixed patterns miss."""
+    found = []
+    for wf_type in [
+        "DownloadDatasetWorkflow",
+        "SplitDownloadWorkflow",
+        "ShardedDownloadWorkflow",
+        "ShardWorkerWorkflow",
+    ]:
+        try:
+            async for wf in client.list_workflows(
+                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
+            ):
+                if task_id in wf.id:
+                    found.append(wf.id)
+        except Exception:
+            pass
+    return found
+
+
 async def cancel_workflow(task_id: str):
     """Cancel running workflow(s) for a task — handles all ID patterns."""
     client = await get_client()
-    patterns = [
+    wf_ids = {
         f"dl-{task_id}",
         f"split-download-{task_id}",
         f"sharded-{task_id}",
-    ]
-    for wf_id in patterns:
+    }
+    wf_ids.update(await _find_running_workflow_ids(client, task_id))
+
+    for wf_id in wf_ids:
         try:
             handle = client.get_workflow_handle(wf_id)
             await handle.cancel()
@@ -158,9 +181,9 @@ async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> boo
     from temporalio.client import WorkflowExecutionStatus
 
     client = await get_client()
-    handles = []
-    for wf_id in (f"dl-{task_id}", f"split-download-{task_id}", f"sharded-{task_id}"):
-        handles.append(client.get_workflow_handle(wf_id))
+    wf_ids = {f"dl-{task_id}", f"split-download-{task_id}", f"sharded-{task_id}"}
+    wf_ids.update(await _find_running_workflow_ids(client, task_id))
+    handles = [client.get_workflow_handle(wf_id) for wf_id in wf_ids]
     try:
         from ..queue.snapshot import get_shards_by_task, init_db
         init_db()
