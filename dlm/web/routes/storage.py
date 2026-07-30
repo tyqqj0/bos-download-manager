@@ -23,7 +23,7 @@ async def list_bos(bucket: str = "auwomo-data", prefix: str = ""):
     """List directories and files in a BOS bucket under a prefix."""
     from ...core.bos import create_bos_client, list_prefixes, get_prefix_size
     from ...core.config import load_config
-    from ...core.state import StateManager
+    from ...queue import snapshot
 
     def do_list():
         config = load_config()
@@ -31,27 +31,27 @@ async def list_bos(bucket: str = "auwomo-data", prefix: str = ""):
 
         dirs, files = list_prefixes(client, bucket, prefix=prefix)
 
-        mgr = StateManager.create()
-        state = mgr.load(use_cache=True)
-        registered_paths = {t.bos_path.strip("/") for t in state.tasks if t.bos_path}
+        snapshot.init_db()
+        tasks = snapshot.get_all_tasks()
+        by_bos_path = {
+            t["bos_path"].strip("/"): t
+            for t in tasks if t.get("bos_path")
+        }
 
         items = []
         for d in sorted(dirs):
             name = d[len(prefix):].strip("/")
             path_key = d.strip("/")
-            task_match = next(
-                (t for t in state.tasks if t.bos_path and t.bos_path.strip("/") == path_key),
-                None,
-            )
+            task_match = by_bos_path.get(path_key)
             items.append({
                 "name": name,
                 "type": "dir",
                 "prefix": d,
                 "size": None,
-                "registered": path_key in registered_paths,
-                "task_id": task_match.id if task_match else None,
-                "task_status": task_match.status if task_match else None,
-                "transfer_status": task_match.transfer_status if task_match else None,
+                "registered": path_key in by_bos_path,
+                "task_id": task_match["id"] if task_match else None,
+                "task_status": task_match["status"] if task_match else None,
+                "transfer_status": task_match.get("transfer_status") if task_match else None,
             })
 
         for key, size in sorted(files, key=lambda x: x[0]):
@@ -151,8 +151,8 @@ async def list_juicefs(path: str = "/", section: str = "managed"):
 @router.post("/storage/register")
 async def register_bos_data(body: dict):
     """Register existing BOS data as a completed task, optionally start transfer."""
-    from ...core.state import StateManager
-    from ...core.models import Task, _now
+    from datetime import datetime, timezone
+    from ...queue import snapshot
     import uuid
 
     bucket = body.get("bucket", "auwomo-data")
@@ -166,31 +166,34 @@ async def register_bos_data(body: dict):
         return {"error": "prefix and name are required"}
 
     def do_register():
-        mgr = StateManager.create()
-        state = mgr.load(use_cache=False)
-
-        existing = next((t for t in state.tasks if t.bos_path and t.bos_path.strip("/") == prefix), None)
-        if existing:
-            return {"error": f"Already registered as {existing.id} ({existing.name})", "task_id": existing.id}
-
-        task_id = f"t-reg-{uuid.uuid4().hex[:8]}"
-        task = Task(
-            id=task_id,
-            name=name,
-            source="bos",
-            repo_id=f"bos://{bucket}/{prefix}",
-            status="done",
-            category=category,
-            type=task_type,
-            bos_path=f"{prefix}/",
-            size_gb=0,
-            downloaded_gb=0,
-            created_at=_now(),
-            completed_at=_now(),
-            transfer_status="queued" if auto_transfer else None,
+        snapshot.init_db()
+        existing = next(
+            (t for t in snapshot.get_all_tasks()
+             if t.get("bos_path") and t["bos_path"].strip("/") == prefix),
+            None,
         )
-        state.tasks.append(task)
-        mgr.save(state)
+        if existing:
+            return {"error": f"Already registered as {existing['id']} ({existing['name']})",
+                    "task_id": existing["id"]}
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        task_id = f"t-reg-{uuid.uuid4().hex[:8]}"
+        snapshot.upsert_task({
+            "id": task_id,
+            "name": name,
+            "source": "bos",
+            "repo_id": f"bos://{bucket}/{prefix}",
+            "status": "done",
+            "category": category,
+            "type": task_type,
+            "priority": 5,
+            "bos_path": f"{prefix}/",
+            "size_gb": 0,
+            "downloaded_gb": 0,
+            "created_at": now,
+            "completed_at": now,
+            "transfer_status": "queued" if auto_transfer else None,
+        })
         return {"ok": True, "task_id": task_id, "name": name}
 
     result = await _run_blocking(do_register)
