@@ -86,12 +86,16 @@ class PipelineEngine:
         self._prefix = ""
 
     def _download_one_file(self, file_info: FileInfo, cancel_event: "threading.Event | None" = None) -> Optional[Path]:
-        """Download a single file with mirror fallback. Runs in thread pool.
+        """Download a single file. Runs in thread pool.
 
-        Uses HF_HUB_DOWNLOAD_TIMEOUT env var to enforce HTTP-level read timeouts
-        (per-read, not per-file). Large files that stream data continuously will
-        NOT be killed — only connections with no data for HTTP_TIMEOUT seconds.
+        Dispatches to HuggingFace or ModelScope based on task.source.
         """
+        if self.task.source == "modelscope":
+            return self._download_one_file_modelscope(file_info, cancel_event)
+        return self._download_one_file_hf(file_info, cancel_event)
+
+    def _download_one_file_hf(self, file_info: FileInfo, cancel_event) -> Optional[Path]:
+        """HuggingFace download with mirror fallback."""
         import threading
         from huggingface_hub import hf_hub_download
 
@@ -113,9 +117,8 @@ class PipelineEngine:
                     local_dir=str(self.staging_dir),
                     endpoint=endpoint,
                     token=os.environ.get("HF_TOKEN"),
-                    force_download=False,  # resume partial downloads
+                    force_download=False,
                 )
-                # Emit download event
                 self._emit_event("file_downloaded", {
                     "file": file_info.path,
                     "size_bytes": file_info.size,
@@ -125,9 +128,12 @@ class PipelineEngine:
                 return Path(local_path)
             except Exception as e:
                 err_str = str(e)
-                # 403/gated repo: no point retrying or trying other mirrors
                 if "403" in err_str or "gated" in err_str.lower() or "restricted" in err_str.lower():
                     raise _AccessDenied(f"Access denied for {file_info.path}: {err_str[:200]}")
+                if "429" in err_str or "rate limit" in err_str.lower() or "too many requests" in err_str.lower():
+                    wait = 60
+                    logger.warning(f"Rate limited on {endpoint}, sleeping {wait}s")
+                    time.sleep(wait)
                 self._emit_event("file_failed", {
                     "file": file_info.path,
                     "error": err_str[:200],
@@ -135,7 +141,42 @@ class PipelineEngine:
                 })
                 logger.warning(f"Download failed from {endpoint} for {file_info.path}: {e}")
                 continue
-        return None  # all mirrors failed
+        return None
+
+    def _download_one_file_modelscope(self, file_info: FileInfo, cancel_event) -> Optional[Path]:
+        """ModelScope per-file download."""
+        from modelscope import dataset_file_download
+
+        if cancel_event and cancel_event.is_set():
+            return None
+
+        t0 = time.time()
+        token = os.environ.get("MODELSCOPE_API_TOKEN") or os.environ.get("MS_TOKEN")
+        try:
+            local_path = dataset_file_download(
+                dataset_id=self.task.repo_id,
+                file_path=file_info.path,
+                local_dir=str(self.staging_dir),
+                token=token,
+            )
+            self._emit_event("file_downloaded", {
+                "file": file_info.path,
+                "size_bytes": file_info.size,
+                "duration_s": round(time.time() - t0, 1),
+                "endpoint": "modelscope",
+            })
+            return Path(local_path)
+        except Exception as e:
+            err_str = str(e)
+            if "403" in err_str or "forbidden" in err_str.lower():
+                raise _AccessDenied(f"Access denied for {file_info.path}: {err_str[:200]}")
+            self._emit_event("file_failed", {
+                "file": file_info.path,
+                "error": err_str[:200],
+                "endpoint": "modelscope",
+            })
+            logger.warning(f"ModelScope download failed for {file_info.path}: {e}")
+            return None
 
     async def _producer(self, files: list[FileInfo], queue: asyncio.Queue):
         """Download files using thread pool, put completed FileInfo onto queue."""
@@ -240,15 +281,16 @@ class PipelineEngine:
                 )
                 raise _StallDetected(f"Disk full abort: {file_info.path}")
 
-            # Check file size growth (handles .incomplete files too)
+            # Check file size growth (handles .incomplete and ModelScope temp files)
             current_size = 0
             try:
-                # HF hub may use .incomplete suffix during download
-                for candidate in [target_path, Path(str(target_path) + ".incomplete")]:
+                for candidate in [
+                    target_path,
+                    Path(str(target_path) + ".incomplete"),
+                    self.staging_dir / "._____temp" / file_info.path,
+                ]:
                     if candidate.exists():
                         current_size = max(current_size, candidate.stat().st_size)
-                # Also check cache directory for this file
-                cache_pattern = self.staging_dir / ".cache" / "**"
                 for p in self.staging_dir.glob(".cache/**/*.incomplete"):
                     if file_info.path.split("/")[-1] in str(p):
                         current_size = max(current_size, p.stat().st_size)

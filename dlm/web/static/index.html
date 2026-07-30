@@ -253,7 +253,13 @@
                                     <span x-text="t.status === 'preempted' ? '被抢占' : t.status === 'paused' ? '已暂停' : t.status"></span>
                                 </span>
                             </td>
-                            <td class="px-3 py-2 text-gray-400 text-xs" x-text="t.server || '-'"></td>
+                            <td class="px-3 py-2 text-gray-400 text-xs">
+                                <span x-text="t.server || '-'"></span>
+                                <button x-show="t.total_shards > 0"
+                                        @click="fetchShards(t.id)"
+                                        class="ml-1 px-1 py-0.5 bg-indigo-800 text-indigo-300 rounded text-[10px] hover:bg-indigo-700"
+                                        x-text="t.done_shards + '/' + t.total_shards + ' shards'"></button>
+                            </td>
                             <td class="px-3 py-2">
                                 <div class="flex items-center gap-2">
                                     <div class="w-16 bg-gray-700 rounded-full h-1.5" x-show="t.size_gb > 0">
@@ -277,7 +283,7 @@
                                     <button x-show="t.status === 'paused' || t.status === 'preempted'"
                                             @click="resumeTask(t.id)" title="恢复"
                                             class="px-2 py-1 bg-green-600 hover:bg-green-700 rounded text-xs">&#9654;</button>
-                                    <button x-show="t.status === 'queued'"
+                                    <button x-show="t.status === 'queued' || t.status === 'paused' || t.status === 'preempted'"
                                             @click="preemptForTask(t.id)" title="插队"
                                             class="px-2 py-1 bg-purple-600 hover:bg-purple-700 rounded text-xs">&#9889;</button>
                                     <button x-show="t.status === 'failed' || t.status === 'queued' || t.status === 'needs-auth'"
@@ -368,6 +374,54 @@
                     </button>
                 </div>
             </template>
+        </div>
+
+        <!-- Shard Detail Modal -->
+        <div x-show="shardDetail !== null" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="closeShards()">
+            <div class="bg-gray-800 rounded-lg p-6 w-[650px] max-h-[80vh] overflow-auto">
+                <div class="flex justify-between mb-3">
+                    <h3 class="font-bold">Shards</h3>
+                    <button @click="closeShards()" class="text-gray-400 hover:text-white text-xl">&times;</button>
+                </div>
+                <div x-show="shardDetail && shardDetail.length === 0" class="text-gray-500 text-sm">No shards found</div>
+                <table x-show="shardDetail && shardDetail.length > 0" class="w-full text-sm">
+                    <thead>
+                        <tr class="text-gray-500 text-xs border-b border-gray-700">
+                            <th class="px-2 py-1 text-left">#</th>
+                            <th class="px-2 py-1 text-left">Server</th>
+                            <th class="px-2 py-1 text-left">Status</th>
+                            <th class="px-2 py-1 text-left">Files</th>
+                            <th class="px-2 py-1 text-left">Size</th>
+                            <th class="px-2 py-1 text-left">Speed</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="s in (shardDetail || [])" :key="s.id">
+                            <tr class="border-b border-gray-700/50">
+                                <td class="px-2 py-1.5 text-gray-400" x-text="s.shard_index"></td>
+                                <td class="px-2 py-1.5 text-gray-300" x-text="s.server || '-'"></td>
+                                <td class="px-2 py-1.5">
+                                    <span class="px-1.5 py-0.5 rounded text-xs"
+                                          :class="statusClass(s.status)"
+                                          x-text="s.status"></span>
+                                </td>
+                                <td class="px-2 py-1.5 text-gray-400 text-xs">
+                                    <span x-text="(s.done_files || 0) + '/' + (s.total_files || '?')"></span>
+                                    <div class="w-16 bg-gray-700 rounded-full h-1 mt-0.5">
+                                        <div class="bg-blue-500 h-1 rounded-full"
+                                             :style="`width: ${shardPct(s)}%`"></div>
+                                    </div>
+                                </td>
+                                <td class="px-2 py-1.5 text-gray-400 text-xs" x-text="formatBytes(s.done_bytes || 0) + '/' + formatBytes(s.total_bytes || 0)"></td>
+                                <td class="px-2 py-1.5 text-blue-300 text-xs font-mono" x-text="s.speed_mbps ? formatSpeed(s.speed_mbps) : '-'"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+                <div class="mt-2 text-xs text-red-400"
+                     x-show="shardDetail && shardDetail.some(s => s.error)"
+                     x-text="(shardDetail || []).filter(s => s.error).map(s => '#' + s.shard_index + ': ' + s.error).join('; ')"></div>
+            </div>
         </div>
 
         <!-- Log Modal -->

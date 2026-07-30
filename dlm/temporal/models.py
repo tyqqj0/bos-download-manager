@@ -49,3 +49,29 @@ class TaskResult:
     files_uploaded: int = 0
     bytes_uploaded: int = 0
     error: Optional[str] = None
+
+
+@dataclass
+class ShardInput:
+    """Input to ShardWorkerWorkflow — describes one shard of a task."""
+    shard_id: str = ""
+    task_id: str = ""
+    task_name: str = ""
+    repo_id: str = ""
+    source: str = "hf"
+    type: str = "dataset"
+    category: str = ""
+    shard_index: int = 0
+    filelist_key: str = ""
+    priority: int = 5
+    size_bytes: int = 0
+
+
+@dataclass
+class ShardResult:
+    """Output from ShardWorkerWorkflow."""
+    shard_id: str = ""
+    status: str = "done"
+    files_uploaded: int = 0
+    bytes_uploaded: int = 0
+    error: Optional[str] = None

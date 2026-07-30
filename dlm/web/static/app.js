@@ -23,6 +23,8 @@ function app() {
         transferTasks: [],
         transferSummary: {},
         transferPaused: false,
+        shardDetail: null,
+        shardTaskId: null,
 
         // Storage tab state
         storageBucket: 'auwomo-data',
@@ -174,12 +176,37 @@ function app() {
         },
 
         async preemptForTask(taskId) {
-            if (!confirm('将暂停一个低优先级下载任务来为此任务腾位。确认插队？')) return;
+            const downloading = this.tasks.filter(t => t.status === 'downloading');
+            if (downloading.length === 0) {
+                this.showToast('当前没有正在下载的任务，无需插队，直接恢复即可', 'error');
+                return;
+            }
+            const options = downloading.map(t =>
+                `${t.name} (${t.server || '?'}, ${this.formatSpeed(t.speed_mbps)})`
+            ).join('\n');
+            const choice = prompt(
+                `选择要暂停的任务（输入序号 1-${downloading.length}）：\n` +
+                downloading.map((t, i) =>
+                    `${i + 1}. ${t.name} @ ${t.server || '?'} (${this.formatSpeed(t.speed_mbps)}, ${t.priority})`
+                ).join('\n')
+            );
+            if (!choice) return;
+            const idx = parseInt(choice) - 1;
+            if (isNaN(idx) || idx < 0 || idx >= downloading.length) {
+                this.showToast('无效的序号', 'error');
+                return;
+            }
+            const victim = downloading[idx];
+            if (!confirm(`确认插队？\n暂停: ${victim.name} @ ${victim.server}\n启动: ${this.tasks.find(t => t.id === taskId)?.name || taskId}`)) return;
             try {
                 const res = await fetch('/api/queue/preempt', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ urgent_task_id: taskId }),
+                    body: JSON.stringify({
+                        urgent_task_id: taskId,
+                        victim_task_id: victim.id,
+                        target_server: victim.server,
+                    }),
                 });
                 const data = await res.json();
                 if (data.ok) {
@@ -713,6 +740,28 @@ function app() {
                     this.showToast(data.detail || 'Add failed', 'error');
                 }
             } catch (e) { this.showToast('Add failed', 'error'); }
+        },
+
+        async fetchShards(taskId) {
+            this.shardTaskId = taskId;
+            try {
+                const res = await fetch(`/api/tasks/${taskId}/shards`);
+                const data = await res.json();
+                this.shardDetail = data.shards || [];
+            } catch (e) {
+                this.shardDetail = [];
+                console.error('fetchShards:', e);
+            }
+        },
+
+        closeShards() {
+            this.shardDetail = null;
+            this.shardTaskId = null;
+        },
+
+        shardPct(shard) {
+            if (!shard.total_files || shard.total_files === 0) return 0;
+            return Math.round((shard.done_files / shard.total_files) * 100);
         },
 
         formatBytes(bytes) {

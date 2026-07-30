@@ -15,7 +15,12 @@ from pathlib import Path
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from .workflows import DownloadDatasetWorkflow, SplitDownloadWorkflow
+from .workflows import (
+    DownloadDatasetWorkflow,
+    SplitDownloadWorkflow,
+    ShardedDownloadWorkflow,
+    ShardWorkerWorkflow,
+)
 from .activities import (
     list_repo_files,
     load_progress,
@@ -28,6 +33,14 @@ from .activities import (
     cleanup_all_staging,
     report_to_dashboard,
     check_disk_space,
+    partition_files_greedy,
+    create_shards_in_db,
+    update_shard_status,
+    report_shard_progress,
+    query_idle_workers,
+    aggregate_task_from_shards,
+    assign_shard_server,
+    download_shard_filelist,
 )
 
 
@@ -87,8 +100,9 @@ async def run_worker(args):
     # Ensure staging exists
     Path("/data/staging").mkdir(parents=True, exist_ok=True)
 
-    # HF high-performance download
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    # Disable Xet (TCP stall bug xet-core#789) — use legacy LFS download
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ.pop("HF_XET_HIGH_PERFORMANCE", None)
     os.environ.setdefault("HF_HUB_CACHE", "/tmp/hf_cache")
 
     # Connect to Temporal
@@ -115,40 +129,44 @@ async def run_worker(args):
         cleanup_all_staging,
         report_to_dashboard,
         check_disk_space,
+        partition_files_greedy,
+        create_shards_in_db,
+        update_shard_status,
+        report_shard_progress,
+        query_idle_workers,
+        aggregate_task_from_shards,
+        assign_shard_server,
+        download_shard_filelist,
     ]
 
     workflows = [
         DownloadDatasetWorkflow,
-        SplitDownloadWorkflow,
+        SplitDownloadWorkflow,       # keep for bj1-4 backward compat
+        ShardedDownloadWorkflow,
+        ShardWorkerWorkflow,
     ]
 
-    logger.info(f"Starting worker: server_key={args.server_key}, queues=[{task_queue}, {personal_queue}]")
+    queues = list(dict.fromkeys([task_queue, personal_queue]))
+    logger.info(f"Starting worker: server_key={args.server_key}, queues={queues}")
     logger.info(f"Registered {len(workflows)} workflows, {len(activities)} activities")
 
-    # Shared queue: picks up new workflows — limit to 1 so each worker
-    # only claims one dataset at a time from the shared pool
-    worker_shared = Worker(
-        client,
-        task_queue=task_queue,
-        workflows=workflows,
-        activities=activities,
-        max_concurrent_workflow_tasks=1,
-        max_concurrent_activities=1,
-    )
+    import uuid
+    build_id = f"{args.server_key}-{uuid.uuid4().hex[:8]}"
 
-    # Personal queue: pinned activities (file-local operations)
-    # max_concurrent limits prevent multiple workflows on same worker (defense in depth)
-    worker_personal = Worker(
-        client,
-        task_queue=personal_queue,
-        workflows=workflows,
-        activities=activities,
-        max_concurrent_workflow_tasks=1,
-        max_concurrent_activities=2,
-    )
+    workers = []
+    for i, q in enumerate(queues):
+        w = Worker(
+            client,
+            task_queue=q,
+            workflows=workflows,
+            activities=activities,
+            max_concurrent_workflow_tasks=1,
+            max_concurrent_activities=2 if q == personal_queue else 1,
+            build_id=build_id,
+        )
+        workers.append(w)
 
     logger.info("Workers running. Waiting for tasks...")
-    # Start heartbeat loop and event buffer
     heartbeat_task = asyncio.create_task(_heartbeat_loop(args.server_key))
 
     from .event_buffer import init_event_buffer
@@ -156,7 +174,7 @@ async def run_worker(args):
     await event_buf.start()
 
     try:
-        await asyncio.gather(worker_shared.run(), worker_personal.run())
+        await asyncio.gather(*(w.run() for w in workers))
     finally:
         heartbeat_task.cancel()
         await event_buf.stop()

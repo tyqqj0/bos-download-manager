@@ -73,8 +73,42 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
         CREATE INDEX IF NOT EXISTS idx_tasks_celery ON tasks(celery_task_id);
+
+        CREATE TABLE IF NOT EXISTS shards (
+            id           TEXT PRIMARY KEY,
+            task_id      TEXT NOT NULL,
+            shard_index  INTEGER NOT NULL,
+            server       TEXT,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            total_files  INTEGER DEFAULT 0,
+            done_files   INTEGER DEFAULT 0,
+            total_bytes  INTEGER DEFAULT 0,
+            done_bytes   INTEGER DEFAULT 0,
+            speed_mbps   REAL DEFAULT 0,
+            error        TEXT,
+            filelist_key TEXT,
+            started_at   TEXT,
+            completed_at TEXT,
+            updated_at   REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_shards_task ON shards(task_id);
+        CREATE INDEX IF NOT EXISTS idx_shards_server ON shards(server);
+        CREATE INDEX IF NOT EXISTS idx_shards_status ON shards(status);
     """)
     conn.commit()
+
+    # Add shard-related columns to tasks table (safe migration)
+    for col, coltype, default in [
+        ("total_shards", "INTEGER", "1"),
+        ("done_shards", "INTEGER", "0"),
+        ("max_workers", "INTEGER", "0"),
+        ("shard_strategy", "TEXT", "'auto'"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")
+        except Exception:
+            pass
 
 
 def upsert_task(task: dict):
@@ -301,5 +335,77 @@ def get_dashboard_summary() -> dict:
 def delete_task(task_id: str):
     """Remove a task from the snapshot."""
     conn = _conn()
+    conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+
+
+# ── Shard CRUD ──────────────────────────────────────────────
+
+
+def upsert_shard(shard: dict):
+    conn = _conn()
+    shard.setdefault("updated_at", time.time())
+    keys = list(shard.keys())
+    placeholders = ", ".join(["?"] * len(keys))
+    cols = ", ".join(keys)
+    updates = ", ".join(f"{k} = excluded.{k}" for k in keys if k != "id")
+    conn.execute(
+        f"INSERT INTO shards ({cols}) VALUES ({placeholders}) "
+        f"ON CONFLICT(id) DO UPDATE SET {updates}",
+        [shard[k] for k in keys],
+    )
+    conn.commit()
+
+
+def get_shard(shard_id: str) -> Optional[dict]:
+    conn = _conn()
+    row = conn.execute("SELECT * FROM shards WHERE id = ?", (shard_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_shards_by_task(task_id: str) -> list:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM shards WHERE task_id = ? ORDER BY shard_index", (task_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_shards_by_status(status: str) -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM shards WHERE status = ?", (status,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_running_shards() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM shards WHERE status = 'running'").fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_shard_progress(shard_id: str, **fields):
+    conn = _conn()
+    fields["updated_at"] = time.time()
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(
+        f"UPDATE shards SET {sets} WHERE id = ?",
+        [*fields.values(), shard_id],
+    )
+    conn.commit()
+
+
+def complete_shard(shard_id: str, status: str = "done"):
+    conn = _conn()
+    from datetime import datetime, timezone
+    conn.execute(
+        "UPDATE shards SET status = ?, speed_mbps = 0, completed_at = ?, updated_at = ? WHERE id = ?",
+        (status, datetime.now(timezone.utc).isoformat(), time.time(), shard_id),
+    )
+    conn.commit()
+
+
+def delete_shards_by_task(task_id: str):
+    conn = _conn()
+    conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
     conn.commit()

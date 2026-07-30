@@ -12,7 +12,7 @@ from typing import Optional
 
 from temporalio import activity
 
-from .models import TaskInput, FileInfo, PipelineStats
+from .models import TaskInput, FileInfo, PipelineStats, ShardInput
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ STAGING_PATH = Path("/data/staging")
 
 @activity.defn
 async def list_repo_files(task_input: TaskInput) -> dict:
-    """List all files in the HF repo. Saves to disk, returns metadata.
+    """List all files in a HF or ModelScope repo. Saves to disk, returns metadata.
 
     Returns {path, count, total_bytes, worker_queue} — the file list stays on
     disk to avoid gRPC limits. worker_queue pins subsequent activities to this worker.
@@ -30,7 +30,7 @@ async def list_repo_files(task_input: TaskInput) -> dict:
     """
     file_count = [0]
 
-    def _list():
+    def _list_hf():
         from huggingface_hub import HfApi
 
         api = HfApi(token=os.environ.get("HF_TOKEN"))
@@ -43,8 +43,44 @@ async def list_repo_files(task_input: TaskInput) -> dict:
             if hasattr(item, "size") and item.size and hasattr(item, "rfilename"):
                 files.append({"path": item.rfilename, "size": item.size})
                 file_count[0] = len(files)
+        return files
 
-        # Save to local file instead of returning via gRPC
+    def _list_modelscope():
+        from modelscope.hub.api import HubApi
+
+        api = HubApi()
+        token = os.environ.get("MODELSCOPE_API_TOKEN") or os.environ.get("MS_TOKEN")
+
+        files = []
+        page = 1
+        while True:
+            page_files = api.get_dataset_files(
+                repo_id=task_input.repo_id,
+                recursive=True,
+                page_number=page,
+                page_size=100,
+                token=token,
+            )
+            if not page_files:
+                break
+            for item in page_files:
+                if isinstance(item, dict) and item.get("Type") == "blob":
+                    size = item.get("Size", 0) or 0
+                    path = item.get("Path", "")
+                    if path and size > 0:
+                        files.append({"path": path, "size": size})
+                        file_count[0] = len(files)
+            if len(page_files) < 100:
+                break
+            page += 1
+        return files
+
+    def _list():
+        if task_input.source == "modelscope":
+            files = _list_modelscope()
+        else:
+            files = _list_hf()
+
         staging_dir = STAGING_PATH / task_input.name
         staging_dir.mkdir(parents=True, exist_ok=True)
         filelist_path = staging_dir / ".filelist.json"
@@ -324,3 +360,161 @@ async def check_disk_space(min_free_gb: int = 25) -> bool:
         logger.warning(f"Disk preflight failed: {free_gb:.1f}GB free < {min_free_gb}GB required")
         return False
     return True
+
+
+# ── Shard activities ────────────────────────────────────────
+
+
+@activity.defn
+async def partition_files_greedy(
+    filelist_path: str, num_shards: int, staging_dir: str
+) -> list[dict]:
+    """Partition files into N shards using greedy bin-packing by size.
+
+    Returns list of {filelist_path, total_files, total_bytes} per shard.
+    """
+    path = Path(filelist_path)
+    all_files = json.loads(path.read_text())
+
+    files_with_size = [(fi["path"], fi.get("size", 0)) for fi in all_files]
+    files_with_size.sort(key=lambda x: x[1], reverse=True)
+
+    shards: list[list] = [[] for _ in range(num_shards)]
+    shard_sizes = [0] * num_shards
+
+    for fpath, size in files_with_size:
+        smallest = min(range(num_shards), key=lambda i: shard_sizes[i])
+        shards[smallest].append({"path": fpath, "size": size})
+        shard_sizes[smallest] += size
+
+    results = []
+    sdir = Path(staging_dir)
+    sdir.mkdir(parents=True, exist_ok=True)
+
+    # Upload shard filelists to BOS so all workers can access them
+    from ..core.bos import create_bos_client, upload_file
+    from ..constants import META_BUCKET
+    ak = os.environ.get("BAIDU_AK", "")
+    sk = os.environ.get("BAIDU_SK", "")
+    endpoint = os.environ.get("BOS_ENDPOINT", "https://bj.bcebos.com")
+    bos = create_bos_client(ak, sk, endpoint)
+
+    task_name = Path(staging_dir).name
+    for i, shard_files in enumerate(shards):
+        shard_filelist = sdir / f".filelist-shard-{i}.json"
+        shard_filelist.write_text(json.dumps(shard_files))
+
+        bos_key = f"download-manager/filelists/{task_name}/shard-{i}.json"
+        upload_file(bos, META_BUCKET, bos_key, str(shard_filelist))
+
+        results.append({
+            "filelist_key": bos_key,
+            "total_files": len(shard_files),
+            "total_bytes": shard_sizes[i],
+        })
+
+    activity.heartbeat(f"partitioned {len(all_files)} files into {num_shards} shards, uploaded to BOS")
+    return results
+
+
+@activity.defn
+async def download_shard_filelist(filelist_key: str, staging_dir: str) -> str:
+    """Download a shard filelist from BOS to local disk. Returns local path."""
+    from ..core.bos import create_bos_client
+    from ..constants import META_BUCKET
+
+    ak = os.environ.get("BAIDU_AK", "")
+    sk = os.environ.get("BAIDU_SK", "")
+    endpoint = os.environ.get("BOS_ENDPOINT", "https://bj.bcebos.com")
+    bos = create_bos_client(ak, sk, endpoint)
+
+    sdir = Path(staging_dir)
+    sdir.mkdir(parents=True, exist_ok=True)
+    local_path = sdir / f".filelist-{Path(filelist_key).stem}.json"
+
+    response = bos.get_object(META_BUCKET, filelist_key)
+    local_path.write_bytes(response.data)
+
+    return str(local_path)
+
+
+_COORDINATOR_URL = None
+
+def _coordinator():
+    global _COORDINATOR_URL
+    if _COORDINATOR_URL is None:
+        _COORDINATOR_URL = os.environ.get("DLM_COORDINATOR", "http://154.85.43.52:8080")
+    return _COORDINATOR_URL
+
+
+@activity.defn
+async def create_shards_in_db(task_id: str, shard_infos: list[dict]) -> list[str]:
+    """Create shard rows via S1 API. Returns shard IDs."""
+    import requests
+    resp = requests.post(
+        f"{_coordinator()}/api/shards/create",
+        json={"task_id": task_id, "shard_infos": shard_infos},
+        timeout=30,
+    )
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(data["error"])
+    return data["shard_ids"]
+
+
+@activity.defn
+async def update_shard_status(shard_id: str, status: str, error: str = None):
+    """Update shard status via S1 API."""
+    import requests
+    requests.post(
+        f"{_coordinator()}/api/shards/status",
+        json={"shard_id": shard_id, "status": status, "error": error},
+        timeout=30,
+    )
+
+
+@activity.defn
+async def report_shard_progress(shard_id: str, done_files: int = 0,
+                                done_bytes: int = 0, speed_mbps: float = 0):
+    """Update shard progress via S1 API."""
+    import requests
+    requests.post(
+        f"{_coordinator()}/api/shard-progress",
+        json={"shard_id": shard_id, "done_files": done_files,
+              "done_bytes": done_bytes, "speed_mbps": speed_mbps},
+        timeout=30,
+    )
+
+
+@activity.defn
+async def query_idle_workers(source: str) -> list[str]:
+    """Query idle workers via S1 API."""
+    import requests
+    resp = requests.get(
+        f"{_coordinator()}/api/shards/idle-workers",
+        params={"source": source},
+        timeout=30,
+    )
+    return resp.json().get("workers", [])
+
+
+@activity.defn
+async def aggregate_task_from_shards(task_id: str):
+    """Aggregate shard progress into task-level via S1 API."""
+    import requests
+    requests.post(
+        f"{_coordinator()}/api/shards/aggregate",
+        json={"task_id": task_id},
+        timeout=30,
+    )
+
+
+@activity.defn
+async def assign_shard_server(shard_id: str, server_key: str):
+    """Record shard-to-server assignment via S1 API."""
+    import requests
+    requests.post(
+        f"{_coordinator()}/api/shards/assign",
+        json={"shard_id": shard_id, "server_key": server_key},
+        timeout=30,
+    )

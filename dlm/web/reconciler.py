@@ -54,7 +54,8 @@ async def reconcile() -> dict:
     try:
         client = await get_client()
         running_ids = set()
-        for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow"]:
+        for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow",
+                        "ShardedDownloadWorkflow", "ShardWorkerWorkflow"]:
             async for wf in client.list_workflows(
                 f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
             ):
@@ -72,15 +73,11 @@ async def reconcile() -> dict:
         updated_at = task.get("updated_at") or 0
         stale_seconds = now - updated_at
 
-        # Check if any workflow exists for this task — match all known ID patterns:
-        #   dl-{id}            (normal)
-        #   split-download-{id} (split parent)
-        #   {id}-part*          (split child)
-        #   dl-{id}-bj*         (manual split per worker)
-        #   dl-{id}-w*          (manual split per worker)
         has_workflow = (
             workflow_id in running_ids
             or f"split-download-{task_id}" in running_ids
+            or f"sharded-{task_id}" in running_ids
+            or any(wid.startswith(f"shard-s-{task_id}-") for wid in running_ids)
             or any(wid.startswith(f"{task_id}-part") for wid in running_ids)
             or any(wid.startswith(f"{workflow_id}-") for wid in running_ids)
         )
@@ -144,8 +141,10 @@ async def auto_dispatch_pending() -> dict:
     Uses optimistic locking: UPDATE tasks SET status='downloading' WHERE status='pending' AND id=?
     to prevent TOCTOU race with concurrent dispatches.
     """
-    from ..queue.snapshot import get_tasks_by_status, get_workers, _conn, init_db
-    from .temporal_client import get_client, start_download
+    from ..queue.snapshot import (
+        get_tasks_by_status, get_workers, get_running_shards, _conn, init_db,
+    )
+    from .temporal_client import get_client, start_download, start_sharded_download
 
     init_db()
     report = {"dispatched": [], "errors": []}
@@ -158,10 +157,12 @@ async def auto_dispatch_pending() -> dict:
         if not alive_workers:
             return report
 
-        # 2. Find busy workers via SQLite downloading tasks (simpler and more reliable
-        #    than querying Temporal, which may timeout or miss recently-started workflows)
+        # 2. Find busy workers — check BOTH tasks table AND shards table
         downloading = get_tasks_by_status("downloading")
-        busy_servers = {t.get("server") for t in downloading if t.get("server")}
+        busy_from_tasks = {t.get("server") for t in downloading if t.get("server")}
+        running_shards = get_running_shards()
+        busy_from_shards = {s.get("server") for s in running_shards if s.get("server")}
+        busy_servers = busy_from_tasks | busy_from_shards
 
         # Deduplicate by server_key (heartbeat can register multiple entries)
         seen_keys = set()
@@ -198,6 +199,12 @@ async def auto_dispatch_pending() -> dict:
                 )
                 continue
 
+            # TEMPORARY BLACKLIST (2026-07-30): bj1-4 running manual AgiBotWorld-Beta
+            # split downloads — auto_dispatch must not assign new tasks to them.
+            # Remove after AgiBotWorld-Beta completes (~44.75TB, est. 2026-08-01).
+            if server_key in ("bj1", "bj2", "bj3", "bj4"):
+                continue
+
             is_bj = server_key.startswith("bj")
 
             # Find first compatible task for this worker
@@ -225,15 +232,21 @@ async def auto_dispatch_pending() -> dict:
             if cursor.rowcount == 0:
                 continue  # someone else claimed it
 
-            # Start workflow
+            # Start workflow — bj workers use legacy single-worker, w* use sharded
             queue = f"download-{server_key}"
             try:
-                await start_download(task, task_queue=queue)
+                if is_bj:
+                    await start_download(task, task_queue=queue)
+                else:
+                    await start_sharded_download(task)
                 report["dispatched"].append({
                     "task": task.get("name", task["id"]),
                     "worker": server_key,
+                    "mode": "legacy" if is_bj else "sharded",
                 })
-                logger.info(f"Auto-dispatch: {task.get('name')} → {server_key}")
+                logger.info(f"Auto-dispatch: {task.get('name')} → {server_key} ({'legacy' if is_bj else 'sharded'})")
+                if not is_bj:
+                    break  # sharded workflow grabs all idle workers — only start one per cycle
             except Exception as e:
                 err_msg = str(e).lower()
                 if "already started" in err_msg:
@@ -265,7 +278,7 @@ async def detect_idle_workers() -> dict:
     Catches the failure mode where split child workflows fail silently
     and the worker sits idle while the dashboard shows "downloading".
     """
-    from ..queue.snapshot import get_tasks_by_status, get_workers, init_db
+    from ..queue.snapshot import get_tasks_by_status, get_workers, get_running_shards, init_db
     from .temporal_client import get_client
 
     init_db()
@@ -280,12 +293,16 @@ async def detect_idle_workers() -> dict:
             return report
 
         downloading = get_tasks_by_status("downloading")
-        busy_servers = {t.get("server") for t in downloading if t.get("server")}
+        busy_from_tasks = {t.get("server") for t in downloading if t.get("server")}
+        running_shards = get_running_shards()
+        busy_from_shards = {s.get("server") for s in running_shards if s.get("server")}
+        busy_servers = busy_from_tasks | busy_from_shards
 
         # Query Temporal for running workflows per task queue
         client = await get_client()
         running_by_queue = {}
-        for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow"]:
+        for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow",
+                        "ShardedDownloadWorkflow", "ShardWorkerWorkflow"]:
             async for wf in client.list_workflows(
                 f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
             ):
