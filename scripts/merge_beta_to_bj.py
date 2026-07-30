@@ -63,28 +63,33 @@ def list_objects(client, prefix):
 
 
 def list_modelscope(repo_id):
-    """Full ModelScope dataset file listing → {path: size}."""
-    import requests
+    """Full ModelScope dataset file listing → {path: size}.
+
+    Uses the same HubApi pagination as dlm.temporal.activities._list_modelscope.
+    """
+    from modelscope.hub.api import HubApi
+
+    api = HubApi()
+    token = os.environ.get("MODELSCOPE_API_TOKEN") or os.environ.get("MS_TOKEN")
 
     out = {}
     page = 1
     while True:
-        resp = requests.get(
-            f"https://modelscope.cn/api/v1/datasets/{repo_id}/repo/files",
-            params={"Recursive": "true", "PageNumber": page, "PageSize": 100},
-            timeout=60,
+        page_files = api.get_dataset_files(
+            repo_id=repo_id,
+            recursive=True,
+            page_number=page,
+            page_size=100,
+            token=token,
         )
-        resp.raise_for_status()
-        data = resp.json().get("Data", {}) or {}
-        files = data.get("Files", []) or []
-        if not files:
+        if not page_files:
             break
-        for item in files:
-            if item.get("Type") == "blob":
+        for item in page_files:
+            if isinstance(item, dict) and item.get("Type") == "blob":
                 path, size = item.get("Path", ""), item.get("Size", 0) or 0
                 if path and size > 0:
                     out[path] = size
-        if len(files) < 100:
+        if len(page_files) < 100:
             break
         page += 1
     return out
