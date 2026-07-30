@@ -19,6 +19,11 @@ declare -A WORKERS=(
     [bj2]="180.76.182.215"
     [bj3]="120.48.21.57"
     [bj4]="180.76.228.120"
+    [bj5]="120.48.56.197"
+    [bj6]="120.48.174.216"
+    [bj7]="120.48.79.251"
+    [bj8]="120.48.142.8"
+    [bj9]="106.12.159.208"
 )
 
 # BJ workers poll only their personal queue (source isolation: ModelScope);
@@ -28,10 +33,12 @@ declare -A QUEUES=(
     [bj2]="download-bj2"
     [bj3]="download-bj3"
     [bj4]="download-bj4"
+    [bj5]="download-bj5"
+    [bj6]="download-bj6"
+    [bj7]="download-bj7"
+    [bj8]="download-bj8"
+    [bj9]="download-bj9"
 )
-
-# bj5-bj9 are provisioned dynamically (BCC); pass --worker bjN --ip X.X.X.X
-# or add them here once their IPs are stable.
 
 # Parse args
 RESTART=true
