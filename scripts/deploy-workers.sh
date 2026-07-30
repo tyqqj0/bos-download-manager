@@ -15,16 +15,34 @@ declare -A WORKERS=(
     [w5]="154.85.54.251"
     [w6]="154.85.50.210"
     [w7]="156.240.121.60"
+    [bj1]="120.48.57.202"
+    [bj2]="180.76.182.215"
+    [bj3]="120.48.21.57"
+    [bj4]="180.76.228.120"
 )
+
+# BJ workers poll only their personal queue (source isolation: ModelScope);
+# w* workers additionally serve the shared coordinator queue (empty = default).
+declare -A QUEUES=(
+    [bj1]="download-bj1"
+    [bj2]="download-bj2"
+    [bj3]="download-bj3"
+    [bj4]="download-bj4"
+)
+
+# bj5-bj9 are provisioned dynamically (BCC); pass --worker bjN --ip X.X.X.X
+# or add them here once their IPs are stable.
 
 # Parse args
 RESTART=true
 TARGETS=""
+CUSTOM_IP=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-restart) RESTART=false; shift ;;
         --worker) TARGETS="$TARGETS $2"; shift 2 ;;
-        *) echo "Usage: $0 [--no-restart] [--worker w1] [--worker w2] ..."; exit 1 ;;
+        --ip) CUSTOM_IP="$2"; shift 2 ;;
+        *) echo "Usage: $0 [--no-restart] [--worker w1] [--worker bjN --ip X.X.X.X] ..."; exit 1 ;;
     esac
 done
 
@@ -36,10 +54,15 @@ fi
 echo "[$(date)] Deploying to: $TARGETS"
 
 for key in $TARGETS; do
-    ip="${WORKERS[$key]}"
+    ip="${WORKERS[$key]:-$CUSTOM_IP}"
     if [ -z "$ip" ]; then
-        echo "  ERROR: Unknown worker '$key'"
+        echo "  ERROR: Unknown worker '$key' (use --ip for dynamic hosts)"
         continue
+    fi
+    queue="${QUEUES[$key]:-}"
+    # Any bjN not in the static map still needs its personal queue
+    if [ -z "$queue" ] && [[ "$key" == bj* ]]; then
+        queue="download-$key"
     fi
 
     echo "  [$key] $ip — syncing code..."
@@ -52,13 +75,15 @@ for key in $TARGETS; do
         "$REPO_DIR/" "root@$ip:$REMOTE_DIR/"
 
     if [ "$RESTART" = true ]; then
-        echo "  [$key] $ip — restarting worker..."
-        ssh "root@$ip" bash -s "$key" <<'REMOTE_SCRIPT'
+        echo "  [$key] $ip — restarting worker (queue=${queue:-default})..."
+        ssh "root@$ip" bash -s "$key" "$queue" <<'REMOTE_SCRIPT'
             SERVER_KEY="$1"
+            TASK_QUEUE="${2:-}"
             pkill -f "dlm.temporal" 2>/dev/null || true
             sleep 2
             cd /root/code/bos-download-manager
             export DLM_SERVER_KEY="$SERVER_KEY"
+            export DLM_TASK_QUEUE="$TASK_QUEUE"
             nohup bash scripts/start-temporal-worker.sh > /var/log/dlm-worker.log 2>&1 &
             sleep 3
             if pgrep -f "dlm.temporal" > /dev/null; then
@@ -69,6 +94,21 @@ for key in $TARGETS; do
             fi
 REMOTE_SCRIPT
     fi
+done
+
+# Version manifest: md5 of the files that matter, per worker vs S1
+echo ""
+echo "[$(date)] Version manifest (md5 of key files):"
+MANIFEST_FILES="dlm/temporal/activities.py dlm/temporal/workflows.py dlm/web/reconciler.py dlm/web/routes/queue.py"
+local_md5=$(cd "$REPO_DIR" && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1)
+echo "  S1 (reference): $local_md5"
+for key in $TARGETS; do
+    ip="${WORKERS[$key]:-$CUSTOM_IP}"
+    [ -z "$ip" ] && continue
+    remote_md5=$(ssh "root@$ip" "cd $REMOTE_DIR && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1" 2>/dev/null || echo "UNREACHABLE")
+    status="OK"
+    [ "$remote_md5" != "$local_md5" ] && status="MISMATCH"
+    echo "  $key: $remote_md5 [$status]"
 done
 
 echo "[$(date)] Deploy complete."
