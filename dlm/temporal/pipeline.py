@@ -415,8 +415,28 @@ class PipelineEngine:
                         "phase": "upload",
                     })
 
+    def _staging_bytes(self) -> int:
+        """Current on-disk size of the staging dir (in-flight download progress)."""
+        total = 0
+        try:
+            for root, _dirs, files in os.walk(self.staging_dir):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        return total
+
     async def _speed_reporter(self):
-        """Periodically report speed and progress until pipeline is done."""
+        """Periodically report speed and progress until pipeline is done.
+
+        Speed is measured from DOWNLOAD activity (staging growth + uploads),
+        not uploads alone — with multi-GB files nothing uploads for a long
+        time and an upload-only metric shows a false 0 while the network
+        is saturated.
+        """
         last_bytes = 0
         last_time = time.time()
         while self.stats.phase != "done":
@@ -424,10 +444,13 @@ class PipelineEngine:
             now = time.time()
             elapsed = now - last_time
             if elapsed > 0:
-                delta_bytes = self.stats.uploaded_bytes - last_bytes
+                # uploaded bytes leave staging as batches complete, so the sum
+                # of both is monotonic download progress
+                progress_bytes = self.stats.uploaded_bytes + self._staging_bytes()
+                delta_bytes = max(0, progress_bytes - last_bytes)
                 speed_bps = delta_bytes / elapsed
                 self.stats.speed_mbps = speed_bps * 8 / 1_000_000
-                last_bytes = self.stats.uploaded_bytes
+                last_bytes = progress_bytes
                 last_time = now
 
                 self.heartbeat_fn(f"downloading {self.stats.speed_mbps:.0f}Mbps")
