@@ -28,7 +28,7 @@ async def reconcile() -> dict:
     """
     from ..queue.snapshot import (
         get_tasks_by_status, update_task_progress, get_shards_by_task,
-        complete_task, init_db,
+        complete_task, init_db, _conn,
     )
     from .temporal_client import get_client, start_sharded_download
 
@@ -123,6 +123,14 @@ async def reconcile() -> dict:
                 try:
                     # Unified sharded path — the legacy DownloadDatasetWorkflow
                     # has no BOS resume filter and must not be reachable here.
+                    # Refresh claimed_at so the listing-phase source guard
+                    # covers this coordinator too.
+                    conn2 = _conn()
+                    conn2.execute(
+                        "UPDATE tasks SET claimed_at = ? WHERE id = ?",
+                        (time.time(), task_id),
+                    )
+                    conn2.commit()
                     await start_sharded_download(task)
                     report["redispatched"].append(task.get("name", task_id))
                     logger.info(
