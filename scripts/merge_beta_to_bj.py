@@ -95,21 +95,31 @@ def list_modelscope(repo_id):
     return out
 
 
-def multipart_copy(client, src_key, dst_key, size):
+def multipart_copy(client, src_key, dst_key, size, part_workers=8):
+    """Server-side multipart copy with concurrent part copies."""
+    from concurrent.futures import ThreadPoolExecutor
+
     upload_id = client.initiate_multipart_upload(BUCKET, dst_key).upload_id
     try:
-        parts = []
+        ranges = []
         offset = 0
         part_number = 1
         while offset < size:
-            part_size = min(PART_SIZE, size - offset)
+            ranges.append((part_number, min(PART_SIZE, size - offset), offset))
+            offset += min(PART_SIZE, size - offset)
+            part_number += 1
+
+        def copy_part(args):
+            pn, psize, poff = args
             resp = client.upload_part_copy(
                 BUCKET, src_key, BUCKET, dst_key,
-                upload_id, part_number, part_size, offset,
+                upload_id, pn, psize, poff,
             )
-            parts.append({"partNumber": part_number, "eTag": resp.etag})
-            offset += part_size
-            part_number += 1
+            return {"partNumber": pn, "eTag": resp.etag}
+
+        with ThreadPoolExecutor(max_workers=part_workers) as pool:
+            parts = list(pool.map(copy_part, ranges))
+        parts.sort(key=lambda p: p["partNumber"])
         client.complete_multipart_upload(BUCKET, dst_key, upload_id, parts)
     except Exception:
         try:
@@ -196,22 +206,40 @@ def main():
         return
 
     print("\n=== Copying ===")
-    done_bytes = 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    done_bytes = [0]
+    done_count = [0]
     failures = []
-    for i, (rel, size) in enumerate(will_copy, 1):
+    lock = threading.Lock()
+
+    def copy_one(item):
+        rel, size = item
         src_key = SRC_PREFIX + rel
         dst_key = DST_PREFIX + rel
-        try:
-            if size > COPY_OBJECT_LIMIT:
-                multipart_copy(client, src_key, dst_key, size)
-            else:
-                client.copy_object(BUCKET, src_key, BUCKET, dst_key)
-            done_bytes += size
-            print(f"[{i}/{len(will_copy)}] {rel} ({size / 1024**3:.1f} GB) "
-                  f"— {done_bytes / 1024**4:.2f} TB done", flush=True)
-        except Exception as e:
-            failures.append(rel)
-            print(f"[{i}/{len(will_copy)}] FAILED {rel}: {e}", flush=True)
+        if size > COPY_OBJECT_LIMIT:
+            multipart_copy(client, src_key, dst_key, size)
+        else:
+            client.copy_object(BUCKET, src_key, BUCKET, dst_key)
+        return rel, size
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(copy_one, item): item for item in will_copy}
+        for fut in as_completed(futures):
+            rel, size = futures[fut]
+            with lock:
+                done_count[0] += 1
+                n = done_count[0]
+            try:
+                fut.result()
+                with lock:
+                    done_bytes[0] += size
+                print(f"[{n}/{len(will_copy)}] {rel} ({size / 1024**3:.1f} GB) "
+                      f"— {done_bytes[0] / 1024**4:.2f} TB done", flush=True)
+            except Exception as e:
+                failures.append(rel)
+                print(f"[{n}/{len(will_copy)}] FAILED {rel}: {e}", flush=True)
 
     print("\nVerifying ...")
     dst_after = list_objects(client, DST_PREFIX)
