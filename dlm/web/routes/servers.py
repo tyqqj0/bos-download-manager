@@ -133,11 +133,18 @@ async def cleanup_server_staging(key: str):
 async def task_progress(body: dict):
     """Receive real-time task progress from workers."""
     def _do():
-        from ...queue.snapshot import init_db, update_task_progress
+        from ...queue.snapshot import init_db, update_task_progress, get_task
         init_db()
         task_id = body.get("task_id")
         if not task_id:
             return {"error": "task_id required"}
+        # Terminal/operator states are durable: a progress report from a dying
+        # or stale workflow must NOT resurrect a paused/revoked task — that
+        # resurrection path made the reconciler re-dispatch tasks an operator
+        # had explicitly stopped (2026-07-31 incident).
+        task = get_task(task_id)
+        if task and task.get("status") in ("paused", "preempted", "revoked", "skipped", "failed", "done"):
+            return {"ok": True, "ignored": f"task is {task['status']}"}
         kwargs = {}
         for key in ("status", "speed_mbps", "progress_pct", "downloaded_gb", "server", "phase"):
             if key in body:
