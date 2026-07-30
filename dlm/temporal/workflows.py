@@ -413,7 +413,7 @@ class ShardWorkerWorkflow:
             return ShardResult(shard_id=shard_id, status="failed", error="disk_full")
 
         # Load progress for resume
-        shard_task = TaskInput(id=shard_input.task_id, name=shard_name)
+        shard_task = TaskInput(id=shard_input.task_id, name=shard_name, repo_id=shard_input.repo_id)
         completed = await workflow.execute_activity(
             "load_progress",
             args=[shard_task],
@@ -474,7 +474,7 @@ class ShardWorkerWorkflow:
 
                 result = await workflow.execute_activity(
                     "run_pipeline_batch",
-                    args=[task_for_pipeline, shard_input.filelist_path,
+                    args=[task_for_pipeline, local_filelist,
                           start_idx, current_batch_size, uploaded_bytes, total_bytes],
                     start_to_close_timeout=timedelta(days=7),
                     heartbeat_timeout=timedelta(minutes=10),

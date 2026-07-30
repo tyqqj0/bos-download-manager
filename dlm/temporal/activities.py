@@ -433,7 +433,7 @@ async def download_shard_filelist(filelist_key: str, staging_dir: str) -> str:
     local_path = sdir / f".filelist-{Path(filelist_key).stem}.json"
 
     response = bos.get_object(META_BUCKET, filelist_key)
-    local_path.write_bytes(response.data)
+    local_path.write_bytes(response.data.read())
 
     return str(local_path)
 
