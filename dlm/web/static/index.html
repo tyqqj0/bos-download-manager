@@ -118,15 +118,29 @@
                     <div class="bg-gray-800 rounded-lg p-3 border border-gray-700 border-l-4 border-l-blue-500">
                         <div class="flex items-center justify-between mb-2">
                             <div class="flex items-center gap-3">
-                                <span class="text-xs font-mono bg-gray-700 px-1.5 py-0.5 rounded text-gray-300" x-text="dl.server || '?'"></span>
+                                <template x-if="!dl.shard_servers || dl.shard_servers.length <= 1">
+                                    <span class="text-xs font-mono bg-gray-700 px-1.5 py-0.5 rounded text-gray-300" x-text="dl.server || '?'"></span>
+                                </template>
+                                <template x-if="dl.shard_servers && dl.shard_servers.length > 1">
+                                    <span class="text-xs font-mono bg-indigo-900/60 px-1.5 py-0.5 rounded text-indigo-300"
+                                          x-text="dl.shard_servers.map(s => s.server).join(',') + ` (${dl.total_shards} shards)`"></span>
+                                </template>
                                 <span class="font-medium text-sm text-gray-100" x-text="dl.name"></span>
-                                <span class="text-xs text-gray-500 bg-gray-700/50 px-1.5 py-0.5 rounded" x-text="dl.phase || 'downloading'" x-show="dl.phase"></span>
+                                <span class="text-xs text-gray-500 bg-gray-700/50 px-1.5 py-0.5 rounded" x-text="dl.phase || 'downloading'" x-show="dl.phase && !(dl.shard_servers && dl.shard_servers.length > 1)"></span>
                             </div>
                             <div class="flex items-center gap-4 text-xs">
                                 <span class="font-mono text-blue-300" x-text="'↓' + formatSpeed(dl.speed_mbps)"></span>
                                 <span class="font-mono text-green-300" x-show="dl.upload_speed_mbps > 0" x-text="'↑' + formatSpeed(dl.upload_speed_mbps)"></span>
                                 <span class="text-gray-400" x-text="dl.eta_seconds ? `ETA ${formatEta(dl.eta_seconds)}` : ''"></span>
                             </div>
+                        </div>
+                        <!-- Per-shard speed breakdown (only for multi-shard) -->
+                        <div x-show="dl.shard_servers && dl.shard_servers.length > 1" class="flex flex-wrap gap-1.5 mb-2">
+                            <template x-for="ss in (dl.shard_servers || [])" :key="ss.server">
+                                <span class="text-xs font-mono px-1.5 py-0.5 rounded"
+                                      :class="ss.speed_mbps > 0 ? 'bg-blue-900/40 text-blue-300' : 'bg-gray-700/50 text-gray-500'"
+                                      x-text="`${ss.server}: ${ss.speed_mbps > 0 ? formatSpeed(ss.speed_mbps) : ss.done_pct + '%'}`"></span>
+                            </template>
                         </div>
                         <div class="flex items-center gap-3">
                             <div class="flex-1 bg-gray-700 rounded-full h-2">

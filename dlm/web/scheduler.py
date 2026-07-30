@@ -34,6 +34,14 @@ def _build_dashboard() -> dict:
             dl["speed_mbps"] = round(speed, 1)
             dl["progress_pct"] = round(done_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0
             dl["downloaded_gb"] = round(done_bytes / (1024 ** 3), 2)
+            dl["size_gb"] = round(total_bytes / (1024 ** 3), 2)
+            dl["total_shards"] = len(shards)
+            dl["done_shards"] = sum(1 for s in shards if s.get("status") == "done")
+            dl["shard_servers"] = [
+                {"server": s.get("server", "?"), "speed_mbps": round(s.get("speed_mbps", 0), 1),
+                 "done_pct": round(s.get("done_bytes", 0) / s.get("total_bytes", 1) * 100, 1) if s.get("total_bytes") else 0}
+                for s in shards
+            ]
     # Recalc aggregate speed from corrected values
     summary["aggregate_speed_mbps"] = round(
         sum(dl.get("speed_mbps", 0) for dl in summary.get("active_downloads", [])), 1)

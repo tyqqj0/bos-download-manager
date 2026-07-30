@@ -1,230 +1,132 @@
-"""dlm ls — List tasks."""
+"""dlm ls — List tasks via the web API."""
 
 import click
 
-from ..core.state import StateManager
-from ..constants import STATUSES, CATEGORIES
 
 SORT_KEYS = ["name", "status", "server", "size", "category"]
 
 
 @click.command("ls")
-@click.option("--status", type=click.Choice(STATUSES), default=None, help="按状态筛选")
+@click.option("--status", default=None, help="按状态筛选 (downloading/queued/done/failed)")
 @click.option("--server", default=None, help="按服务器筛选")
-@click.option("--category", type=click.Choice(CATEGORIES), default=None, help="按分类筛选")
-@click.option("--priority", default=None, help="按优先级筛选")
-@click.option("--sort", "sort_by", type=click.Choice(SORT_KEYS), default="name", help="排序字段")
+@click.option("--category", default=None, help="按分类筛选")
+@click.option("--sort", "sort_by", type=click.Choice(SORT_KEYS), default="status", help="排序字段")
 @click.option("--reverse", "reverse_sort", is_flag=True, help="倒序排列")
-@click.option("--size", "check_size", is_flag=True, help="实时查询 BOS 获取真实下载大小")
-@click.option("--refresh", "refresh_total", is_flag=True, help="强制刷新所有 HF 总大小（含已有值的）")
-@click.option("--live", "live_mode", is_flag=True, help="只显示活跃任务 + 实时进度/速度（快速，不调外部API）")
-@click.option("--all", "show_all", is_flag=True, help="包含 skipped/needs-auth")
-@click.option("--format", "fmt", type=click.Choice(["table", "json", "csv"]), default="table")
-def ls_cmd(status, server, category, priority, sort_by, reverse_sort, check_size, refresh_total, live_mode, show_all, fmt):
+@click.option("--live", "live_mode", is_flag=True, help="只显示活跃任务 + 实时进度/速度")
+@click.option("--all", "show_all", is_flag=True, help="包含 skipped")
+@click.option("--format", "fmt", type=click.Choice(["table", "json"]), default="table")
+def ls_cmd(status, server, category, sort_by, reverse_sort, live_mode, show_all, fmt):
     """列出下载任务。"""
-    mgr = StateManager.create()
-    state = mgr.load(use_cache=not live_mode)
+    from ._api import get
 
-    # Live mode: show only active tasks with progress/speed
+    try:
+        params = {"sort": sort_by, "reverse": reverse_sort}
+        if status:
+            params["status"] = status
+        if server:
+            params["server"] = server
+        if category:
+            params["category"] = category
+        data = get("/api/tasks", **params)
+    except Exception as e:
+        click.echo(f"✗ API 错误: {e}")
+        raise SystemExit(1)
+
+    tasks = data.get("tasks", [])
+
     if live_mode:
-        _print_live(state)
-        return
-
-    # Real-time size check via BOS API
-    if check_size or refresh_total:
-        click.echo("正在查询真实大小...")
-        from ..core.size import fetch_sizes, fetch_hf_total_sizes
-        from ..core.config import load_config
-        from ..core.bos import create_bos_client
-
-        config = load_config()
-        bos = create_bos_client(config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"])
-
-        # Downloaded sizes from BOS
-        sizes = fetch_sizes(bos, state.tasks, verbose=True)
-        updated = 0
-        for task in state.tasks:
-            if task.id in sizes:
-                task.downloaded_gb = sizes[task.id]
-                updated += 1
-
-        # Total sizes from HuggingFace
-        hf_token = config.get("HF_TOKEN", "")
-        hf_sizes = fetch_hf_total_sizes(state.tasks, hf_token=hf_token or None, force=refresh_total)
-        hf_updated = 0
-        for task in state.tasks:
-            if task.id in hf_sizes and hf_sizes[task.id] > 0:
-                task.size_gb = hf_sizes[task.id]
-                hf_updated += 1
-
-        if updated or hf_updated:
-            mgr.save(state)
-            click.echo(f"已更新: {updated} 个下载大小, {hf_updated} 个总大小\n")
-
-    tasks = state.tasks
-
-    # Filters
-    if status:
-        tasks = [t for t in tasks if t.status == status]
+        tasks = [t for t in tasks if t["status"] in ("downloading",)]
     elif not show_all:
-        tasks = [t for t in tasks if t.status not in ("skipped", "needs-auth")]
-    if server:
-        tasks = [t for t in tasks if t.server == server]
-    if category:
-        tasks = [t for t in tasks if t.category == category]
-    if priority:
-        tasks = [t for t in tasks if t.priority == priority]
+        tasks = [t for t in tasks if t["status"] not in ("skipped",)]
 
     if not tasks:
         click.echo("无匹配任务。")
         return
 
-    # Sort
-    tasks = _sort_tasks(tasks, sort_by, reverse_sort)
-
     if fmt == "json":
         import json
-        from dataclasses import asdict
-        click.echo(json.dumps([asdict(t) for t in tasks], ensure_ascii=False, indent=2))
+        click.echo(json.dumps(tasks, ensure_ascii=False, indent=2))
         return
 
-    if fmt == "csv":
-        click.echo("id,name,repo_id,source,category,size_gb,downloaded_gb,status,server,priority")
-        for t in tasks:
-            click.echo(f"{t.id},{t.name},{t.repo_id},{t.source},{t.category},{t.size_gb},{t.downloaded_gb},{t.status},{t.server or '-'},{t.priority}")
-        return
-
-    # Table format
-    _print_table(tasks)
-
-
-STATUS_ORDER = {"downloading": 0, "dispatched": 1, "queued": 2, "failed": 3, "done": 4, "skipped": 5, "needs-auth": 6}
-
-
-def _sort_tasks(tasks, sort_by, reverse):
-    """Sort tasks by the given key."""
-    if sort_by == "name":
-        key = lambda t: t.name.lower()
-    elif sort_by == "status":
-        key = lambda t: STATUS_ORDER.get(t.status, 9)
-    elif sort_by == "server":
-        key = lambda t: (t.server or "ZZZ")
-    elif sort_by == "size":
-        key = lambda t: t.size_gb
-        reverse = not reverse
-    elif sort_by == "category":
-        key = lambda t: t.category
+    if live_mode:
+        _print_live(tasks)
     else:
-        key = lambda t: t.name.lower()
-    return sorted(tasks, key=key, reverse=reverse)
+        _print_table(tasks)
 
 
-def _format_size(task) -> str:
-    """Format size column: always show downloaded/total when possible."""
-    dl = _human_size(task.downloaded_gb) if task.downloaded_gb > 0 else "0"
-    if task.status == "done":
-        if task.downloaded_gb > 0:
-            return _human_size(task.downloaded_gb)
-        if task.size_gb > 0:
-            return _human_size(task.size_gb)
-        return "-"
-    if task.size_gb > 0:
-        total = _human_size(task.size_gb)
-        return f"{dl}/{total}"
-    if task.downloaded_gb > 0:
-        return f"{dl}/?"
+def _print_table(tasks):
+    sym = {
+        "done": "✓", "downloading": "↓", "dispatched": "→",
+        "queued": "○", "failed": "✗", "skipped": "⏸",
+        "paused": "⏸", "preempted": "⏪",
+    }
+    header = f"{'名称':<30} {'状态':<3} {'服务器':<6} {'大小':<14} {'速度':<10} {'分片':<8}"
+    click.echo(header)
+    click.echo("─" * 75)
+
+    for t in tasks:
+        s = sym.get(t["status"], "?")
+        name = t["name"][:28] if len(t["name"]) > 28 else t["name"]
+        srv = t.get("server") or "-"
+        size_str = _format_size(t)
+        speed = ""
+        if t["status"] == "downloading" and t.get("speed_mbps", 0) > 0:
+            speed = f"{t['speed_mbps']:.1f}MB/s"
+        shards = ""
+        ts = t.get("total_shards", 0)
+        ds = t.get("done_shards", 0)
+        if ts and ts > 1:
+            shards = f"{ds}/{ts}"
+        click.echo(f"{name:<30} {s:<3} {srv:<6} {size_str:<14} {speed:<10} {shards:<8}")
+
+    click.echo("")
+    total = len(tasks)
+    by_status = {}
+    for t in tasks:
+        by_status[t["status"]] = by_status.get(t["status"], 0) + 1
+    parts = [f"{v} {k}" for k, v in sorted(by_status.items())]
+    click.echo(f"共 {total} 个任务: {', '.join(parts)}")
+
+
+def _print_live(tasks):
+    if not tasks:
+        click.echo("无活跃下载。")
+        return
+
+    click.echo(f"{'服务器':<6} {'名称':<30} {'进度':<7} {'速度':<12} {'大小':<14} {'分片':<8}")
+    click.echo("─" * 80)
+
+    for t in tasks:
+        name = t["name"][:28] if len(t["name"]) > 28 else t["name"]
+        srv = t.get("server") or "-"
+        pct = f"{t.get('progress_pct', 0):.0f}%" if t.get("progress_pct") else "-"
+        speed = f"{t['speed_mbps']:.1f}MB/s" if t.get("speed_mbps", 0) > 0 else "-"
+        size_str = _format_size(t)
+        ts = t.get("total_shards", 0)
+        ds = t.get("done_shards", 0)
+        shards = f"{ds}/{ts}" if ts and ts > 1 else ""
+        click.echo(f"{srv:<6} {name:<30} {pct:<7} {speed:<12} {size_str:<14} {shards:<8}")
+
+    click.echo("")
+    total_speed = sum(t.get("speed_mbps", 0) for t in tasks)
+    click.echo(f"{len(tasks)} 个任务下载中, 总速度: {total_speed:.1f} MB/s")
+
+
+def _format_size(t):
+    dl = t.get("downloaded_gb", 0) or 0
+    total = t.get("size_gb", 0) or 0
+    if t["status"] == "done":
+        return _human(dl) if dl > 0 else (_human(total) if total > 0 else "-")
+    if total > 0:
+        return f"{_human(dl)}/{_human(total)}"
+    if dl > 0:
+        return f"{_human(dl)}/?"
     return "-"
 
 
-def _human_size(gb: float) -> str:
-    """Format GB value concisely."""
+def _human(gb):
     if gb >= 1000:
         return f"{gb / 1000:.1f}T"
     if gb >= 10:
         return f"{gb:.0f}G"
     return f"{gb:.1f}G"
-
-
-def _print_table(tasks):
-    """Print tasks as a formatted table."""
-    sym = {
-        "done": "✓", "downloading": "↓", "dispatched": "→",
-        "queued": "○", "failed": "✗", "skipped": "⏸", "needs-auth": "🔒",
-    }
-
-    header = f"{'ID':<16} {'名称':<24} {'状态':<5} {'服务器':<4} {'大小':<12} {'分类':<12} {'来源':<4}"
-    click.echo(header)
-    click.echo("─" * len(header))
-
-    for t in tasks:
-        s = sym.get(t.status, "?")
-        size_str = _format_size(t)
-        name_display = t.name[:22] if len(t.name) > 22 else t.name
-        click.echo(
-            f"{t.id:<16} {name_display:<24} {s:<5} {t.server or '-':<4} {size_str:<12} {t.category:<12} {t.source:<4}"
-        )
-
-    click.echo("")
-    # Summary
-    total = len(tasks)
-    by_status = {}
-    for t in tasks:
-        by_status[t.status] = by_status.get(t.status, 0) + 1
-    parts = [f"{v} {k}" for k, v in sorted(by_status.items())]
-    click.echo(f"共 {total} 个任务: {', '.join(parts)}")
-
-    # Total size
-    total_dl = sum(t.downloaded_gb for t in tasks)
-    total_est = sum(t.size_gb for t in tasks)
-    if total_dl > 0:
-        click.echo(f"总量: {_human_size(total_dl)} 已下载 / {_human_size(total_est)} 预估")
-    else:
-        click.echo(f"总量: {_human_size(total_est)} 预估 (用 --size 获取真实大小)")
-
-    # Legend
-    click.echo(f"图例: ✓ done  ↓ downloading  → dispatched  ○ queued  ✗ failed")
-
-
-def _print_live(state):
-    """Show only active (downloading/dispatched) tasks with progress info."""
-    active = [t for t in state.tasks if t.status in ("downloading", "dispatched")]
-    if not active:
-        click.echo("无活跃任务。")
-        return
-
-    active.sort(key=lambda t: (0 if t.status == "downloading" else 1, t.server or ""))
-
-    click.echo(f"{'服务器':<5} {'名称':<28} {'状态':<5} {'进度':<7} {'速度':<10} {'ETA':<8}")
-    click.echo("─" * 70)
-
-    for t in active:
-        name = t.name[:26] if len(t.name) > 26 else t.name
-        svr = t.server or "-"
-
-        if t.status == "downloading":
-            pct = f"{t.progress_pct:.0f}%" if t.progress_pct > 0 else "-"
-            speed = f"{t.speed_mbps:.1f}MB/s" if t.speed_mbps > 0 else "-"
-            eta = _format_eta_short(t.eta_seconds)
-            phase = t.phase or ""
-            if phase == "moving":
-                pct = "上传中"
-                speed = ""
-                eta = ""
-            click.echo(f"{svr:<5} {name:<28} {'↓':<5} {pct:<7} {speed:<10} {eta:<8}")
-        else:
-            click.echo(f"{svr:<5} {name:<28} {'→':<5} {'等待':<7} {'':<10} {'':<8}")
-
-    click.echo("")
-    dl_count = sum(1 for t in active if t.status == "downloading")
-    disp_count = sum(1 for t in active if t.status == "dispatched")
-    click.echo(f"{dl_count} 下载中, {disp_count} 待执行")
-
-
-def _format_eta_short(seconds):
-    if not seconds or seconds <= 0:
-        return "-"
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}min"
-    return f"{seconds // 3600}h{(seconds % 3600) // 60}m"

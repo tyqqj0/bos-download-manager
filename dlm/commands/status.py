@@ -1,176 +1,108 @@
-"""dlm status — Cluster status from heartbeats (no SSH)."""
+"""dlm status — Cluster status from dashboard API."""
 
 import click
-from datetime import datetime, timezone
-
-from ..core.state import StateManager
+import time
 
 
 @click.command("status")
 @click.option("--json", "as_json", is_flag=True, help="JSON 输出")
 def status_cmd(as_json):
-    """显示所有 Worker 实时状态（从心跳读取，秒级响应）。"""
-    mgr = StateManager.create()
-    state = mgr.load(use_cache=False)
+    """显示集群状态和活跃下载。"""
+    from ._api import get
 
-    heartbeats = state.worker_heartbeats
-    downloading = [t for t in state.tasks if t.status == "downloading"]
+    try:
+        dashboard = get("/api/dashboard")
+    except Exception as e:
+        click.echo(f"✗ API 错误: {e}")
+        raise SystemExit(1)
 
     if as_json:
         import json
-        data = {
-            "heartbeats": heartbeats,
-            "downloading": [
-                {"id": t.id, "server": t.server, "name": t.name,
-                 "progress_pct": t.progress_pct, "speed_mbps": t.speed_mbps,
-                 "eta_seconds": t.eta_seconds, "phase": t.phase}
-                for t in downloading
-            ],
-        }
-        click.echo(json.dumps(data, ensure_ascii=False, indent=2))
+        click.echo(json.dumps(dashboard, ensure_ascii=False, indent=2))
         return
 
-    now = datetime.now(timezone.utc)
-
-    click.echo("═" * 58)
+    click.echo("═" * 62)
     click.echo("  DLM Cluster Status")
-    click.echo("═" * 58)
+    click.echo("═" * 62)
 
-    if not heartbeats:
-        click.echo("\n  无 Worker 心跳。daemon 可能未启动。")
-        click.echo("  启动: ssh <server> 'python3 -m dlm.worker --server-key <key>'")
-        _print_summary(state)
-        return
+    # Summary
+    by_status = dashboard.get("by_status", {})
+    total = dashboard.get("total_tasks", 0)
+    dl_speed = dashboard.get("aggregate_download_speed_mbps", 0)
+    ul_speed = dashboard.get("aggregate_upload_speed_mbps", 0)
+    dl_tb = dashboard.get("total_downloaded_tb", 0)
+    est_tb = dashboard.get("total_estimated_tb", 0)
 
-    for key in sorted(heartbeats.keys()):
-        hb = heartbeats[key]
-        alive_at = hb.get("alive_at", "")
-        pid = hb.get("pid", "?")
-        disk_gb = hb.get("disk_free_gb", 0)
-        current_task = hb.get("current_task")
+    click.echo(f"\n  任务: {total} 总计 | {by_status.get('downloading', 0)} 下载中 | "
+               f"{by_status.get('pending', 0)} 排队 | {by_status.get('done', 0)} 完成 | "
+               f"{by_status.get('failed', 0)} 失败")
+    click.echo(f"  速度: ↓{dl_speed:.1f} MB/s  ↑{ul_speed:.1f} MB/s")
+    click.echo(f"  总量: {dl_tb:.1f}T / {est_tb:.1f}T")
 
-        # Determine alive status
-        icon, status_text = _alive_status(alive_at, now)
+    # Workers
+    workers = dashboard.get("workers", [])
+    now = time.time()
+    click.echo(f"\n{'─' * 62}")
+    click.echo("  Workers:")
 
-        click.echo(f"\n  {icon} {key} — {status_text}  (pid={pid}, disk={disk_gb:.0f}GB free)")
+    seen_keys = set()
+    for w in workers:
+        key = w.get("server_key", "?")
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        last_seen = w.get("last_seen") or 0
+        age = now - last_seen
+        disk = w.get("disk_free_gb", 0)
 
-        # Show current task with progress
-        task_info = next((t for t in downloading if t.server == key), None)
-        if task_info:
-            name = task_info.name[:30]
-            pct = task_info.progress_pct
-            speed = task_info.speed_mbps
-            eta = task_info.eta_seconds
-            phase = task_info.phase or "downloading"
-
-            progress_bar = _bar(min(pct, 100))
-            speed_str = f"{speed:.1f} MB/s" if speed > 0 else ""
-            eta_str = _format_eta(eta) if eta else ""
-
-            click.echo(f"    ↓ {name}")
-            if phase == "moving":
-                click.echo(f"      上传到 BOS 中...  {speed_str}")
-            else:
-                click.echo(f"      {progress_bar} {pct:.0f}%  {speed_str}  {eta_str}")
-                if phase and phase not in ("downloading", "starting"):
-                    click.echo(f"      阶段: {phase}")
-        elif current_task:
-            click.echo(f"    任务: {current_task} (等待状态更新)")
+        if age < 180:
+            icon, status = "●", "活跃"
+        elif age < 600:
+            icon, status = "◐", f"延迟 ({int(age)}s)"
         else:
-            click.echo(f"    空闲")
+            icon, status = "○", f"离线 ({int(age/60)}min)"
 
-    _print_summary(state)
+        click.echo(f"    {icon} {key:<5} {status:<16} disk={disk:.0f}GB free")
+
+    # Active downloads
+    active = dashboard.get("active_downloads", [])
+    if active:
+        click.echo(f"\n{'─' * 62}")
+        click.echo("  Active Downloads:")
+        for dl in active:
+            name = dl.get("name", "?")[:35]
+            srv = dl.get("server", "?")
+            speed = dl.get("speed_mbps", 0)
+            pct = dl.get("progress_pct", 0)
+            phase = dl.get("phase", "")
+            shards = dl.get("shard_servers", [])
+
+            speed_str = f"{speed:.1f}MB/s" if speed > 0 else "-"
+            bar = _bar(pct)
+
+            if shards and len(shards) > 1:
+                shard_str = ", ".join(s["server"] for s in shards)
+                click.echo(f"    ↓ {name}")
+                click.echo(f"      [{shard_str}] ({len(shards)} shards)")
+                click.echo(f"      {bar} {pct:.0f}%  {speed_str}")
+                for s in shards:
+                    ss = f"{s.get('speed_mbps',0):.1f}MB/s" if s.get("speed_mbps", 0) > 0 else f"{s.get('done_pct',0):.0f}%"
+                    click.echo(f"        {s['server']}: {ss}")
+            else:
+                click.echo(f"    ↓ {name} @ {srv}")
+                click.echo(f"      {bar} {pct:.0f}%  {speed_str}  {phase}")
+
+    # Alerts
+    alerts = dashboard.get("alerts", [])
+    if alerts:
+        click.echo(f"\n{'─' * 62}")
+        click.echo("  告警:")
+        for a in alerts:
+            sev = "!!" if a.get("severity") == "critical" else "⚠"
+            click.echo(f"    {sev} {a.get('message', '')}")
 
 
-def _alive_status(alive_at: str, now: datetime) -> tuple:
-    """Return (icon, text) based on heartbeat age."""
-    if not alive_at:
-        return "○", "未知"
-    try:
-        ts = datetime.fromisoformat(alive_at)
-        age_s = (now - ts).total_seconds()
-    except (ValueError, TypeError):
-        return "○", "未知"
-
-    if age_s < 180:
-        return "●", f"活跃 ({int(age_s)}s ago)"
-    elif age_s < 300:
-        return "◐", f"延迟 ({int(age_s)}s ago)"
-    else:
-        mins = int(age_s / 60)
-        return "○", f"离线 ({mins}min ago)"
-
-
-def _bar(pct: float, width: int = 20) -> str:
-    """Simple progress bar."""
+def _bar(pct, width=20):
     pct = min(max(pct, 0), 100)
     filled = int(width * pct / 100)
     return f"[{'█' * filled}{'░' * (width - filled)}]"
-
-
-def _format_eta(seconds: int) -> str:
-    if seconds is None or seconds <= 0:
-        return ""
-    if seconds < 60:
-        return f"ETA {seconds}s"
-    if seconds < 3600:
-        return f"ETA {seconds // 60}min"
-    hours = seconds // 3600
-    mins = (seconds % 3600) // 60
-    return f"ETA {hours}h{mins}m"
-
-
-def _print_summary(state):
-    """Print task count summary."""
-    click.echo(f"\n{'─' * 58}")
-    by_status = {}
-    for t in state.tasks:
-        by_status[t.status] = by_status.get(t.status, 0) + 1
-    parts = [f"{v} {k}" for k, v in sorted(by_status.items(), key=lambda x: x[1], reverse=True)]
-    click.echo(f"  {len(state.tasks)} 个任务: {', '.join(parts)}")
-
-    # Alerts
-    now = datetime.now(timezone.utc)
-    alerts = _check_alerts(state, now)
-    if alerts:
-        click.echo(f"\n{'─' * 58}")
-        click.echo("  告警:")
-        for a in alerts:
-            click.echo(a)
-
-
-def _check_alerts(state, now):
-    """Detect conditions that need attention."""
-    alerts = []
-    heartbeats = state.worker_heartbeats
-
-    for key in sorted(heartbeats.keys()):
-        hb = heartbeats[key]
-        disk = hb.get("disk_free_gb", 999)
-        if disk < 5:
-            alerts.append(f"    !! {key}: 磁盘将满 ({disk:.0f}GB free)")
-        alive_at = hb.get("alive_at", "")
-        if alive_at:
-            try:
-                age = (now - datetime.fromisoformat(alive_at)).total_seconds()
-                if age > 300:
-                    alerts.append(f"    !! {key}: 离线 ({age/60:.0f}min 未响应)")
-            except (ValueError, TypeError):
-                pass
-
-    for t in state.tasks:
-        if t.status == "downloading" and t.worker_heartbeat:
-            try:
-                hb_age = (now - datetime.fromisoformat(t.worker_heartbeat)).total_seconds()
-                if hb_age > 3600:
-                    alerts.append(
-                        f"    !! {t.server}: {t.name[:20]} 可能卡住 ({hb_age/3600:.0f}h 无更新)"
-                    )
-            except (ValueError, TypeError):
-                pass
-
-    failed = [t for t in state.tasks if t.status == "failed"]
-    if failed:
-        alerts.append(f"    !! {len(failed)} 个任务失败")
-
-    return alerts
