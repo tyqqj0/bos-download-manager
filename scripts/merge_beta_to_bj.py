@@ -35,7 +35,6 @@ from dlm.core.config import load_config  # noqa: E402
 BUCKET = "auwomo-data"
 SRC_PREFIX = "manipulation/AgiBotWorld-Beta/"
 DST_PREFIX = "manipulation/AgiBotWorld-Beta-BJ/"
-MS_REPO = None  # resolved from --repo-id or the DLM task record
 
 # Conflicts where the BJ copy wins (verified 2026-07-31)
 CONFLICT_SKIP = {
@@ -193,6 +192,7 @@ def main():
 
     print("\n=== Copying ===")
     done_bytes = 0
+    failures = []
     for i, (rel, size) in enumerate(will_copy, 1):
         src_key = SRC_PREFIX + rel
         dst_key = DST_PREFIX + rel
@@ -205,6 +205,7 @@ def main():
             print(f"[{i}/{len(will_copy)}] {rel} ({size / 1024**3:.1f} GB) "
                   f"— {done_bytes / 1024**4:.2f} TB done", flush=True)
         except Exception as e:
+            failures.append(rel)
             print(f"[{i}/{len(will_copy)}] FAILED {rel}: {e}", flush=True)
 
     print("\nVerifying ...")
@@ -212,6 +213,12 @@ def main():
     print(f"  {DST_PREFIX}: {len(dst_after)} objects, "
           f"{sum(dst_after.values()) / 1024**4:.2f} TB "
           f"(was {len(dst)}, expected ≈ {len(dst) + len(will_copy)})")
+
+    if failures:
+        print(f"\nMERGE INCOMPLETE: {len(failures)} objects failed — re-run to retry (idempotent):")
+        for rel in failures[:20]:
+            print(f"  {rel}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

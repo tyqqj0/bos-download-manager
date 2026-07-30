@@ -40,10 +40,9 @@ app.conf.update(
         "queue_order_strategy": "priority",
     },
     task_routes={
-        "dlm.worker.download.download_dataset": {"queue": "downloads"},
         "dlm.transfer.tasks.transfer_to_juicefs": {"queue": "transfers"},
     },
 )
 
 app.autodiscover_tasks(["dlm.transfer"])
-app.conf.include = ["dlm.worker.download", "dlm.transfer.tasks"]
+app.conf.include = ["dlm.transfer.tasks"]

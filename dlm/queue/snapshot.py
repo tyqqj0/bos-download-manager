@@ -106,6 +106,7 @@ def init_db():
         ("shard_strategy", "TEXT", "'auto'"),
         ("resume_skipped_files", "INTEGER", "0"),
         ("resume_skipped_gb", "REAL", "0"),
+        ("claimed_at", "REAL", "0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")

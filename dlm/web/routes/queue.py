@@ -298,11 +298,13 @@ async def preempt_for_task(body: dict):
     #    servers per shard; a task-level claim would wrongly mark one worker
     #    busy in the idle query. target_server only influences victim choice.
     def do_claim():
+        now_ts = time.time()
         conn = snapshot._conn()
         conn.execute(
-            "UPDATE tasks SET status = 'downloading', server = NULL, priority = 0, updated_at = ? "
+            "UPDATE tasks SET status = 'downloading', server = NULL, priority = 0, "
+            "updated_at = ?, claimed_at = ? "
             "WHERE id = ?",
-            (time.time(), urgent_id),
+            (now_ts, now_ts, urgent_id),
         )
         conn.commit()
         return snapshot.get_task(urgent_id)
@@ -378,6 +380,10 @@ async def create_shards(body: dict):
 
     def do_create():
         snapshot.init_db()
+        # A re-dispatch may partition into FEWER shards (BOS filter shrinks the
+        # set) — stale rows from a prior run would pin servers busy forever and
+        # inflate total_shards, so clear them first.
+        snapshot.delete_shards_by_task(task_id)
         shard_ids = []
         for info in shard_infos:
             idx = info["shard_index"]
@@ -585,12 +591,18 @@ async def reshard_task(body: dict):
 
     def do_requeue():
         conn = snapshot._conn()
-        conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
-        conn.execute(
+        # Conditional on the status observed before termination: if
+        # auto_dispatch claimed a pending task during the terminate window,
+        # requeuing blindly would silently discard the new shard count.
+        cur = conn.execute(
             "UPDATE tasks SET status = 'pending', server = NULL, max_workers = ?, "
-            "speed_mbps = 0, updated_at = ? WHERE id = ?",
-            (shard_count, time.time(), task_id),
+            "speed_mbps = 0, updated_at = ? WHERE id = ? AND status = ?",
+            (shard_count, time.time(), task_id, task["status"]),
         )
+        if cur.rowcount == 0:
+            conn.commit()
+            return {"error": "task status changed during reshard — retry"}
+        conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
         conn.commit()
         return {
             "ok": True, "task_id": task_id, "shard_count": shard_count,

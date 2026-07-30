@@ -602,14 +602,23 @@ class ShardedDownloadWorkflow:
 
         # Step 1b: BOS-aware resume — drop files already uploaded (key + size
         # match under the task's target prefix). One paginated BOS list.
-        filter_result = await workflow.execute_activity(
-            "filter_filelist_against_bos",
-            args=[filelist_path, task_input],
-            task_queue=listing_queue,
-            start_to_close_timeout=timedelta(minutes=15),
-            heartbeat_timeout=timedelta(minutes=3),
-            retry_policy=ACTIVITY_RETRY,
-        )
+        try:
+            filter_result = await workflow.execute_activity(
+                "filter_filelist_against_bos",
+                args=[filelist_path, task_input],
+                task_queue=listing_queue,
+                start_to_close_timeout=timedelta(minutes=15),
+                heartbeat_timeout=timedelta(minutes=3),
+                retry_policy=ACTIVITY_RETRY,
+            )
+        except Exception as e:
+            error_msg = f"BOS resume filter failed: {str(e)[:400]}"
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_id, "failed", None, None, None, None, None, error_msg],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            return TaskResult(status="failed", error=error_msg)
         skipped_files = filter_result["skipped_files"]
         skipped_gb = filter_result["skipped_bytes"] / (1024 ** 3)
         total_files = filter_result["remaining_files"]
@@ -656,13 +665,22 @@ class ShardedDownloadWorkflow:
 
         # Step 4: Partition + upload filelists to BOS (always, even for 1 shard).
         # Pinned: reads the filtered filelist from the listing worker's disk.
-        raw_parts = await workflow.execute_activity(
-            "partition_files_greedy",
-            args=[filtered_path, num_shards, staging_dir],
-            task_queue=listing_queue,
-            start_to_close_timeout=timedelta(minutes=10),
-            retry_policy=ACTIVITY_RETRY,
-        )
+        try:
+            raw_parts = await workflow.execute_activity(
+                "partition_files_greedy",
+                args=[filtered_path, num_shards, staging_dir],
+                task_queue=listing_queue,
+                start_to_close_timeout=timedelta(minutes=10),
+                retry_policy=ACTIVITY_RETRY,
+            )
+        except Exception as e:
+            error_msg = f"Partition failed: {str(e)[:400]}"
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_id, "failed", None, None, None, None, None, error_msg],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            return TaskResult(status="failed", error=error_msg)
         partitions = [{**p, "shard_index": i} for i, p in enumerate(raw_parts)]
 
         # Step 5: Create shard rows in SQLite (via activity — R1)

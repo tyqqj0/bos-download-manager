@@ -171,7 +171,7 @@ async def auto_dispatch_pending() -> dict:
     from ..queue.snapshot import (
         get_tasks_by_status, get_workers, get_running_shards, _conn, init_db,
     )
-    from .temporal_client import get_client, start_download, start_sharded_download
+    from .temporal_client import get_client, start_sharded_download
 
     init_db()
     report = {"dispatched": [], "errors": []}
@@ -212,14 +212,16 @@ async def auto_dispatch_pending() -> dict:
         # 4. Coordinator-race guard: a downloading task with no shard rows means
         #    its sharded coordinator is still listing/filtering — its workers
         #    look idle but will be claimed shortly. Don't dispatch that source
-        #    until shards exist. Age cap: a coordinator dead >15min stops
-        #    blocking its source (reconcile() will clean it up).
+        #    until shards exist. Keyed on claimed_at (set once at claim time,
+        #    never refreshed by progress reports) so a legacy non-sharded task
+        #    can't pin its source forever; a dead coordinator stops blocking
+        #    after 15 min (reconcile() cleans it up).
         conn = _conn()
         listing_cutoff = time.time() - 900
         rows = conn.execute(
             "SELECT DISTINCT t.source FROM tasks t "
             "WHERE t.status = 'downloading' "
-            "AND (t.updated_at IS NULL OR t.updated_at > ?) "
+            "AND t.claimed_at > ? "
             "AND NOT EXISTS (SELECT 1 FROM shards s WHERE s.task_id = t.id)",
             (listing_cutoff,),
         ).fetchall()
@@ -262,19 +264,24 @@ async def auto_dispatch_pending() -> dict:
             # Optimistic lock: claim status only. server stays NULL — the
             # coordinator assigns servers per shard, and a task-level server
             # would count this worker as busy in its own idle query.
+            now_ts = time.time()
             cursor = conn.execute(
-                "UPDATE tasks SET status = 'downloading', server = NULL, updated_at = ? "
+                "UPDATE tasks SET status = 'downloading', server = NULL, "
+                "updated_at = ?, claimed_at = ? "
                 "WHERE id = ? AND status = 'pending'",
-                (time.time(), task["id"]),
+                (now_ts, now_ts, task["id"]),
             )
             conn.commit()
 
             if cursor.rowcount == 0:
                 continue  # someone else claimed it
 
+            # Guard the source immediately — even an "already started" race
+            # below must not let a second coordinator spawn this cycle
+            sources_in_listing.add(task.get("source", "hf"))
+
             try:
                 await start_sharded_download(task)
-                sources_in_listing.add(task.get("source", "hf"))
                 report["dispatched"].append({
                     "task": task.get("name", task["id"]),
                     "worker": "sharded",

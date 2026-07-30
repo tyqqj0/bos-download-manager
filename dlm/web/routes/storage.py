@@ -187,6 +187,7 @@ async def register_bos_data(body: dict):
             "category": category,
             "type": task_type,
             "priority": 5,
+            "max_workers": 0,
             "bos_path": f"{prefix}/",
             "size_gb": 0,
             "downloaded_gb": 0,

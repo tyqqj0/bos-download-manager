@@ -379,7 +379,17 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
         except Exception as e:
             logger.debug(f"Progress report failed: {e}")
 
-    engine = PipelineEngine(task_input, staging_dir, heartbeat_fn, progress_fn)
+    # Shard runs must upload to the TASK's flat BOS prefix, not a shard-N/
+    # subprefix — the pipeline derives the upload prefix from task.name, so
+    # hand it the base name while keeping staging shard-scoped for isolation.
+    # (A shard-N/ prefix would be invisible to the BOS resume filter and
+    # would scatter the dataset across per-shard subdirectories.)
+    import dataclasses
+    engine_task = (
+        dataclasses.replace(task_input, name=task_input.name.rsplit("/shard-", 1)[0])
+        if is_shard else task_input
+    )
+    engine = PipelineEngine(engine_task, staging_dir, heartbeat_fn, progress_fn)
     stats = await engine.run(files)
 
     if stats.failed_files > 0:
