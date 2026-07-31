@@ -437,16 +437,22 @@ class PipelineEngine:
         time and an upload-only metric shows a false 0 while the network
         is saturated.
         """
-        last_bytes = 0
+        # Seed the baseline from what is ALREADY on disk. A resumed batch starts
+        # with a full staging dir; measuring from 0 would report that entire
+        # backlog as one interval's traffic (observed: 12,977 Mbps spikes).
+        last_bytes = self.stats.uploaded_bytes + await asyncio.to_thread(self._staging_bytes)
         last_time = time.time()
         while self.stats.phase != "done":
             await asyncio.sleep(SPEED_REPORT_INTERVAL)
             now = time.time()
             elapsed = now - last_time
             if elapsed > 0:
-                # uploaded bytes leave staging as batches complete, so the sum
-                # of both is monotonic download progress
-                progress_bytes = self.stats.uploaded_bytes + self._staging_bytes()
+                # A file leaves staging exactly when it lands in uploaded_bytes,
+                # so the sum is monotonic download progress. Walked off-loop —
+                # a shard can hold 80k staged files.
+                progress_bytes = self.stats.uploaded_bytes + await asyncio.to_thread(
+                    self._staging_bytes
+                )
                 delta_bytes = max(0, progress_bytes - last_bytes)
                 speed_bps = delta_bytes / elapsed
                 self.stats.speed_mbps = speed_bps * 8 / 1_000_000

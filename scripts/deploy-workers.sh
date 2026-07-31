@@ -93,11 +93,23 @@ for key in $TARGETS; do
             export DLM_TASK_QUEUE="$TASK_QUEUE"
             nohup bash scripts/start-temporal-worker.sh > /var/log/dlm-worker.log 2>&1 &
             sleep 3
-            if pgrep -f "dlm.temporal" > /dev/null; then
+            if ps aux | grep -q "[p]ython3 -m dlm.temporal"; then
                 echo "      Worker $SERVER_KEY started successfully"
             else
                 echo "      ERROR: Worker $SERVER_KEY failed to start"
                 tail -5 /var/log/dlm-worker.log
+            fi
+
+            # Sidecar watchdog: independent of the worker, so it still reports
+            # when the worker hangs or dies silently. enable = survives reboot.
+            if [ -f /etc/systemd/system/dlm-sidecar@.service ]; then
+                systemctl enable --now "dlm-sidecar@$SERVER_KEY" 2>/dev/null
+                systemctl restart "dlm-sidecar@$SERVER_KEY" 2>/dev/null
+                if systemctl is-active --quiet "dlm-sidecar@$SERVER_KEY"; then
+                    echo "      Sidecar $SERVER_KEY active"
+                else
+                    echo "      WARN: sidecar $SERVER_KEY not active"
+                fi
             fi
 REMOTE_SCRIPT
     fi

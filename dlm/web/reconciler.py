@@ -336,7 +336,15 @@ async def detect_idle_workers() -> dict:
     try:
         workers = get_workers()
         now = time.time()
-        alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
+        # Keep only the freshest heartbeat row per server_key — auxiliary rows
+        # (e.g. a dead wN@sidecar) must not mask a live wN@temporal.
+        freshest = {}
+        for w in workers:
+            key = w.get("server_key", "")
+            if key and (key not in freshest
+                        or (w.get("last_seen") or 0) > (freshest[key].get("last_seen") or 0)):
+                freshest[key] = w
+        alive_workers = [w for w in freshest.values() if now - (w.get("last_seen") or 0) < 180]
 
         if not alive_workers:
             return report
@@ -380,6 +388,8 @@ async def detect_idle_workers() -> dict:
 
             queue_name = f"download-{key}"
             has_running_wf = bool(running_by_queue.get(queue_name))
+            # busy_servers already folds in running shard ownership, which is
+            # how a sharded task claims a worker (its task row has server=NULL)
             has_downloading_task = key in busy_servers
 
             if not has_running_wf and not has_downloading_task:
