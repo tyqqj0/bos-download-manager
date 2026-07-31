@@ -36,7 +36,14 @@ class _AccessDenied(Exception):
     pass
 
 
-DOWNLOAD_WORKERS = 4          # parallel file downloads (was 8, reduced to limit disk pressure)
+# Download concurrency adapts to file size. Big files saturate the link on
+# their own and more streams only add disk pressure; small files are pure
+# round-trip latency (HEAD + GET + CDN GET each), so throughput scales with
+# concurrency until the link fills.
+DOWNLOAD_WORKERS = 4          # large-file default; see _download_concurrency()
+DOWNLOAD_WORKERS_MAX = 32     # small-file ceiling
+SMALL_FILE_BYTES = 8 * 1024 ** 2    # <8MB mean → latency-bound, scale up
+LARGE_FILE_BYTES = 256 * 1024 ** 2  # >256MB mean → bandwidth-bound, stay low
 UPLOAD_CONCURRENCY = 8        # parallel BOS uploads (asyncio.Semaphore)
 DISK_FREE_MIN_PCT = 0.30      # keep 30% disk free (dynamic threshold)
 DISK_FREE_ABSOLUTE_MIN_GB = 20  # absolute minimum free space
@@ -50,6 +57,29 @@ SPEED_REPORT_INTERVAL = 15    # seconds between progress reports
 QUEUE_MAX_SIZE = 16           # max files buffered between download and upload
 MAX_PENDING_UPLOADS = UPLOAD_CONCURRENCY + 4  # max in-flight upload tasks before backpressure
 STAGING_PATH = Path("/data/staging")
+
+
+def _download_concurrency(files: list) -> int:
+    """Pick download parallelism from the batch's mean file size.
+
+    A 372k-file / 300KB-each dataset spent ~20h at 13 Mbps on 4 streams
+    because every file costs three round-trips to the CDN; the link was
+    nowhere near saturated.
+    """
+    if not files:
+        return DOWNLOAD_WORKERS
+    mean = sum(f.size for f in files) / len(files)
+    if mean >= LARGE_FILE_BYTES:
+        return DOWNLOAD_WORKERS
+    if mean <= SMALL_FILE_BYTES:
+        return DOWNLOAD_WORKERS_MAX
+    # Log-ish interpolation between the two anchors
+    span = LARGE_FILE_BYTES - SMALL_FILE_BYTES
+    ratio = 1 - (mean - SMALL_FILE_BYTES) / span
+    return max(
+        DOWNLOAD_WORKERS,
+        int(DOWNLOAD_WORKERS + (DOWNLOAD_WORKERS_MAX - DOWNLOAD_WORKERS) * ratio),
+    )
 
 
 def _disk_free_gb() -> float:
@@ -84,6 +114,7 @@ class PipelineEngine:
         self._bos_client = None
         self._bucket = ""
         self._prefix = ""
+        self._concurrency = DOWNLOAD_WORKERS  # set from batch contents in run()
 
     def _download_one_file(self, file_info: FileInfo, cancel_event: "threading.Event | None" = None) -> Optional[Path]:
         """Download a single file. Runs in thread pool.
@@ -183,7 +214,7 @@ class PipelineEngine:
         import threading
 
         loop = asyncio.get_running_loop()
-        sem = asyncio.Semaphore(DOWNLOAD_WORKERS)
+        sem = asyncio.Semaphore(self._concurrency)
 
         async def download_with_limit(file_info: FileInfo):
             async with sem:
@@ -507,8 +538,17 @@ class PipelineEngine:
             return self.stats
 
         self._init_bos_client()
-        self._executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
-        queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX_SIZE)
+        self._concurrency = _download_concurrency(files)
+        mean_mb = (self.stats.total_bytes / len(files)) / 1024 ** 2
+        logger.info(
+            "Pipeline: %d files, mean %.1f MB → %d download streams",
+            len(files), mean_mb, self._concurrency,
+        )
+        self.heartbeat_fn(
+            f"{len(files)} files, mean {mean_mb:.1f}MB, {self._concurrency} streams"
+        )
+        self._executor = ThreadPoolExecutor(max_workers=self._concurrency)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=max(QUEUE_MAX_SIZE, self._concurrency * 2))
 
         self.stats.phase = "downloading"
         try:

@@ -28,20 +28,11 @@ async def diagnose():
     from ...queue.snapshot import get_all_tasks, get_workers, init_db
     init_db()
 
-    tasks = get_all_tasks()
-    workers = get_workers()
-    now = time.time()
+    from ..fleet import dedupe_workers
 
-    # A worker may have several heartbeat rows (e.g. wN@temporal and a dead
-    # wN@sidecar) — judge liveness by the FRESHEST row per server_key, or
-    # stale auxiliary rows produce phantom "offline worker" alerts.
-    freshest = {}
-    for w in workers:
-        key = w.get("server_key", "")
-        if key and (key not in freshest
-                    or (w.get("last_seen") or 0) > (freshest[key].get("last_seen") or 0)):
-            freshest[key] = w
-    workers = list(freshest.values())
+    tasks = get_all_tasks()
+    workers = dedupe_workers(get_workers())
+    now = time.time()
 
     # 1. Offline workers
     offline_workers = []
@@ -140,45 +131,27 @@ async def diagnose():
     #    ownership is the primary signal; workflow task-queue membership is the
     #    fallback. Skipped entirely if the Temporal query failed, since without
     #    it every worker would look idle.
-    idle_workers = []
+    from ..fleet import idle_workers as compute_idle
     from ...queue.snapshot import get_running_shards
-    downloading_tasks = [t for t in tasks if t.get("status") == "downloading"]
-    busy_servers = {t.get("server") for t in downloading_tasks if t.get("server")}
-    busy_servers |= {s.get("server") for s in get_running_shards() if s.get("server")}
-    alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < WORKER_TIMEOUT]
-    idle_seen = set()
-    for w in alive_workers:
-        wkey = w.get("server_key", "")
-        if not wkey or wkey in idle_seen:
-            continue
-        idle_seen.add(wkey)
-        if wkey in busy_servers:
-            continue
-        if running_queues is None:
-            continue  # cannot tell without Temporal — don't cry wolf
-        if f"download-{wkey}" in running_queues:
-            continue
-        idle_workers.append({
-            "server_key": wkey,
-            "disk_free_gb": w.get("disk_free_gb"),
-            "message": "Online, holds no shard and no workflow — free for dispatch",
-        })
+
+    candidates = compute_idle(tasks, workers, get_running_shards(), now)
+    if running_queues is None:
+        candidates = []  # cannot tell without Temporal — don't cry wolf
+    else:
+        candidates = [
+            c for c in candidates
+            if f"download-{c['server_key']}" not in running_queues
+        ]
+    for c in candidates:
+        c["message"] = "Online, holds no shard and no workflow — free for dispatch"
 
     # 7. Get last reconciler + idle worker reports
     from ..cache import cache
     reconciler_report = cache.get("reconciler_report")
     idle_report = cache.get("idle_worker_report")
 
-    # An idle worker is only a PROBLEM when work is waiting for it: pending
-    # tasks of a source it can serve (modelscope→bj*, hf→w*). With an empty
-    # queue, idle is the correct resting state, not an incident.
-    pending_sources = {
-        (t.get("source") or "hf") for t in tasks if t.get("status") == "pending"
-    }
-    starved_idle = [
-        i for i in idle_workers
-        if ("modelscope" if i["server_key"].startswith("bj") else "hf") in pending_sources
-    ]
+    # Idle only counts as an ISSUE when work is queued for that worker's source.
+    starved_idle = [c for c in candidates if c["starved"]]
 
     total_issues = (
         len(offline_workers) + len(stuck) + len(failed_repeat)
@@ -193,7 +166,7 @@ async def diagnose():
         "orphaned_tasks": orphaned,
         "idle_workers": starved_idle,
         "idle_workers_no_pending_work": [
-            i["server_key"] for i in idle_workers if i not in starved_idle
+            c["server_key"] for c in candidates if not c["starved"]
         ],
         "disk_full": disk_full,
         "failed_repeat": failed_repeat,

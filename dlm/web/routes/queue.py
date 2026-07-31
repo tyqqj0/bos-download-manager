@@ -519,37 +519,29 @@ async def query_idle_workers_api(source: str = "hf", exclude_task: str = ""):
     """
     import time
 
+    from ..fleet import (
+        alive_workers, busy_servers, worker_serves, MIN_SHARD_DISK_GB,
+    )
+
     def do_query():
         snapshot.init_db()
         now = time.time()
-        workers = snapshot.get_workers()
-        alive = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
 
-        running = snapshot.get_running_shards()
-        busy_from_shards = {
-            s["server"] for s in running
-            if s.get("server") and s.get("task_id") != exclude_task
-        }
-        downloading = snapshot.get_tasks_by_status("downloading")
-        busy_from_tasks = {
-            t.get("server") for t in downloading
-            if t.get("server") and t.get("id") != exclude_task
-        }
-        busy = busy_from_shards | busy_from_tasks
+        # The dispatching task's own claim/shards must not count as busy
+        running = [s for s in snapshot.get_running_shards()
+                   if s.get("task_id") != exclude_task]
+        downloading = [t for t in snapshot.get_tasks_by_status("downloading")
+                       if t.get("id") != exclude_task]
+        busy = busy_servers(downloading, running)
 
-        seen = set()
         idle = []
-        for w in alive:
-            key = w.get("server_key", "")
-            if not key or key in seen or key in busy:
+        for w in alive_workers(snapshot.get_workers(), now):
+            key = w.get("server_key") or ""
+            if key in busy:
                 continue
-            seen.add(key)
-            if (w.get("disk_free_gb") or 0) < 70:
+            if (w.get("disk_free_gb") or 0) < MIN_SHARD_DISK_GB:
                 continue
-            is_bj = key.startswith("bj")
-            if source == "modelscope" and not is_bj:
-                continue
-            if source != "modelscope" and is_bj:
+            if not worker_serves(key, source):
                 continue
             idle.append(key)
         return {"workers": idle}

@@ -18,7 +18,7 @@ RECONCILE_INTERVAL = 300  # 5 minutes
 STALE_THRESHOLD = 600     # 10 minutes without update = suspicious
 DEAD_THRESHOLD = 1800     # 30 minutes without update = definitely dead
 SPEED_STALE_THRESHOLD = 300  # 5 minutes without update = zero out speed
-MIN_DISPATCH_DISK_GB = 70  # must exceed pipeline backpressure threshold (~60GB for 200GB disk)
+from .fleet import MIN_SHARD_DISK_GB as MIN_DISPATCH_DISK_GB  # single definition
 
 
 async def reconcile() -> dict:
@@ -185,29 +185,22 @@ async def auto_dispatch_pending() -> dict:
     report = {"dispatched": [], "errors": []}
 
     try:
-        # 1. Find alive workers
-        workers = get_workers()
+        # 1. Find alive workers (deduped by freshest heartbeat row)
+        from .fleet import (
+            alive_workers as compute_alive, busy_servers as compute_busy,
+            worker_serves,
+        )
+
         now = time.time()
-        alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
-        if not alive_workers:
+        alive = compute_alive(get_workers(), now)
+        if not alive:
             return report
 
-        # 2. Find busy workers — check BOTH tasks table AND shards table
+        # 2. Busy = holds a downloading task OR a running shard
         downloading = get_tasks_by_status("downloading")
-        busy_from_tasks = {t.get("server") for t in downloading if t.get("server")}
-        running_shards = get_running_shards()
-        busy_from_shards = {s.get("server") for s in running_shards if s.get("server")}
-        busy_servers = busy_from_tasks | busy_from_shards
+        busy = compute_busy(downloading, get_running_shards())
 
-        # Deduplicate by server_key (heartbeat can register multiple entries)
-        seen_keys = set()
-        idle_workers = []
-        for w in alive_workers:
-            key = w.get("server_key")
-            if key and key not in busy_servers and key not in seen_keys:
-                seen_keys.add(key)
-                idle_workers.append(w)
-
+        idle_workers = [w for w in alive if (w.get("server_key") or "") not in busy]
         if not idle_workers:
             return report
 
@@ -251,18 +244,14 @@ async def auto_dispatch_pending() -> dict:
                 )
                 continue
 
-            is_bj = server_key.startswith("bj")
-
             # Find first compatible task for this worker
             task = None
             for i, t in enumerate(pending):
                 source = t.get("source", "hf")
                 if source in sources_in_listing:
                     continue  # a coordinator for this source is still partitioning
-                if is_bj and source != "modelscope":
-                    continue  # BJ workers only handle ModelScope
-                if not is_bj and source == "modelscope":
-                    continue  # HK workers skip ModelScope (too slow)
+                if not worker_serves(server_key, source):
+                    continue  # ModelScope → bj*, everything else → w*
                 task = pending.pop(i)
                 break
 
@@ -334,26 +323,15 @@ async def detect_idle_workers() -> dict:
     report = {"idle_workers": [], "failed_splits": [], "errors": []}
 
     try:
-        workers = get_workers()
-        now = time.time()
-        # Keep only the freshest heartbeat row per server_key — auxiliary rows
-        # (e.g. a dead wN@sidecar) must not mask a live wN@temporal.
-        freshest = {}
-        for w in workers:
-            key = w.get("server_key", "")
-            if key and (key not in freshest
-                        or (w.get("last_seen") or 0) > (freshest[key].get("last_seen") or 0)):
-                freshest[key] = w
-        alive_workers = [w for w in freshest.values() if now - (w.get("last_seen") or 0) < 180]
+        from .fleet import alive_workers as compute_alive, busy_servers as compute_busy
 
+        now = time.time()
+        alive_workers = compute_alive(get_workers(), now)
         if not alive_workers:
             return report
 
         downloading = get_tasks_by_status("downloading")
-        busy_from_tasks = {t.get("server") for t in downloading if t.get("server")}
-        running_shards = get_running_shards()
-        busy_from_shards = {s.get("server") for s in running_shards if s.get("server")}
-        busy_servers = busy_from_tasks | busy_from_shards
+        busy_servers = compute_busy(downloading, get_running_shards())
 
         # Query Temporal for running workflows per task queue
         client = await get_client()

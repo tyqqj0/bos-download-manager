@@ -77,18 +77,10 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
     now = time.time()
     new_alerts: dict[str, dict] = {}
 
-    # A worker can have several heartbeat rows (wN@temporal + wN@sidecar).
-    # Judge liveness by the freshest row, or a stale auxiliary row reports a
-    # perfectly healthy worker as offline.
-    freshest: dict = {}
-    for w in workers:
-        key = w.get("server_key", "")
-        if key and (key not in freshest
-                    or (w.get("last_seen") or 0) > (freshest[key].get("last_seen") or 0)):
-            freshest[key] = w
-    workers = list(freshest.values())
+    from .fleet import dedupe_workers, alive_workers as compute_alive
 
-    alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
+    workers = dedupe_workers(workers)
+    alive_workers = compute_alive(workers, now)
     # Every worker counts for offline detection — bj nodes carry the ModelScope
     # half of the fleet and were previously exempt from these alerts.
     real_workers = list(workers)
@@ -176,46 +168,27 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 "message": f"Task {t.get('name', '')} failed {t.get('retry_count', 0)} times",
             }
 
-    # WARNING: Worker online, holds no work, AND work is waiting for it.
-    # A sharded task's row has server=NULL — the servers live on the shards, so
-    # shard ownership is what makes a worker busy. Without that, every worker
-    # running a shard looked idle. And with an empty queue, idle is the correct
-    # resting state, not an alert.
-    from ..queue.snapshot import get_running_shards
-    downloading_tasks = [t for t in tasks if t.get("status") == "downloading"]
-    busy_servers = {t.get("server") for t in downloading_tasks if t.get("server")}
+    # WARNING: worker holds no work while work is queued for its source.
+    # Idle with an empty queue is the correct resting state, not an alert.
     try:
-        busy_servers |= {s.get("server") for s in get_running_shards() if s.get("server")}
-    except Exception:
-        busy_servers = None  # cannot tell — stay silent rather than cry wolf
+        from ..queue.snapshot import get_running_shards
+        from .fleet import idle_workers as compute_idle
 
-    pending_sources = {
-        (t.get("source") or "hf") for t in tasks if t.get("status") == "pending"
-    }
-
-    if busy_servers is not None:
-        idle_seen = set()
-        for w in alive_workers:
-            wkey = w.get("server_key", "")
-            if not wkey or wkey in idle_seen:
+        for c in compute_idle(tasks, workers, get_running_shards(), now):
+            if not c["starved"]:
                 continue
-            idle_seen.add(wkey)
-            if wkey in busy_servers:
-                continue
-            source_for_worker = "modelscope" if wkey.startswith("bj") else "hf"
-            if source_for_worker not in pending_sources:
-                continue  # nothing queued it could take — resting normally
-            key = f"idle_worker:{wkey}"
-            new_alerts[key] = {
+            new_alerts[f"idle_worker:{c['server_key']}"] = {
                 "severity": WARNING,
                 "type": "idle_worker",
-                "server": wkey,
-                "disk_free_gb": w.get("disk_free_gb"),
+                "server": c["server_key"],
+                "disk_free_gb": c["disk_free_gb"],
                 "message": (
-                    f"Worker {wkey} idle while {source_for_worker} tasks wait in queue. "
-                    f"Disk: {w.get('disk_free_gb', '?')}GB free."
+                    f"Worker {c['server_key']} idle while {c['source']} tasks "
+                    f"wait in queue. Disk: {c['disk_free_gb'] or '?'}GB free."
                 ),
             }
+    except Exception:
+        pass  # cannot determine — stay silent rather than cry wolf
 
     # WARNING: Event delivery broken (Layer 3 sees activity but no events arriving)
     from .cache import cache
