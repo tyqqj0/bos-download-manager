@@ -1,5 +1,7 @@
 # AgiBotWorld-Beta 续传 + 框架升级 — 实现计划 (v2, 审阅后修订)
 
+> **STATUS: 已完成并验收 (2026-07-31)**。验收 A1-A10 全部通过。Beta 任务 t-20260730-c4caf4 以 6 分片（bj1/2/3/4/5/7）~1.45Gbps 续传中，BOS 过滤跳过 948 文件/27.9TB。执行中发现并追加修复了 3 个计划外缺陷：①进度上报复活 paused 任务（servers.py 状态守卫）②带后缀 legacy workflow ID 逃过取消（temporal_client 子串扫描）③速度只按上传统计致大文件期间显示 0（pipeline 按下载活动计速）。
+
 > 需求与验收标准见同目录 `2026-07-31-beta-resume-requirements.md`（本次修订同步更新 A1/A4/A7 表述）。
 > v1 审阅结论 NEEDS_REVISION，4 CRITICAL + 9 IMPORTANT/MINOR 已全部吸收，对应修订标注 [R#n]。
 

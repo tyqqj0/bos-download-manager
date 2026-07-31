@@ -18,18 +18,23 @@ Each active download: `id`, `name`, `server`, `speed_mbps`, `progress_pct`, `dow
 |--------|------|-------------|
 | GET | `/api/tasks` | List all tasks. Params: `status`, `server`, `category`, `sort`, `reverse` |
 | POST | `/api/tasks` | Create task. Body: `url_or_repo`, `category`, `type`, `priority`, `name?`, `size_gb?`, `no_dispatch?` |
-| GET | `/api/tasks/{id}` | Get single task |
+| POST | `/api/queue/add` | Create task (queue-native). Body: `repo_id`, `name?`, `type`, `category`, `source`, `priority` (0=jump queue), `shard_count` (0=auto) |
+| GET | `/api/tasks/{id}` | Get single task (incl. `resume_skipped_files/gb` — BOS resume filter evidence) |
 | POST | `/api/tasks/{id}/reset` | Reset stuck task to dispatched |
-| POST | `/api/tasks/{id}/skip` | Skip task |
+| POST | `/api/tasks/{id}/skip` | Revoke task + terminate its workflows |
 | POST | `/api/tasks/{id}/retry` | Retry failed task |
+| POST | `/api/queue/pause` | Pause (durable — progress reports cannot resurrect). Body: `task_id` |
+| POST | `/api/queue/resume` | Requeue a paused task. Body: `task_id` |
+| POST | `/api/queue/reshard` | Change shard count via lossless restart. Body: `task_id`, `shard_count` |
+| POST | `/api/queue/preempt` | Pause a running task, start an urgent one. Body: `urgent_task_id`, `victim_task_id?` |
 | DELETE | `/api/queue/{id}` | Cancel workflow and delete task |
 
 ## Shards
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/shards?task_id=X` | List shards for a task |
-| GET | `/api/shards/idle-workers?source=hf` | Idle workers by source |
+| GET | `/api/tasks/{id}/shards` | List shards for a task |
+| GET | `/api/shards/idle-workers?source=hf&exclude_task=X` | Idle workers by source |
 | POST | `/api/shards/aggregate` | Force re-aggregate shard progress to task |
 
 ## Health
