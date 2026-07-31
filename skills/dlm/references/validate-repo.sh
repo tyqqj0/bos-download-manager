@@ -138,9 +138,14 @@ elif [ "$SOURCE" = "modelscope" ]; then
       "$API_URL" 2>/dev/null || echo "000")
 
     if [ "$HTTP_CODE" = "200" ]; then
-      # ModelScope returns 200 with success=true/false
-      SUCCESS=$(python3 -c "import json; d=json.load(open('/tmp/ms_check.json')); print(d.get('Success', d.get('success', False)))" 2>/dev/null || echo "false")
-      if [ "$SUCCESS" = "True" ] || [ "$SUCCESS" = "true" ]; then
+      # ModelScope answers 200 for both hit and miss; the body carries the
+      # verdict as Code + a non-null Data object (there is no Success field).
+      FOUND=$(python3 -c "
+import json
+d = json.load(open('/tmp/ms_check.json'))
+print('yes' if d.get('Code') == 200 and d.get('Data') else 'no')
+" 2>/dev/null || echo "no")
+      if [ "$FOUND" = "yes" ]; then
         echo "EXISTS=true"
         echo "TYPE=${TYPE_HINT:-$try_type}"
         echo "GATED=false"
