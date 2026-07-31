@@ -499,23 +499,13 @@ class PipelineEngine:
     def _init_bos_client(self):
         """Initialize BOS client and determine target bucket/prefix."""
         from ..core.config import load_config
-        from ..core.bos import create_bos_client
-        from ..constants import DATA_BUCKET, MODEL_BUCKET
+        from ..core.bos import bos_target, create_bos_client
 
         config = load_config()
         self._bos_client = create_bos_client(
             config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
         )
-
-        if self.task.type == "model":
-            self._bucket = MODEL_BUCKET
-            self._prefix = f"{self.task.name}/"
-        else:
-            self._bucket = DATA_BUCKET
-            if self.task.category:
-                self._prefix = f"{self.task.category}/{self.task.name}/"
-            else:
-                self._prefix = f"{self.task.name}/"
+        self._bucket, self._prefix = bos_target(self.task)
 
     def _emit_event(self, event_type: str, data: dict):
         """Emit a monitoring event to the event buffer (if available)."""

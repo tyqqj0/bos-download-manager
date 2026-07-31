@@ -11,14 +11,12 @@ from typing import Callable, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ...core.config import load_config
-from ...core.bos import create_bos_client, upload_file, MULTIPART_THRESHOLD
-from ...constants import DATA_BUCKET
+from ...core.bos import bos_target, create_bos_client, upload_file, MULTIPART_THRESHOLD
 from ..errors import TaskError, ErrorClass
 from .base import Mover
 
 logger = logging.getLogger(__name__)
 
-MODEL_BUCKET = "auwomo-model-open"
 UPLOAD_WORKERS = 32
 TAR_WORKERS = 4
 EXCLUDE_PATTERNS = (".incomplete", ".huggingface", ".cache", "__pycache__")
@@ -239,10 +237,7 @@ class BOSSDKMover(Mover):
 
     def _resolve_target(self, task) -> tuple:
         """Determine bucket and prefix from task type/category."""
-        if task.type == "model":
-            return MODEL_BUCKET, f"{task.name}/"
-        else:
-            return DATA_BUCKET, f"{task.category}/{task.name}/"
+        return bos_target(task)
 
     def _collect_files(self, source_dir: Path):
         """Walk source_dir, skip excluded patterns."""

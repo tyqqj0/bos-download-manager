@@ -12,6 +12,24 @@ from baidubce.services.bos.bos_client import BosClient
 MULTIPART_THRESHOLD = 100 * 1024 * 1024  # 100MB
 
 
+def bos_target(task) -> tuple[str, str]:
+    """The (bucket, key prefix) a task's files upload to.
+
+    The uploader and the resume filter MUST agree on this: the filter drops
+    files it already sees under the prefix, so a prefix that differs by even
+    a path segment silently re-downloads the whole dataset. Accepts anything
+    with .type/.name/.category (TaskInput, Task).
+    """
+    from ..constants import DATA_BUCKET, MODEL_BUCKET
+
+    if getattr(task, "type", None) == "model":
+        return MODEL_BUCKET, f"{task.name}/"
+    category = getattr(task, "category", None)
+    if category:
+        return DATA_BUCKET, f"{category}/{task.name}/"
+    return DATA_BUCKET, f"{task.name}/"
+
+
 def create_bos_client(ak: str, sk: str, endpoint: str) -> BosClient:
     config = BceClientConfiguration(
         credentials=BceCredentials(ak, sk),

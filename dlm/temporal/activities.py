@@ -167,23 +167,15 @@ async def filter_filelist_against_bos(filelist_path: str, task_input: TaskInput)
     that holds filelist_path (pin via task_queue).
     """
     from ..core.config import load_config
-    from ..core.bos import create_bos_client
-    from ..constants import DATA_BUCKET, MODEL_BUCKET
+    from ..core.bos import bos_target, create_bos_client
 
     def _filter():
         config = load_config()
         bos = create_bos_client(
             config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
         )
-        # Mirror pipeline._init_bos_client key layout exactly
-        if task_input.type == "model":
-            bucket, prefix = MODEL_BUCKET, f"{task_input.name}/"
-        else:
-            bucket = DATA_BUCKET
-            if task_input.category:
-                prefix = f"{task_input.category}/{task_input.name}/"
-            else:
-                prefix = f"{task_input.name}/"
+        # Same target the uploader writes to — see bos_target()
+        bucket, prefix = bos_target(task_input)
 
         existing = {}
         marker = ""
