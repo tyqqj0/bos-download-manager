@@ -95,3 +95,25 @@ def test_idle_while_matching_work_waits_is_starved():
     idle = {i["server_key"]: i for i in idle_workers(tasks, workers, [], NOW)}
     assert idle["bj2"]["starved"] is True   # ModelScope work is queued for it
     assert idle["w2"]["starved"] is False   # nothing it can serve is queued
+
+
+def test_live_workflow_matches_every_id_scheme():
+    from dlm.web.fleet import has_live_workflow
+
+    tid = "t-20260730-c4caf4"
+    for wid in (
+        f"dl-{tid}",                 # legacy single-node
+        f"split-download-{tid}",     # legacy split parent
+        f"sharded-{tid}",            # current coordinator
+        f"shard-s-{tid}-3",          # current shard child
+        f"{tid}-part1",              # legacy split child
+        f"dl-{tid}-v3",              # suffixed retry of the legacy id
+    ):
+        assert has_live_workflow(tid, {wid}), wid
+
+
+def test_live_workflow_does_not_match_a_different_task():
+    from dlm.web.fleet import has_live_workflow
+
+    assert not has_live_workflow("t-aaa", {"sharded-t-bbb", "shard-s-t-bbb-0"})
+    assert not has_live_workflow("t-aaa", set())

@@ -15,10 +15,16 @@ import time
 logger = logging.getLogger("dlm.reconciler")
 
 RECONCILE_INTERVAL = 300  # 5 minutes
-STALE_THRESHOLD = 600     # 10 minutes without update = suspicious
-DEAD_THRESHOLD = 1800     # 30 minutes without update = definitely dead
 SPEED_STALE_THRESHOLD = 300  # 5 minutes without update = zero out speed
-from .fleet import MIN_SHARD_DISK_GB as MIN_DISPATCH_DISK_GB  # single definition
+
+# Single definitions — the doctor reports on the same thresholds the
+# reconciler acts on, and they must not drift apart.
+from .fleet import (  # noqa: E402
+    DEAD_THRESHOLD,
+    MIN_SHARD_DISK_GB as MIN_DISPATCH_DISK_GB,
+    STALE_THRESHOLD,
+    has_live_workflow,
+)
 
 
 async def reconcile() -> dict:
@@ -72,18 +78,10 @@ async def reconcile() -> dict:
 
     for task in downloading:
         task_id = task["id"]
-        workflow_id = f"dl-{task_id}"
         updated_at = task.get("updated_at") or 0
         stale_seconds = now - updated_at
 
-        has_workflow = (
-            workflow_id in running_ids
-            or f"split-download-{task_id}" in running_ids
-            or f"sharded-{task_id}" in running_ids
-            or any(wid.startswith(f"shard-s-{task_id}-") for wid in running_ids)
-            or any(wid.startswith(f"{task_id}-part") for wid in running_ids)
-            or any(wid.startswith(f"{workflow_id}-") for wid in running_ids)
-        )
+        has_workflow = has_live_workflow(task_id, running_ids)
 
         if not has_workflow:
             # Before re-dispatching, check if all shards are already done.

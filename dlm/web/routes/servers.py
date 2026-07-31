@@ -3,6 +3,7 @@
 from fastapi import APIRouter, HTTPException
 
 from ..cache import cache
+from ..fleet import TERMINAL_STATUSES
 from . import run_blocking
 
 router = APIRouter(tags=["servers"])
@@ -145,7 +146,7 @@ async def task_progress(body: dict):
         # resurrection path made the reconciler re-dispatch tasks an operator
         # had explicitly stopped (2026-07-31 incident).
         task = get_task(task_id)
-        if task and task.get("status") in ("paused", "preempted", "revoked", "skipped", "failed", "done"):
+        if task and task.get("status") in TERMINAL_STATUSES:
             return {"ok": True, "ignored": f"task is {task['status']}"}
 
         status = body.get("status")

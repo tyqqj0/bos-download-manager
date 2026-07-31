@@ -15,11 +15,9 @@ from pydantic import BaseModel
 
 from . import run_blocking
 
-router = APIRouter(tags=["doctor"])
+from ..fleet import DEAD_THRESHOLD, STALE_THRESHOLD, WORKER_TIMEOUT, has_live_workflow
 
-WORKER_TIMEOUT = 180
-STALE_THRESHOLD = 600
-DEAD_THRESHOLD = 1800
+router = APIRouter(tags=["doctor"])
 
 
 @router.get("/doctor")
@@ -99,17 +97,7 @@ async def diagnose():
         downloading = [t for t in tasks if t.get("status") == "downloading"]
         for t in downloading:
             task_id = t["id"]
-            workflow_id = f"dl-{task_id}"
-            # Match all known workflow ID patterns
-            has_workflow = (
-                workflow_id in running_ids
-                or f"split-download-{task_id}" in running_ids
-                or f"sharded-{task_id}" in running_ids
-                or any(wid.startswith(f"shard-s-{task_id}-") for wid in running_ids)
-                or any(wid.startswith(f"{task_id}-part") for wid in running_ids)
-                or any(wid.startswith(f"{workflow_id}-") for wid in running_ids)
-            )
-            if not has_workflow:
+            if not has_live_workflow(task_id, running_ids):
                 age = now - (t.get("updated_at") or 0)
                 orphaned.append({
                     "task_id": t["id"],
@@ -221,14 +209,7 @@ async def fix(req: FixRequest):
             downloading = [t for t in tasks if t.get("status") == "downloading"]
             for t in downloading:
                 task_id = t["id"]
-                has_wf = (
-                    f"dl-{task_id}" in running_ids
-                    or f"split-download-{task_id}" in running_ids
-                    or f"sharded-{task_id}" in running_ids
-                    or any(w.startswith(f"shard-s-{task_id}-") for w in running_ids)
-                    or any(w.startswith(f"dl-{task_id}-") for w in running_ids)
-                )
-                if has_wf:
+                if has_live_workflow(task_id, running_ids):
                     continue
                 try:
                     # Sharded path only — the legacy workflow has no BOS resume

@@ -10,6 +10,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from ..core.naming import shard_task_name
     from .models import TaskInput, TaskResult, ShardInput, ShardResult
 
 
@@ -380,7 +381,7 @@ class ShardWorkerWorkflow:
     async def run(self, shard_input: ShardInput) -> ShardResult:
         shard_id = shard_input.shard_id
         server_key = workflow.info().task_queue.removeprefix("download-")
-        shard_name = f"{shard_input.task_name}/shard-{shard_input.shard_index}"
+        shard_name = shard_task_name(shard_input.task_name, shard_input.shard_index)
 
         # Mark shard running + record server
         await workflow.execute_activity(

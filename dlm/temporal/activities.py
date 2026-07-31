@@ -12,6 +12,7 @@ from typing import Optional
 
 from temporalio import activity
 
+from ..core.naming import shard_row_id, split_shard_name
 from .models import TaskInput, FileInfo, PipelineStats, ShardInput
 
 logger = logging.getLogger(__name__)
@@ -321,12 +322,9 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
         activity.heartbeat(msg)
 
     # Detect shard mode: shard workers use "TaskName/shard-N" naming
-    is_shard = "/shard-" in task_input.name
-    shard_id = None
-    if is_shard:
-        parts = task_input.name.rsplit("/shard-", 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            shard_id = f"s-{task_input.id}-{parts[1]}"
+    base_name, shard_index = split_shard_name(task_input.name)
+    is_shard = shard_index is not None
+    shard_id = shard_row_id(task_input.id, shard_index) if is_shard else None
 
     def progress_fn(downloaded_bytes: int, total_bytes: int, speed_bps: float):
         """Report speed to S1 dashboard via HTTP every 15s."""
@@ -378,8 +376,7 @@ async def run_pipeline_batch(task_input: TaskInput, filelist_path: str,
     # would scatter the dataset across per-shard subdirectories.)
     import dataclasses
     engine_task = (
-        dataclasses.replace(task_input, name=task_input.name.rsplit("/shard-", 1)[0])
-        if is_shard else task_input
+        dataclasses.replace(task_input, name=base_name) if is_shard else task_input
     )
     engine = PipelineEngine(engine_task, staging_dir, heartbeat_fn, progress_fn)
     stats = await engine.run(files)

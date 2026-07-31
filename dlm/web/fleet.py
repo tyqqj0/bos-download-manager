@@ -13,6 +13,33 @@ import time
 
 WORKER_TIMEOUT = 180  # seconds without a heartbeat before a worker is offline
 MIN_SHARD_DISK_GB = 70  # a worker below this is not offered new shards
+STALE_THRESHOLD = 600  # 10 min without a task update = suspicious
+DEAD_THRESHOLD = 1800  # 30 min without a task update = definitely dead
+
+# Terminal/operator states. A progress report must never move a task out of
+# one of these — a dying workflow's late report used to resurrect tasks an
+# operator had explicitly stopped (2026-07-31 incident).
+TERMINAL_STATUSES = ("paused", "preempted", "revoked", "skipped", "failed", "done")
+
+
+def has_live_workflow(task_id: str, running_ids) -> bool:
+    """Whether any running workflow belongs to this task.
+
+    A task's work can live under any of the historical ID schemes, and a
+    check that misses one concludes the task is orphaned and re-dispatches
+    it — a second coordinator downloading what is already downloading. The
+    doctor's fix path had drifted from its own report path in exactly this
+    way (it omitted the legacy `{task_id}-part` children).
+    """
+    legacy = f"dl-{task_id}"
+    return (
+        legacy in running_ids
+        or f"split-download-{task_id}" in running_ids
+        or f"sharded-{task_id}" in running_ids
+        or any(wid.startswith(f"shard-s-{task_id}-") for wid in running_ids)
+        or any(wid.startswith(f"{task_id}-part") for wid in running_ids)
+        or any(wid.startswith(f"{legacy}-") for wid in running_ids)
+    )
 
 
 def dedupe_workers(workers: list[dict]) -> list[dict]:

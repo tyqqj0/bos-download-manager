@@ -9,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from fastapi import APIRouter
 
+from ...core.naming import shard_row_id
 from ...queue import snapshot
+from ..fleet import TERMINAL_STATUSES
 
 logger = logging.getLogger("dlm.web")
 router = APIRouter(tags=["queue"])
@@ -355,6 +357,13 @@ async def report_shard_progress(body: dict):
         shard = snapshot.get_shard(shard_id)
         if not shard:
             return {"error": f"Shard {shard_id} not found"}
+        # pause_task cancels workflows cooperatively, so in-flight shards keep
+        # reporting for a while after the operator stopped the task. Writing
+        # that through would re-set a paused task's speed and progress — the
+        # same rule /api/task-progress already enforces.
+        parent = snapshot.get_task(shard.get("task_id") or "")
+        if parent and parent.get("status") in TERMINAL_STATUSES:
+            return {"ok": True, "ignored": f"task is {parent['status']}"}
         snapshot.update_shard_progress(
             shard_id,
             done_files=body.get("done_files", shard.get("done_files", 0)),
@@ -387,7 +396,7 @@ async def create_shards(body: dict):
         shard_ids = []
         for info in shard_infos:
             idx = info["shard_index"]
-            shard_id = f"s-{task_id}-{idx}"
+            shard_id = shard_row_id(task_id, idx)
             snapshot.upsert_shard({
                 "id": shard_id,
                 "task_id": task_id,
