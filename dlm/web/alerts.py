@@ -77,8 +77,21 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
     now = time.time()
     new_alerts: dict[str, dict] = {}
 
+    # A worker can have several heartbeat rows (wN@temporal + wN@sidecar).
+    # Judge liveness by the freshest row, or a stale auxiliary row reports a
+    # perfectly healthy worker as offline.
+    freshest: dict = {}
+    for w in workers:
+        key = w.get("server_key", "")
+        if key and (key not in freshest
+                    or (w.get("last_seen") or 0) > (freshest[key].get("last_seen") or 0)):
+            freshest[key] = w
+    workers = list(freshest.values())
+
     alive_workers = [w for w in workers if now - (w.get("last_seen") or 0) < 180]
-    real_workers = [w for w in workers if w.get("server_key", "").startswith("w")]
+    # Every worker counts for offline detection — bj nodes carry the ModelScope
+    # half of the fleet and were previously exempt from these alerts.
+    real_workers = list(workers)
 
     # CRITICAL: All workers offline — but check if S1 itself is the problem
     if real_workers and not any(w in alive_workers for w in real_workers):
@@ -163,17 +176,35 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 "message": f"Task {t.get('name', '')} failed {t.get('retry_count', 0)} times",
             }
 
-    # WARNING: Worker online but idle — no downloading task assigned
-    # Catches split-workflow failures where children die but worker stays alive
+    # WARNING: Worker online, holds no work, AND work is waiting for it.
+    # A sharded task's row has server=NULL — the servers live on the shards, so
+    # shard ownership is what makes a worker busy. Without that, every worker
+    # running a shard looked idle. And with an empty queue, idle is the correct
+    # resting state, not an alert.
+    from ..queue.snapshot import get_running_shards
     downloading_tasks = [t for t in tasks if t.get("status") == "downloading"]
     busy_servers = {t.get("server") for t in downloading_tasks if t.get("server")}
-    idle_seen = set()
-    for w in alive_workers:
-        wkey = w.get("server_key", "")
-        if not wkey or wkey in idle_seen:
-            continue
-        idle_seen.add(wkey)
-        if wkey not in busy_servers:
+    try:
+        busy_servers |= {s.get("server") for s in get_running_shards() if s.get("server")}
+    except Exception:
+        busy_servers = None  # cannot tell — stay silent rather than cry wolf
+
+    pending_sources = {
+        (t.get("source") or "hf") for t in tasks if t.get("status") == "pending"
+    }
+
+    if busy_servers is not None:
+        idle_seen = set()
+        for w in alive_workers:
+            wkey = w.get("server_key", "")
+            if not wkey or wkey in idle_seen:
+                continue
+            idle_seen.add(wkey)
+            if wkey in busy_servers:
+                continue
+            source_for_worker = "modelscope" if wkey.startswith("bj") else "hf"
+            if source_for_worker not in pending_sources:
+                continue  # nothing queued it could take — resting normally
             key = f"idle_worker:{wkey}"
             new_alerts[key] = {
                 "severity": WARNING,
@@ -181,9 +212,8 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 "server": wkey,
                 "disk_free_gb": w.get("disk_free_gb"),
                 "message": (
-                    f"Worker {wkey} online but idle — no downloading task. "
-                    f"Disk: {w.get('disk_free_gb', '?')}GB free. "
-                    f"Check for failed split workflow."
+                    f"Worker {wkey} idle while {source_for_worker} tasks wait in queue. "
+                    f"Disk: {w.get('disk_free_gb', '?')}GB free."
                 ),
             }
 

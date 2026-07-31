@@ -28,7 +28,10 @@ def _build_dashboard() -> dict:
     # shard aggregates so per-shard progress_fn writes don't confuse the dashboard.
     for dl in summary.get("active_downloads", []):
         shards = get_shards_by_task(dl["id"])
-        if len(shards) > 1:
+        # Any sharded task — including a 1-shard one — carries its servers on
+        # the shards, not the task row (which stays NULL). Skipping the
+        # single-shard case left those tasks rendering their server as "?".
+        if shards:
             done_bytes = sum(s.get("done_bytes", 0) for s in shards)
             total_bytes = sum(s.get("total_bytes", 0) for s in shards)
             speed = sum(s.get("speed_mbps", 0) for s in shards)
@@ -43,6 +46,10 @@ def _build_dashboard() -> dict:
                  "done_pct": round(s.get("done_bytes", 0) / s.get("total_bytes", 1) * 100, 1) if s.get("total_bytes") else 0}
                 for s in shards
             ]
+            if not dl.get("server"):
+                dl["server"] = ",".join(
+                    s.get("server") for s in shards if s.get("server")
+                ) or None
     # Recalc aggregate speed from corrected values
     summary["aggregate_speed_mbps"] = round(
         sum(dl.get("speed_mbps", 0) for dl in summary.get("active_downloads", [])), 1)
