@@ -122,12 +122,15 @@ Six branches, each with a distinct trigger. Pick the matching branch and follow 
      — not an issue, do not report them as one.
    - **failed_repeat**: retry_count >= 5. Suggest skip.
 
-4. If the user approves fixes, apply:
+4. If the user approves fixes, apply. These are the ONLY supported actions —
+   anything else is reported back under `unsupported_actions`:
    ```bash
    curl -s -X POST http://154.85.43.52:8080/api/doctor \
      -H 'Content-Type: application/json' \
-     -d '{"actions":["reset_stuck","restart_dead","skip_zombie"]}'
+     -d '{"actions":["redispatch_orphaned","reset_stuck","skip_zombie"]}'
    ```
+   There is no "restart worker" action — that is a host-level operation, see
+   the manage branch.
 
 5. Never auto-clean disk without explicit user approval.
 
@@ -147,7 +150,7 @@ Six branches, each with a distinct trigger. Pick the matching branch and follow 
    - Change shard count (lossless restart): `POST /api/queue/reshard` body
      `{"task_id": "<id>", "shard_count": N}`
    - Jump the queue: `POST /api/queue/jump` body `{"task_id": "<id>"}`
-   - Reset task: `POST /api/tasks/<id>/reset`
+   - Requeue a failed/paused/revoked task: `POST /api/tasks/<id>/retry`
    - Revoke task (also terminates its workflows): `POST /api/tasks/<id>/skip`
    - Retry task: `POST /api/tasks/<id>/retry`
    - Cancel + delete: `DELETE /api/queue/<id>`

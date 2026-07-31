@@ -20,9 +20,8 @@ Each active download: `id`, `name`, `server`, `speed_mbps`, `progress_pct`, `dow
 | POST | `/api/tasks` | Create task. Body: `url_or_repo`, `category`, `type`, `priority`, `name?`, `size_gb?`, `no_dispatch?` |
 | POST | `/api/queue/add` | Create task (queue-native). Body: `repo_id`, `name?`, `type`, `category`, `source`, `priority` (0=jump queue), `shard_count` (0=auto) |
 | GET | `/api/tasks/{id}` | Get single task (incl. `resume_skipped_files/gb` — BOS resume filter evidence) |
-| POST | `/api/tasks/{id}/reset` | Reset stuck task to dispatched |
 | POST | `/api/tasks/{id}/skip` | Revoke task + terminate its workflows |
-| POST | `/api/tasks/{id}/retry` | Retry failed task |
+| POST | `/api/tasks/{id}/retry` | Requeue a failed/revoked/paused/pending task |
 | POST | `/api/queue/pause` | Pause (durable — progress reports cannot resurrect). Body: `task_id` |
 | POST | `/api/queue/resume` | Requeue a paused task. Body: `task_id` |
 | POST | `/api/queue/reshard` | Change shard count via lossless restart. Body: `task_id`, `shard_count` |
@@ -42,7 +41,7 @@ Each active download: `id`, `name`, `server`, `speed_mbps`, `progress_pct`, `dow
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/doctor` | Health check report |
-| POST | `/api/doctor` | Auto-fix. Body: `{"actions":["reset_stuck","restart_dead","skip_zombie"]}` |
+| POST | `/api/doctor` | Auto-fix. Body: `{"actions":[...]}` — only `redispatch_orphaned`, `reset_stuck`, `skip_zombie` are supported; others come back as `unsupported_actions` |
 
 ## Servers
 

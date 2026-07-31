@@ -208,15 +208,18 @@ class FixRequest(BaseModel):
 
 @router.post("/doctor")
 async def fix(req: FixRequest):
-    """Apply repair actions.
+    """Apply repair actions. Unknown actions are reported, never silently dropped.
 
     Available actions:
-    - redispatch_orphaned: re-dispatch tasks with no Temporal workflow
-    - reset_stuck: reset stuck tasks to pending (legacy)
-    - skip_zombie: revoke permanently failed tasks
+    - redispatch_orphaned: re-dispatch tasks with no Temporal workflow (sharded)
+    - reset_stuck: reset stuck tasks to pending
+    - skip_zombie: revoke permanently failed tasks (retry_count >= 8)
+
+    There is deliberately no "restart worker" action — restarting a worker is a
+    host-level operation and goes through scripts/deploy-workers.sh.
     """
     from ...queue.snapshot import get_all_tasks, update_task_progress, init_db
-    from ..temporal_client import start_download
+    from ..temporal_client import start_sharded_download
     init_db()
 
     tasks = get_all_tasks()
@@ -224,29 +227,44 @@ async def fix(req: FixRequest):
     results = {}
     actions = req.actions or ["redispatch_orphaned"]
 
+    unknown = [a for a in actions
+               if a not in ("redispatch_orphaned", "reset_stuck", "skip_zombie")]
+    if unknown:
+        results["unsupported_actions"] = unknown
+
     if "redispatch_orphaned" in actions:
         redispatched = []
         try:
             from ..temporal_client import get_client
             client = await get_client()
             running_ids = set()
-            async for wf in client.list_workflows(
-                'WorkflowType="DownloadDatasetWorkflow" AND ExecutionStatus="Running"'
-            ):
-                running_ids.add(wf.id)
+            for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow",
+                            "ShardedDownloadWorkflow", "ShardWorkerWorkflow"]:
+                async for wf in client.list_workflows(
+                    f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
+                ):
+                    running_ids.add(wf.id)
 
             downloading = [t for t in tasks if t.get("status") == "downloading"]
             for t in downloading:
-                workflow_id = f"dl-{t['id']}"
-                if workflow_id not in running_ids:
-                    server = t.get("server", "")
-                    queue = f"download-{server}" if server else "download-workers"
-                    try:
-                        await start_download(t, task_queue=queue)
-                        redispatched.append(t.get("name", t["id"]))
-                    except Exception as e:
-                        if "already started" not in str(e).lower():
-                            redispatched.append(f"{t.get('name', t['id'])} (FAILED: {e})")
+                task_id = t["id"]
+                has_wf = (
+                    f"dl-{task_id}" in running_ids
+                    or f"split-download-{task_id}" in running_ids
+                    or f"sharded-{task_id}" in running_ids
+                    or any(w.startswith(f"shard-s-{task_id}-") for w in running_ids)
+                    or any(w.startswith(f"dl-{task_id}-") for w in running_ids)
+                )
+                if has_wf:
+                    continue
+                try:
+                    # Sharded path only — the legacy workflow has no BOS resume
+                    # filter and would re-download everything already uploaded.
+                    await start_sharded_download(t)
+                    redispatched.append(t.get("name", task_id))
+                except Exception as e:
+                    if "already started" not in str(e).lower():
+                        redispatched.append(f"{t.get('name', task_id)} (FAILED: {e})")
         except Exception as e:
             redispatched.append(f"ERROR: {e}")
         results["redispatch_orphaned"] = redispatched
