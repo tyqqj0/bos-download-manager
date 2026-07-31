@@ -451,32 +451,33 @@ async def report_to_dashboard(task_id: str, status: str, phase: str = None,
                                progress_pct: float = None, speed_mbps: float = None,
                                downloaded_gb: float = None, server: str = None,
                                error: str = None):
-    """Update the SQLite dashboard snapshot (for web UI)."""
-    def _update():
-        from ..queue.snapshot import init_db, update_task_progress, complete_task
-        init_db()
+    """Report task status to S1 via the coordinator API.
 
-        if status in ("done", "failed"):
-            if downloaded_gb is not None:
-                update_task_progress(task_id, downloaded_gb=downloaded_gb)
-            complete_task(task_id, status)
-        else:
-            kwargs = {"status": status}
-            if phase is not None:
-                kwargs["phase"] = phase
-            if progress_pct is not None:
-                kwargs["progress_pct"] = progress_pct
-            if speed_mbps is not None:
-                kwargs["speed_mbps"] = speed_mbps
-            if downloaded_gb is not None:
-                kwargs["downloaded_gb"] = downloaded_gb
-            if server is not None:
-                kwargs["server"] = server
-            if error is not None:
-                kwargs["error"] = error
-            update_task_progress(task_id, **kwargs)
+    MUST go over HTTP: this activity runs on a worker, and the SQLite DB is
+    S1-local. Writing directly would land every status transition — including
+    'done' — in the worker's own throwaway DB, leaving the real task stuck in
+    'downloading' forever (observed 2026-07-31).
+    """
+    import requests
 
-    await asyncio.to_thread(_update)
+    payload = {"task_id": task_id, "status": status}
+    for key, value in (
+        ("phase", phase),
+        ("progress_pct", progress_pct),
+        ("speed_mbps", speed_mbps),
+        ("downloaded_gb", downloaded_gb),
+        ("server", server),
+        ("error", error),
+    ):
+        if value is not None:
+            payload[key] = value
+
+    def _post():
+        requests.post(
+            f"{_coordinator()}/api/task-progress", json=payload, timeout=30
+        ).raise_for_status()
+
+    await asyncio.to_thread(_post)
 
 
 @activity.defn

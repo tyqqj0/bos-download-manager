@@ -133,7 +133,9 @@ async def cleanup_server_staging(key: str):
 async def task_progress(body: dict):
     """Receive real-time task progress from workers."""
     def _do():
-        from ...queue.snapshot import init_db, update_task_progress, get_task
+        from ...queue.snapshot import (
+            init_db, update_task_progress, complete_task, get_task,
+        )
         init_db()
         task_id = body.get("task_id")
         if not task_id:
@@ -145,8 +147,18 @@ async def task_progress(body: dict):
         task = get_task(task_id)
         if task and task.get("status") in ("paused", "preempted", "revoked", "skipped", "failed", "done"):
             return {"ok": True, "ignored": f"task is {task['status']}"}
+
+        status = body.get("status")
+        if status in ("done", "failed"):
+            for key in ("downloaded_gb", "progress_pct", "error"):
+                if key in body:
+                    update_task_progress(task_id, **{key: body[key]})
+            complete_task(task_id, status)
+            return {"ok": True, "completed": status}
+
         kwargs = {}
-        for key in ("status", "speed_mbps", "progress_pct", "downloaded_gb", "server", "phase"):
+        for key in ("status", "speed_mbps", "progress_pct", "downloaded_gb",
+                    "server", "phase", "error"):
             if key in body:
                 kwargs[key] = body[key]
         update_task_progress(task_id, **kwargs)
