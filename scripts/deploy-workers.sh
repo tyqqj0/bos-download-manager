@@ -87,14 +87,23 @@ for key in $TARGETS; do
     # for a month. rsync above already put the unit at deploy/, so install
     # from there. enable --now starts a missing sidecar but leaves a running
     # one alone (code reload happens in the restart branch, same as workers).
-    ssh "root@$ip" bash -s "$key" <<'SIDECAR_SCRIPT'
+    ssh "root@$ip" bash -s "$key" "$REMOTE_DIR" <<'SIDECAR_SCRIPT'
         SERVER_KEY="$1"
-        install -m644 /root/code/bos-download-manager/deploy/dlm-sidecar@.service \
+        REMOTE_DIR="$2"
+        # The unit hardcodes /usr/bin/python3; a host where that interpreter
+        # lacks `requests` (bj5-9 were provisioned separately) crash-loops
+        # every 5s while briefly reading `active` — hence the warning AND the
+        # sleep before is-active below.
+        /usr/bin/python3 -c "import requests" 2>/dev/null \
+            || echo "      WARN: $SERVER_KEY /usr/bin/python3 lacks requests — sidecar will crash-loop"
+        install -m644 "$REMOTE_DIR/deploy/dlm-sidecar@.service" \
             /etc/systemd/system/dlm-sidecar@.service
         systemctl daemon-reload
         systemctl enable --now "dlm-sidecar@$SERVER_KEY" 2>/dev/null || true
+        sleep 3
         if ! systemctl is-active --quiet "dlm-sidecar@$SERVER_KEY"; then
             echo "      WARN: sidecar $SERVER_KEY not active after install"
+            systemctl status "dlm-sidecar@$SERVER_KEY" --no-pager 2>/dev/null | tail -3
         fi
 SIDECAR_SCRIPT
 

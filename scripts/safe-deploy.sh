@@ -9,6 +9,10 @@
 set -euo pipefail
 
 COORDINATOR="http://154.85.43.52:8080"
+# The FULL fleet. Phase 1's cancel is fleet-wide, so a no-args run of this
+# script must also touch every host it cancelled work for — a w-only list
+# here once meant bj downloads were cancelled by a script that never
+# restarted bj workers.
 WORKERS=(
     "w1:156.240.120.209"
     "w2:154.85.53.152"
@@ -17,6 +21,15 @@ WORKERS=(
     "w5:154.85.54.251"
     "w6:154.85.50.210"
     "w7:156.240.121.60"
+    "bj1:120.48.57.202"
+    "bj2:180.76.182.215"
+    "bj3:120.48.21.57"
+    "bj4:180.76.228.120"
+    "bj5:120.48.56.197"
+    "bj6:120.48.174.216"
+    "bj7:120.48.79.251"
+    "bj8:120.48.142.8"
+    "bj9:106.12.159.208"
 )
 
 SKIP_CANCEL=false
@@ -71,6 +84,7 @@ import sys, json
 d = json.load(sys.stdin)
 assert d.get('dry_run') is False, f'expected an armed cancel, got: {d}'
 assert 'error' not in d, d['error']
+assert not d.get('errors'), f\"partial cancel failures: {d['errors']}\"
 "; then
         echo "  ERROR: cancel-all-workflows did not execute: $RESULT"
         exit 1
@@ -84,38 +98,22 @@ assert 'error' not in d, d['error']
     echo ""
 fi
 
-# Phase 2: Sync code to workers
-echo "=== Phase 2: Sync code ==="
-for entry in "${WORKERS[@]}"; do
-    key="${entry%%:*}"
-    ip="${entry##*:}"
-    echo "  → $key ($ip)"
-    rsync -az --delete \
-        --exclude='.git' --exclude='__pycache__' --exclude='.env' \
-        --exclude='*.pyc' --exclude='.superpowers' \
-        /root/code/bos-download-manager/ \
-        root@$ip:/root/code/bos-download-manager/ &
-done
-wait
-echo "  Sync complete."
-echo ""
-
-# Phase 3: Restart workers
-echo "=== Phase 3: Restart workers ==="
-for entry in "${WORKERS[@]}"; do
-    key="${entry%%:*}"
-    ip="${entry##*:}"
-    echo "  → $key ($ip)"
-    ssh -o ConnectTimeout=10 root@$ip "
-        pkill -f 'dlm.temporal' 2>/dev/null || true
-        sleep 2
-        tmux kill-session -t dlm-worker 2>/dev/null || true
-        tmux new-session -d -s dlm-worker \
-            'DLM_SERVER_KEY=$key bash /root/code/bos-download-manager/scripts/start-temporal-worker.sh'
-    " 2>/dev/null &
-done
-wait
-echo "  All workers restarted."
+# Phase 2+3: Sync + restart — delegated to deploy-workers.sh, the single
+# owner of worker lifecycle. It knows each bj host's personal task queue
+# (a worker restarted without DLM_TASK_QUEUE polls the wrong queues and
+# silently takes no work), installs/checks the sidecar, and prints the md5
+# version manifest. The tmux-based restart that used to live here is the
+# ad-hoc launch pattern this repo has already banned once.
+echo "=== Phase 2+3: Sync + restart (deploy-workers.sh) ==="
+if [ ${#TARGET_WORKERS[@]} -gt 0 ]; then
+    DEPLOY_ARGS=()
+    for target in "${TARGET_WORKERS[@]}"; do
+        DEPLOY_ARGS+=(--worker "$target")
+    done
+    bash /root/code/bos-download-manager/scripts/deploy-workers.sh "${DEPLOY_ARGS[@]}"
+else
+    bash /root/code/bos-download-manager/scripts/deploy-workers.sh
+fi
 echo ""
 
 # Phase 4: Wait for workers to register, then re-dispatch

@@ -29,10 +29,14 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dlm.core.bos import create_bos_client  # noqa: E402
+from dlm.core.config import load_config  # noqa: E402
 from dlm.constants import DATA_BUCKET as BUCKET  # noqa: E402
 
 SRC_PREFIX = "other/AgiBotWorld-Alpha/"
 DST_PREFIX = "manipulation/AgiBotWorld-Alpha/"
+# Backups live OUTSIDE the dataset prefix — the canonical prefix must hold
+# repo files only, and the resume filter must never see a .bak key.
+BACKUP_PREFIX = "download-manager/backups/AgiBotWorld-Alpha/"
 REPO_ID = "agibot_world/AgiBotWorld-Alpha"
 
 COPY_OBJECT_LIMIT = 5 * 1024 ** 3  # BOS single CopyObject cap
@@ -51,7 +55,7 @@ PLANNED = [
         "rel": ".gitattributes",
         "size": 20_361,
         "overwrites": True,       # dst holds a stale 2,461 B version
-        "backup": ".gitattributes.bak-20260802",
+        "backup": "gitattributes.bak-20260802",
     },
 ]
 
@@ -155,40 +159,51 @@ def main():
                         help="actually copy (default: dry-run)")
     args = parser.parse_args()
 
+    config = load_config()
     client = create_bos_client(
-        os.environ["BAIDU_AK"], os.environ["BAIDU_SK"],
-        os.environ.get("BOS_ENDPOINT", "https://bj.bcebos.com"),
+        config["BAIDU_AK"], config["BAIDU_SK"],
+        config.get("BOS_ENDPOINT") or "https://bj.bcebos.com",
     )
 
     # Pre-flight: the world must still match the reconciliation this plan
-    # was approved against.
+    # was approved against. A dst already holding the exact target size is
+    # "already done" — the script is safely re-runnable (A6 re-verifies).
+    todo = []
     for item in PLANNED:
         src_key = SRC_PREFIX + item["rel"]
         dst_key = DST_PREFIX + item["rel"]
+        dst_size = head_size(client, dst_key)
+        if dst_size == item["size"]:
+            print(f"  skip: {dst_key} already complete ({dst_size:,} B)")
+            continue
         src_size = head_size(client, src_key)
         if src_size != item["size"]:
             sys.exit(f"ABORT: {src_key} size {src_size} != expected {item['size']} "
                      f"— world changed since reconciliation, re-run the analysis")
-        dst_size = head_size(client, dst_key)
-        if item["overwrites"]:
-            if dst_size is None:
-                sys.exit(f"ABORT: expected a stale {dst_key} to overwrite, found none")
-        elif dst_size is not None:
-            sys.exit(f"ABORT: {dst_key} already exists ({dst_size} B) — nothing to add?")
+        if item["overwrites"] and dst_size is None:
+            sys.exit(f"ABORT: expected a stale {dst_key} to overwrite, found none")
+        if not item["overwrites"] and dst_size is not None:
+            sys.exit(f"ABORT: {dst_key} exists with unexpected size {dst_size} B")
         print(f"  plan: {src_key} ({item['size']:,} B) -> {dst_key}"
               + (f"  [overwrites {dst_size:,} B; backup first]" if item["overwrites"] else ""))
+        todo.append(item)
 
     if not args.execute:
         print("\nDry-run only. Re-run with --execute to copy.")
         return
 
-    for item in PLANNED:
+    for item in todo:
         src_key = SRC_PREFIX + item["rel"]
         dst_key = DST_PREFIX + item["rel"]
         if item["backup"]:
-            backup_key = DST_PREFIX + item["backup"]
-            print(f"  backup: {dst_key} -> {backup_key}")
-            client.copy_object(BUCKET, dst_key, BUCKET, backup_key)
+            backup_key = BACKUP_PREFIX + item["backup"]
+            # A backup key must never be overwritten: on a partial-failure
+            # re-run it would be the only surviving copy of the original.
+            if head_size(client, backup_key) is not None:
+                print(f"  backup exists, keeping: {backup_key}")
+            else:
+                print(f"  backup: {dst_key} -> {backup_key}")
+                client.copy_object(BUCKET, dst_key, BUCKET, backup_key)
         print(f"  copy: {src_key} -> {dst_key} ...")
         copy_object(client, src_key, dst_key, item["size"])
         got = head_size(client, dst_key)

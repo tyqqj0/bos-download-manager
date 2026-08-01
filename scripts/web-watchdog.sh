@@ -7,9 +7,9 @@
 # Trigger discipline — only counts what a restart can actually fix:
 #   curl exit 7  (connection refused)  \  the wedged-loop / dead-process
 #   curl exit 28 (timeout)             /  shapes; these count toward restart
-#   HTTP 5xx                           →  logged, NOT counted. A restart does
-#      not fix SQLite lock contention, and counting 500s turns a busy DB into
-#      a restart loop.
+#   any HTTP response (200/5xx/...)    →  the loop answered, so it is not
+#      wedged: resets the consecutive counter. 5xx is logged; a restart does
+#      not fix SQLite lock contention.
 set -u
 
 URL="http://127.0.0.1:8080/api/dashboard"
@@ -23,9 +23,28 @@ FAIL_THRESHOLD=3
 COOLDOWN_S=120        # after a restart, give startup + cache warm-up a grace period
 MAX_RESTARTS_HOUR=3   # beyond this something is really wrong — stop and shout
 HEARTBEAT_EVERY_S=3600
+SCHED_STALE_S=300     # dashboard updated_at older than this = scheduler wedged
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
 now=$(date +%s)
+
+# Respect operator intent: `systemctl stop dlm-web` must stay stopped. A
+# crashed process is Restart=always's job; the wedge this script exists for
+# always leaves the unit `active`. `failed` should be unreachable with
+# StartLimitIntervalSec=0, but if it happens, recover rather than stand by.
+state=$(systemctl is-active dlm-web 2>/dev/null || true)
+case "$state" in
+    active|activating|reloading) ;;
+    failed)
+        log "unit is 'failed' — reset-failed + restart"
+        systemctl reset-failed dlm-web 2>/dev/null || true
+        systemctl restart --no-block dlm-web \
+            || log "ERROR: restart of failed unit did not enqueue (rc=$?)"
+        echo "$now" > "$COOLDOWN_FILE"
+        exit 0
+        ;;
+    *) exit 0 ;;  # inactive/deactivating = deliberately stopped
+esac
 
 # Cooldown: a probe right after our own restart is measuring startup, not health.
 if [ -f "$COOLDOWN_FILE" ]; then
@@ -35,11 +54,26 @@ if [ -f "$COOLDOWN_FILE" ]; then
     fi
 fi
 
-code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$URL")
+body=$(curl -s -m 10 "$URL")
 curl_rc=$?
 
-if [ "$curl_rc" -eq 0 ] && [ "$code" = "200" ]; then
+if [ "$curl_rc" -eq 0 ] && [ -n "$body" ]; then
     echo 0 > "$COUNT_FILE"
+    # The loop answering does not prove the scheduler loop is advancing —
+    # the cache serves stale data forever. Log-only signal (a restart is not
+    # known to be the right fix for that failure, a human is).
+    stale=$(echo "$body" | python3 -c "
+import json, sys, time
+try:
+    d = json.load(sys.stdin)
+    ts = d.get('updated_at') or 0
+    print(int(time.time() - ts))
+except Exception:
+    print(-1)
+" 2>/dev/null || echo -1)
+    if [ "$stale" -gt "$SCHED_STALE_S" ] 2>/dev/null; then
+        log "WARNING: HTTP alive but dashboard is ${stale}s stale — scheduler may be wedged (not auto-restarting)"
+    fi
     last_hb=$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
     if [ $((now - last_hb)) -ge "$HEARTBEAT_EVERY_S" ]; then
         # A watchdog that only logs failures is indistinguishable from one
@@ -51,8 +85,10 @@ if [ "$curl_rc" -eq 0 ] && [ "$code" = "200" ]; then
 fi
 
 if [ "$curl_rc" -ne 7 ] && [ "$curl_rc" -ne 28 ]; then
-    # Reachable but unhappy (5xx, empty reply...) — not the wedge shape.
-    log "probe: http=$code curl_rc=$curl_rc — logged only, not counted"
+    # Reachable but unhappy (5xx handled above as body; here: odd curl rc).
+    # The server responded in some form, so the wedge chain is broken.
+    echo 0 > "$COUNT_FILE"
+    log "probe: curl_rc=$curl_rc — logged only, counter reset"
     exit 0
 fi
 
@@ -77,6 +113,9 @@ awk -v cutoff=$((now - 3600)) '$1 > cutoff' "$HOURLY_FILE" > "$HOURLY_FILE.tmp" 
 echo "$now" >> "$HOURLY_FILE"
 echo 0 > "$COUNT_FILE"
 echo "$now" > "$COOLDOWN_FILE"
+systemctl reset-failed dlm-web 2>/dev/null || true
 # --no-block: a oneshot blocking on another unit's restart job is a
 # job-ordering hazard, and it keeps this probe's own runtime bounded.
-systemctl restart --no-block dlm-web
+if ! systemctl restart --no-block dlm-web; then
+    log "ERROR: systemctl restart dlm-web FAILED (rc=$?) — unit state needs a human"
+fi
