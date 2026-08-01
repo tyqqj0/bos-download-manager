@@ -85,7 +85,7 @@ async def start_download(task_dict: dict, task_queue: str = "download-workers"):
     from ..temporal.models import TaskInput
     from ..temporal.workflows import DownloadDatasetWorkflow
 
-    client = await get_client()
+    client = await connected_client()
     task_input = TaskInput(
         id=task_dict["id"],
         name=task_dict["name"],
@@ -113,7 +113,7 @@ async def start_split_download(task_dict: dict, worker_count: int = 2):
     from ..temporal.models import TaskInput
     from ..temporal.workflows import SplitDownloadWorkflow
 
-    client = await get_client()
+    client = await connected_client()
     task_input = TaskInput(
         id=task_dict["id"],
         name=task_dict["name"],
@@ -140,7 +140,7 @@ async def start_sharded_download(task_dict: dict):
     from ..temporal.models import TaskInput
     from ..temporal.workflows import ShardedDownloadWorkflow
 
-    client = await get_client()
+    client = await connected_client()
     task_input = TaskInput(
         id=task_dict["id"],
         name=task_dict.get("name", ""),
@@ -178,7 +178,7 @@ async def _find_running_workflow_ids(client, task_id: str) -> list:
 
 async def cancel_workflow(task_id: str):
     """Cancel running workflow(s) for a task — handles all ID patterns."""
-    client = await get_client()
+    client = await connected_client()
     wf_ids = {
         f"dl-{task_id}",
         f"split-download-{task_id}",
@@ -189,7 +189,7 @@ async def cancel_workflow(task_id: str):
     for wf_id in wf_ids:
         try:
             handle = client.get_workflow_handle(wf_id)
-            await handle.cancel()
+            await handle.cancel(rpc_timeout=QUERY_TIMEOUT)
             logger.info(f"Cancelled workflow {wf_id}")
         except Exception:
             pass
@@ -202,7 +202,7 @@ async def cancel_workflow(task_id: str):
         for shard in shards:
             try:
                 handle = client.get_workflow_handle(f"shard-{shard['id']}")
-                await handle.cancel()
+                await handle.cancel(rpc_timeout=QUERY_TIMEOUT)
             except Exception:
                 pass
     except Exception:
@@ -220,7 +220,7 @@ async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> boo
     import time as _time
     from temporalio.client import WorkflowExecutionStatus
 
-    client = await get_client()
+    client = await connected_client()
     wf_ids = {f"dl-{task_id}", f"split-download-{task_id}", f"sharded-{task_id}"}
     wf_ids.update(await _find_running_workflow_ids(client, task_id))
     handles = [client.get_workflow_handle(wf_id) for wf_id in wf_ids]
@@ -234,7 +234,9 @@ async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> boo
 
     for handle in handles:
         try:
-            await handle.terminate(reason=f"reshard/requeue of {task_id}")
+            await handle.terminate(
+                reason=f"reshard/requeue of {task_id}", rpc_timeout=QUERY_TIMEOUT
+            )
         except Exception:
             pass  # not found / already closed
 
@@ -256,24 +258,3 @@ async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> boo
             return True
         await asyncio.sleep(2)
     return False
-
-
-async def list_running_workflows() -> list:
-    """List all running download workflows (all types)."""
-    client = await connected_client()
-    workflows = []
-    for wf_type in WORKFLOW_TYPES:
-        try:
-            async for wf in client.list_workflows(
-                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"',
-                rpc_timeout=QUERY_TIMEOUT,
-            ):
-                workflows.append({
-                    "workflow_id": wf.id,
-                    "workflow_type": wf_type,
-                    "status": wf.status.name,
-                    "start_time": str(wf.start_time) if wf.start_time else None,
-                })
-        except Exception:
-            pass
-    return workflows
