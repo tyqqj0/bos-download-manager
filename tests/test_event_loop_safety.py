@@ -90,15 +90,36 @@ def test_every_scheduler_stage_has_a_deadline():
     assert not bare, f"scheduler awaits without a deadline: {bare}"
 
 
+def _docstrings(tree: ast.AST) -> set[int]:
+    """id()s of the Constant nodes that are docstrings, not code."""
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = n.body[0] if n.body else None
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                out.add(id(first.value))
+    return out
+
+
 def test_workflow_type_list_is_defined_once():
-    """Six inlined copies is how the rpc_timeout got missed in five of them."""
+    """Six inlined copies is how the rpc_timeout got missed in five of them.
+
+    Prose mentions in comments and docstrings are fine and expected — only a
+    literal in executable code is a copy that can drift.
+    """
     from dlm.web import temporal_client
 
     hits = []
     for path in WEB.rglob("*.py"):
-        text = path.read_text()
-        if "ShardWorkerWorkflow" in text and path.name != "temporal_client.py":
-            hits.append(str(path.relative_to(WEB)))
+        if path.name == "temporal_client.py":
+            continue
+        tree = ast.parse(path.read_text())
+        skip = _docstrings(tree)
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Constant) and id(n) not in skip
+                    and n.value in temporal_client.WORKFLOW_TYPES):
+                hits.append(f"{path.relative_to(WEB)}:{n.lineno}")
 
     assert not hits, f"workflow types re-listed outside temporal_client: {hits}"
     assert "ShardWorkerWorkflow" in temporal_client.WORKFLOW_TYPES
