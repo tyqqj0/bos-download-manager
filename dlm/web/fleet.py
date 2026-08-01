@@ -59,6 +59,42 @@ def dedupe_workers(workers: list[dict]) -> list[dict]:
     return list(freshest.values())
 
 
+def merge_workers(workers: list[dict], now: float | None = None) -> list[dict]:
+    """One row per server_key, with fields merged across its hostnames.
+
+    `dedupe_workers` keeps the freshest row whole, which answers "is it
+    alive" and gets "what is it doing" wrong: the hostnames carry different
+    columns. `wN@temporal` sends liveness only and `wN@sidecar` sends the
+    metrics, and the temporal row is almost always the fresher of the two —
+    so freshest-wins silently drops every sidecar metric and a busy worker
+    reads as having no sidecar at all.
+
+    A hostname that has itself gone quiet stops contributing: otherwise a
+    sidecar that died hours ago would keep a worker looking healthy on the
+    strength of its last reading.
+    """
+    now = time.time() if now is None else now
+    by_key: dict[str, list[dict]] = {}
+    for w in workers:
+        key = w.get("server_key") or ""
+        if key:
+            by_key.setdefault(key, []).append(w)
+
+    merged = []
+    for key, rows in by_key.items():
+        rows.sort(key=lambda x: x.get("last_seen") or 0)
+        newest = rows[-1].get("last_seen") or 0
+        row: dict = {"server_key": key}
+        for w in rows:  # oldest first, so the freshest value of each field wins
+            if newest - (w.get("last_seen") or 0) > WORKER_TIMEOUT:
+                continue
+            for field, value in w.items():
+                if value is not None:
+                    row[field] = value
+        merged.append(row)
+    return merged
+
+
 def alive_workers(workers: list[dict], now: float | None = None) -> list[dict]:
     """Deduped workers whose freshest heartbeat is within WORKER_TIMEOUT."""
     now = time.time() if now is None else now

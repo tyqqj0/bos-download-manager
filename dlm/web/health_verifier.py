@@ -29,7 +29,7 @@ import asyncio
 import logging
 import time
 
-from .fleet import STALE_THRESHOLD, WORKER_TIMEOUT, dedupe_workers
+from .fleet import STALE_THRESHOLD, WORKER_TIMEOUT, merge_workers
 
 logger = logging.getLogger("dlm.health_verifier")
 
@@ -60,7 +60,9 @@ def collect_fleet_health() -> dict:
 
     init_db()
     now = time.time()
-    workers = dedupe_workers(get_workers())
+    # Merged, not deduped: the metrics live on the `@sidecar` hostname while
+    # the fresher `@temporal` row carries only liveness.
+    workers = merge_workers(get_workers(), now)
     anomalies = correlate_layers(
         workers, get_all_tasks(), get_running_shards(), now
     )

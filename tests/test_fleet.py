@@ -117,3 +117,44 @@ def test_live_workflow_does_not_match_a_different_task():
 
     assert not has_live_workflow("t-aaa", {"sharded-t-bbb", "shard-s-t-bbb-0"})
     assert not has_live_workflow("t-aaa", set())
+
+
+def test_merge_keeps_sidecar_metrics_the_fresher_temporal_row_lacks():
+    """The false-alarm shape: freshest-wins drops every metric a worker sends.
+
+    `wN@temporal` heartbeats more often than `wN@sidecar` but carries no
+    metrics, so dedupe_workers picked it and Layer 3 reported every busy
+    HK worker as having no sidecar.
+    """
+    from dlm.web.fleet import merge_workers
+
+    now = 1000.0
+    rows = [
+        {"server_key": "w1", "hostname": "w1@temporal", "last_seen": now,
+         "files_last_5min": None, "https_connections": None},
+        {"server_key": "w1", "hostname": "w1@sidecar", "last_seen": now - 20,
+         "files_last_5min": 1225, "https_connections": 21},
+    ]
+
+    merged, = merge_workers(rows, now)
+
+    assert merged["last_seen"] == now          # liveness from the freshest row
+    assert merged["files_last_5min"] == 1225   # metrics from the sidecar row
+    assert merged["https_connections"] == 21
+
+
+def test_merge_drops_metrics_from_a_hostname_that_went_quiet():
+    """A dead sidecar must stop contributing, not look healthy forever."""
+    from dlm.web.fleet import merge_workers
+
+    now = 1000.0
+    rows = [
+        {"server_key": "w1", "hostname": "w1@temporal", "last_seen": now},
+        {"server_key": "w1", "hostname": "w1@sidecar", "last_seen": now - 7200,
+         "files_last_5min": 1225, "download_process_alive": 1},
+    ]
+
+    merged, = merge_workers(rows, now)
+
+    assert merged.get("files_last_5min") is None
+    assert merged.get("download_process_alive") is None
