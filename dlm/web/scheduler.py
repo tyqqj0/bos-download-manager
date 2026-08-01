@@ -205,7 +205,9 @@ async def background_scheduler():
 
                 last_reconcile = now
 
-            # Layer 3: SSH health verification (every 5 min)
+            # Layer 3: cross-layer health correlation (every 5 min).
+            # Reads heartbeat data only — it must never SSH or fork, see
+            # health_verifier's module docstring for what that cost us.
             if now - last_health_verify > RECONCILE_INTERVAL:
                 try:
                     from .health_verifier import verify_all_workers

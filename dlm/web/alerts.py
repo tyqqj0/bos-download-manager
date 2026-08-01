@@ -7,7 +7,7 @@ and adds persistent file logging.
 Three-layer cross-referencing:
 - Layer 1 (sidecar heartbeat) for process/disk status
 - Layer 2 (event buffer) for download activity
-- Layer 3 (SSH verify) for ground truth
+- Layer 3 (cross-layer correlation) for contradictions between the two
 """
 
 import logging
@@ -190,7 +190,9 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
     except Exception:
         pass  # cannot determine — stay silent rather than cry wolf
 
-    # WARNING: Event delivery broken (Layer 3 sees activity but no events arriving)
+    # WARNING: contradictions between the heartbeat and the event stream.
+    # `sidecar_missing` and `possible_stall` stay out of this list on purpose:
+    # both are advisory, and escalating them would alert on 11 of 16 workers.
     from .cache import cache
     verify_report = cache.get("health_verify_report")
     if verify_report and isinstance(verify_report, dict):
