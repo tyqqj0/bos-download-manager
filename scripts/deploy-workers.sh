@@ -81,6 +81,23 @@ for key in $TARGETS; do
         --exclude 'node_modules' \
         "$REPO_DIR/" "root@$ip:$REMOTE_DIR/"
 
+    # Sidecar unit: installed/refreshed on EVERY deploy, not only restarts.
+    # The old `if [ -f ...service ]` check silently skipped hosts that never
+    # had the unit — which is exactly how bj1-bj9 ran without stall telemetry
+    # for a month. rsync above already put the unit at deploy/, so install
+    # from there. enable --now starts a missing sidecar but leaves a running
+    # one alone (code reload happens in the restart branch, same as workers).
+    ssh "root@$ip" bash -s "$key" <<'SIDECAR_SCRIPT'
+        SERVER_KEY="$1"
+        install -m644 /root/code/bos-download-manager/deploy/dlm-sidecar@.service \
+            /etc/systemd/system/dlm-sidecar@.service
+        systemctl daemon-reload
+        systemctl enable --now "dlm-sidecar@$SERVER_KEY" 2>/dev/null || true
+        if ! systemctl is-active --quiet "dlm-sidecar@$SERVER_KEY"; then
+            echo "      WARN: sidecar $SERVER_KEY not active after install"
+        fi
+SIDECAR_SCRIPT
+
     if [ "$RESTART" = true ]; then
         echo "  [$key] $ip — restarting worker (queue=${queue:-default})..."
         ssh "root@$ip" bash -s "$key" "$queue" <<'REMOTE_SCRIPT'
@@ -100,16 +117,17 @@ for key in $TARGETS; do
                 tail -5 /var/log/dlm-worker.log
             fi
 
-            # Sidecar watchdog: independent of the worker, so it still reports
-            # when the worker hangs or dies silently. enable = survives reboot.
-            if [ -f /etc/systemd/system/dlm-sidecar@.service ]; then
-                systemctl enable --now "dlm-sidecar@$SERVER_KEY" 2>/dev/null
-                systemctl restart "dlm-sidecar@$SERVER_KEY" 2>/dev/null
-                if systemctl is-active --quiet "dlm-sidecar@$SERVER_KEY"; then
-                    echo "      Sidecar $SERVER_KEY active"
-                else
-                    echo "      WARN: sidecar $SERVER_KEY not active"
-                fi
+            # Sidecar watchdog: unit install/enable already happened in the
+            # sync phase; a restart deploy also reloads its code. sleep before
+            # is-active — checked immediately, a unit dying 0.2s later still
+            # reads as active.
+            systemctl restart "dlm-sidecar@$SERVER_KEY" 2>/dev/null
+            sleep 3
+            if systemctl is-active --quiet "dlm-sidecar@$SERVER_KEY"; then
+                echo "      Sidecar $SERVER_KEY active"
+            else
+                echo "      WARN: sidecar $SERVER_KEY not active"
+                systemctl status "dlm-sidecar@$SERVER_KEY" --no-pager 2>/dev/null | tail -3
             fi
 REMOTE_SCRIPT
     fi

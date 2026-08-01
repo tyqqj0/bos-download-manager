@@ -45,8 +45,11 @@ bash scripts/deploy-workers.sh                 # all 16
 bash scripts/deploy-workers.sh --worker bj1    # subset
 bash scripts/deploy-workers.sh --no-restart    # sync only
 
-# Start web server (on S1; use subshell so it survives SSH exit)
-cd /root/code/bos-download-manager && (setsid nohup python3 -m dlm web --port 8080 > /var/log/dlm-web.log 2>&1 < /dev/null &)
+# Web server (on S1): systemd-managed since 2026-08-02 — never launch by hand
+systemctl restart dlm-web         # (re)start; logs still at /var/log/dlm-web.log
+systemctl status dlm-web dlm-web-watchdog.timer
+# The watchdog timer probes /api/dashboard every 30s and auto-restarts a
+# wedged (alive-but-unresponsive) web; its log: /var/log/dlm-web-watchdog.log
 
 # Worker restart: ALWAYS via deploy-workers.sh, never ad-hoc ssh setsid (dies with the session)
 

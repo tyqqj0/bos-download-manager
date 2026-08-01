@@ -1,0 +1,9 @@
+# Oneshot probe run by dlm-web-watchdog.timer. Do NOT add RuntimeDirectory=
+# here: systemd removes a RuntimeDirectory when the unit stops, a oneshot
+# stops after every run, and the failure counter would reset each cycle.
+[Unit]
+Description=DLM web liveness probe
+
+[Service]
+Type=oneshot
+ExecStart=/root/code/bos-download-manager/scripts/web-watchdog.sh

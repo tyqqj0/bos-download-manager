@@ -30,6 +30,15 @@ WORKFLOW_TYPES = (
     "ShardWorkerWorkflow",
 )
 
+# The coordinator/parent types — what fleet-wide cancel operates on. Children
+# (ShardWorkerWorkflow) are NOT cancelled directly: they die with their parent
+# via ParentClosePolicy=TERMINATE, which skips the child's failure handler.
+# Cancelling a child directly runs that handler, the shard reports "failed",
+# the coordinator marks the whole task `failed` — a terminal status the
+# reconciler never re-dispatches. Parent-only cancel leaves the task in
+# `downloading`, where orphan re-dispatch reclaims it losslessly.
+PARENT_WORKFLOW_TYPES = tuple(t for t in WORKFLOW_TYPES if t != "ShardWorkerWorkflow")
+
 CONNECT_TIMEOUT = 5  # seconds to reach the frontend; connect() has no deadline
 QUERY_TIMEOUT = timedelta(seconds=15)  # per list/describe RPC
 

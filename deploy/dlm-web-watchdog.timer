@@ -1,0 +1,16 @@
+# Fires the HTTP-liveness probe for dlm-web. Enable THIS unit (the .timer),
+# not the .service.
+[Unit]
+Description=DLM web liveness probe timer
+
+[Timer]
+# OnUnitActiveSec alone never fires: it measures from the service's last
+# activation, and with no seed event there is nothing to measure from.
+OnBootSec=60
+OnUnitActiveSec=30
+# Default accuracy is 1 minute, which would silently stretch the 30s period
+# to 30-90s and double detection latency.
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

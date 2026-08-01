@@ -86,11 +86,11 @@ dlm server remove S2     # 移除
 # 安装 web 依赖
 pip install -e ".[web]"
 
-# 启动（前台）
+# 启动（前台，本地开发）
 dlm web --host 0.0.0.0 --port 8080
 
-# 后台常驻
-tmux new-session -d -s dlm-web "dlm web --host 0.0.0.0 --port 8080"
+# 生产（S1）：systemd 常驻 + HTTP 探活 watchdog（unit 文件在 deploy/）
+systemctl enable --now dlm-web dlm-web-watchdog.timer
 ```
 
 访问 `http://<server-ip>:8080`，功能：

@@ -1,0 +1,37 @@
+# DLM control-plane web (S1). Installed at /etc/systemd/system/dlm-web.service.
+#
+# Exists because of 2026-07-31: the bare `setsid nohup` web wedged (event loop
+# frozen, process alive, port open) and nothing restarted it for 24 hours.
+# Restart=always covers crashes; the paired dlm-web-watchdog.timer covers the
+# wedge case Restart= cannot see. Both are required.
+[Unit]
+Description=DLM Control-Plane Web (S1)
+After=network.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# WorkingDirectory is load-bearing: dlm.core.config load_dotenv() searches
+# upward from cwd, which is how BAIDU_*/HF_TOKEN reach the process.
+WorkingDirectory=/root/code/bos-download-manager
+# Belt-and-braces on top of dotenv. systemd's parser is not a shell: if the
+# .env ever gains `export X=Y` lines or a BOM, check
+# `journalctl -u dlm-web | grep -i environment` and drop this line.
+EnvironmentFile=-/root/code/bos-download-manager/.env
+ExecStart=/usr/bin/python3 -m dlm web --port 8080
+Restart=always
+RestartSec=5
+# A SIGSTOPped process never handles SIGTERM; without this, `systemctl
+# restart` waits the default 90s before SIGKILL and the A2 recovery budget
+# does not close.
+TimeoutStopSec=20
+# The watchdog plus manual restarts during drills can exceed systemd's
+# default 5-starts-per-10s limit, after which systemd refuses to start the
+# unit at all — inverting the recovery guarantee into a permanent outage.
+StartLimitIntervalSec=0
+# Same log path operators have always tailed (matches dlm-worker@ convention).
+StandardOutput=append:/var/log/dlm-web.log
+StandardError=append:/var/log/dlm-web.log
+
+[Install]
+WantedBy=multi-user.target

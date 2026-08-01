@@ -49,11 +49,33 @@ echo "=== DLM Safe Deploy ==="
 echo "  Workers: ${WORKERS[*]}"
 echo ""
 
-# Phase 1: Cancel running workflows
+# Phase 1: Cancel running workflows.
+# The endpoint is FLEET-WIDE (it cancels bj downloads too), so it only runs
+# when this script's scope is also the whole fleet. A --worker subset deploy
+# must not take down every other worker's downloads as a side effect.
+if [ "$SKIP_CANCEL" = false ] && [ ${#TARGET_WORKERS[@]} -gt 0 ]; then
+    echo "=== Phase 1 SKIPPED: --worker subset given, but workflow cancel is"
+    echo "    fleet-wide. Use a full-fleet run (no --worker) to cancel, or"
+    echo "    accept in-flight batches being interrupted by the restart."
+    SKIP_CANCEL=true
+fi
 if [ "$SKIP_CANCEL" = false ]; then
     echo "=== Phase 1: Cancel running workflows ==="
-    RESULT=$(curl -sf "$COORDINATOR/api/cancel-all-workflows" -X POST 2>/dev/null || echo '{"count":0}')
-    CANCELLED=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('count',0))" 2>/dev/null || echo "0")
+    # No -f: a 4xx must be loud, not masked into the {"count":0} fallback —
+    # that exact masking is how this phase reported success while cancelling
+    # nothing for a month.
+    RESULT=$(curl -s -X POST "$COORDINATOR/api/cancel-all-workflows" \
+        -H 'Content-Type: application/json' -d '{"confirm": true}')
+    if ! echo "$RESULT" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+assert d.get('dry_run') is False, f'expected an armed cancel, got: {d}'
+assert 'error' not in d, d['error']
+"; then
+        echo "  ERROR: cancel-all-workflows did not execute: $RESULT"
+        exit 1
+    fi
+    CANCELLED=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('count',0))")
     echo "  Cancelled $CANCELLED workflows"
     if [ "$CANCELLED" -gt 0 ]; then
         echo "  Waiting 30s for graceful shutdown..."
