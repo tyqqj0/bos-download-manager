@@ -16,6 +16,7 @@ logger = logging.getLogger("dlm.reconciler")
 
 RECONCILE_INTERVAL = 300  # 5 minutes
 SPEED_STALE_THRESHOLD = 300  # 5 minutes without update = zero out speed
+RECENT_CLOSED_LIMIT = 500  # cap on the unfiltered closed-workflow scan
 
 # Single definitions — the doctor reports on the same thresholds the
 # reconciler acts on, and they must not drift apart.
@@ -36,7 +37,7 @@ async def reconcile() -> dict:
         get_tasks_by_status, update_task_progress, get_shards_by_task,
         complete_task, init_db, _conn,
     )
-    from .temporal_client import get_client, start_sharded_download
+    from .temporal_client import running_workflows, start_sharded_download
 
     init_db()
     report = {
@@ -61,14 +62,7 @@ async def reconcile() -> dict:
 
     # Get running workflows from Temporal
     try:
-        client = await get_client()
-        running_ids = set()
-        for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow",
-                        "ShardedDownloadWorkflow", "ShardWorkerWorkflow"]:
-            async for wf in client.list_workflows(
-                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
-            ):
-                running_ids.add(wf.id)
+        running_ids = set(await running_workflows())
         report["running_workflows"] = len(running_ids)
     except Exception as e:
         report["errors"].append(f"Failed to query Temporal: {e}")
@@ -177,7 +171,7 @@ async def auto_dispatch_pending() -> dict:
     from ..queue.snapshot import (
         get_tasks_by_status, get_workers, get_running_shards, _conn, init_db,
     )
-    from .temporal_client import get_client, start_sharded_download
+    from .temporal_client import start_sharded_download
 
     init_db()
     report = {"dispatched": [], "errors": []}
@@ -315,7 +309,7 @@ async def detect_idle_workers() -> dict:
     and the worker sits idle while the dashboard shows "downloading".
     """
     from ..queue.snapshot import get_tasks_by_status, get_workers, get_running_shards, init_db
-    from .temporal_client import get_client
+    from .temporal_client import QUERY_TIMEOUT, connected_client, running_workflows
 
     init_db()
     report = {"idle_workers": [], "failed_splits": [], "errors": []}
@@ -332,20 +326,21 @@ async def detect_idle_workers() -> dict:
         busy_servers = compute_busy(downloading, get_running_shards())
 
         # Query Temporal for running workflows per task queue
-        client = await get_client()
+        client = await connected_client()
         running_by_queue = {}
-        for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow",
-                        "ShardedDownloadWorkflow", "ShardWorkerWorkflow"]:
-            async for wf in client.list_workflows(
-                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
-            ):
-                running_by_queue.setdefault(wf.task_queue, []).append(wf.id)
+        for wf_id, queue in (await running_workflows(client)).items():
+            running_by_queue.setdefault(queue, []).append(wf_id)
 
-        # Also check for recently-failed workflows on each task queue
+        # Also check for recently-failed workflows on each task queue.
+        # Capped: this query carries no WorkflowType filter, so it walks every
+        # closed execution in the namespace over a 2-day window — unbounded,
+        # it can run for minutes on every 5-minute reconcile.
         recently_failed = {}
         try:
             async for wf in client.list_workflows(
-                'ExecutionStatus="Completed" AND CloseTime > "2d"'
+                'ExecutionStatus="Completed" AND CloseTime > "2d"',
+                limit=RECENT_CLOSED_LIMIT,
+                rpc_timeout=QUERY_TIMEOUT,
             ):
                 recently_failed.setdefault(wf.task_queue, []).append({
                     "id": wf.id,

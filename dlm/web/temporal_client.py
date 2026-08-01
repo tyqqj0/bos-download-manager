@@ -1,8 +1,17 @@
-"""Temporal client singleton for the web server."""
+"""Temporal client singleton for the web server.
+
+Every call out to Temporal from here runs on the uvicorn event loop, so
+every one of them needs a deadline. An await that never returns is not a
+slow request — it stops the loop iteration it belongs to. The scheduler
+loop reached through this module drives auto-dispatch, reconcile and
+health verification, and a hang there leaves a process that answers HTTP
+normally while nothing is dispatched or reconciled ever again.
+"""
 
 import asyncio
 import logging
 import os
+from datetime import timedelta
 from typing import Optional
 
 from temporalio.client import Client
@@ -12,12 +21,28 @@ logger = logging.getLogger("dlm.web")
 _client: Optional[Client] = None
 _client_loop: Optional[asyncio.AbstractEventLoop] = None
 
+# The download workflow types, in one place. Six sites used to inline this
+# same list, and each was a place a new workflow type could be forgotten.
+WORKFLOW_TYPES = (
+    "DownloadDatasetWorkflow",
+    "SplitDownloadWorkflow",
+    "ShardedDownloadWorkflow",
+    "ShardWorkerWorkflow",
+)
+
+CONNECT_TIMEOUT = 5  # seconds to reach the frontend; connect() has no deadline
+QUERY_TIMEOUT = timedelta(seconds=15)  # per list/describe RPC
+
 
 async def get_client() -> Client:
     """Get or create the Temporal client connection.
 
     Creates a new client if the event loop has changed (e.g., called from
     a different context than where the client was first created).
+
+    Prefer `connected_client()` — `Client.connect` takes no deadline of its
+    own, so if the frontend completes the TCP handshake and then goes quiet
+    this await never returns.
     """
     global _client, _client_loop
     current_loop = asyncio.get_running_loop()
@@ -29,6 +54,30 @@ async def get_client() -> Client:
         _client_loop = current_loop
 
     return _client
+
+
+async def connected_client(timeout: float = CONNECT_TIMEOUT) -> Client:
+    """`get_client()` that cannot hang forever."""
+    return await asyncio.wait_for(get_client(), timeout=timeout)
+
+
+async def running_workflows(client: Optional[Client] = None) -> dict:
+    """Every RUNNING download workflow, as `{workflow_id: task_queue}`.
+
+    The callers want three different views of this — a set of ids, the set
+    of busy task queues, and the id→queue mapping — so it returns the
+    mapping and lets them narrow it. Every scan carries an rpc_timeout;
+    none of the six hand-rolled copies did.
+    """
+    client = client or await connected_client()
+    found: dict[str, str] = {}
+    for wf_type in WORKFLOW_TYPES:
+        async for wf in client.list_workflows(
+            f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"',
+            rpc_timeout=QUERY_TIMEOUT,
+        ):
+            found[wf.id] = wf.task_queue
+    return found
 
 
 async def start_download(task_dict: dict, task_queue: str = "download-workers"):
@@ -118,22 +167,13 @@ async def start_sharded_download(task_dict: dict):
 async def _find_running_workflow_ids(client, task_id: str) -> list:
     """All RUNNING workflow IDs containing task_id — catches suffixed legacy
     IDs (e.g. dl-{task_id}-bjN-v3) that fixed patterns miss."""
-    found = []
-    for wf_type in [
-        "DownloadDatasetWorkflow",
-        "SplitDownloadWorkflow",
-        "ShardedDownloadWorkflow",
-        "ShardWorkerWorkflow",
-    ]:
-        try:
-            async for wf in client.list_workflows(
-                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
-            ):
-                if task_id in wf.id:
-                    found.append(wf.id)
-        except Exception:
-            pass
-    return found
+    try:
+        return [wf_id for wf_id in await running_workflows(client) if task_id in wf_id]
+    except Exception:
+        # Best effort: the caller falls back to the fixed ID patterns. Swallowing
+        # this is only safe because the scan is now bounded — an untimed one
+        # would hang /queue/pause and /tasks/{id}/skip instead of failing.
+        return []
 
 
 async def cancel_workflow(task_id: str):
@@ -204,7 +244,10 @@ async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> boo
         still_open = 0
         for handle in handles:
             try:
-                desc = await handle.describe()
+                # Without a deadline a single hung describe() outlives
+                # `timeout_s` entirely — the loop only re-checks between
+                # iterations, so it never gets to notice the deadline passed.
+                desc = await handle.describe(rpc_timeout=QUERY_TIMEOUT)
                 if desc.status in open_statuses:
                     still_open += 1
             except Exception:
@@ -217,17 +260,13 @@ async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> boo
 
 async def list_running_workflows() -> list:
     """List all running download workflows (all types)."""
-    client = await get_client()
+    client = await connected_client()
     workflows = []
-    for wf_type in [
-        "DownloadDatasetWorkflow",
-        "SplitDownloadWorkflow",
-        "ShardedDownloadWorkflow",
-        "ShardWorkerWorkflow",
-    ]:
+    for wf_type in WORKFLOW_TYPES:
         try:
             async for wf in client.list_workflows(
-                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
+                f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"',
+                rpc_timeout=QUERY_TIMEOUT,
             ):
                 workflows.append({
                     "workflow_id": wf.id,

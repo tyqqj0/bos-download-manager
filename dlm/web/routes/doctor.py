@@ -20,16 +20,26 @@ from ..fleet import DEAD_THRESHOLD, STALE_THRESHOLD, WORKER_TIMEOUT, has_live_wo
 router = APIRouter(tags=["doctor"])
 
 
+def _read_state() -> tuple[list, list, list]:
+    """Every SQLite read this route needs, in one executor hop.
+
+    `init_db()` is not a read — it runs executescript + commit and takes the
+    write lock — so calling it (and the queries) straight from `async def`
+    put a lock wait on the event loop on every /api/doctor request.
+    """
+    from ...queue.snapshot import (
+        get_all_tasks, get_running_shards, get_workers, init_db,
+    )
+    from ..fleet import dedupe_workers
+
+    init_db()
+    return get_all_tasks(), dedupe_workers(get_workers()), get_running_shards()
+
+
 @router.get("/doctor")
 async def diagnose():
     """Run health diagnostics including Temporal workflow check."""
-    from ...queue.snapshot import get_all_tasks, get_workers, init_db
-    init_db()
-
-    from ..fleet import dedupe_workers
-
-    tasks = get_all_tasks()
-    workers = dedupe_workers(get_workers())
+    tasks, workers, running_shards = await run_blocking(_read_state)
     now = time.time()
 
     # 1. Offline workers
@@ -76,23 +86,10 @@ async def diagnose():
     # 5. Check Temporal workflows vs downloading tasks
     orphaned = []
     try:
-        from ..temporal_client import get_client
-        client = await asyncio.wait_for(get_client(), timeout=5)
-        running_ids = set()
-
-        running_queues = set()
-
-        async def _list_wfs():
-            for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow",
-                            "ShardedDownloadWorkflow", "ShardWorkerWorkflow"]:
-                async for wf in client.list_workflows(
-                    f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
-                ):
-                    running_ids.add(wf.id)
-                    if wf.task_queue:
-                        running_queues.add(wf.task_queue)
-
-        await asyncio.wait_for(_list_wfs(), timeout=10)
+        from ..temporal_client import running_workflows
+        by_id = await asyncio.wait_for(running_workflows(), timeout=15)
+        running_ids = set(by_id)
+        running_queues = {q for q in by_id.values() if q}
 
         downloading = [t for t in tasks if t.get("status") == "downloading"]
         for t in downloading:
@@ -104,7 +101,6 @@ async def diagnose():
                     "name": t.get("name", ""),
                     "server": t.get("server", ""),
                     "stale_seconds": int(age),
-                    "workflow_id": workflow_id,
                 })
     except asyncio.TimeoutError:
         orphaned = [{"error": "Temporal query timed out (15s)"}]
@@ -120,9 +116,8 @@ async def diagnose():
     #    fallback. Skipped entirely if the Temporal query failed, since without
     #    it every worker would look idle.
     from ..fleet import idle_workers as compute_idle
-    from ...queue.snapshot import get_running_shards
 
-    candidates = compute_idle(tasks, workers, get_running_shards(), now)
+    candidates = compute_idle(tasks, workers, running_shards, now)
     if running_queues is None:
         candidates = []  # cannot tell without Temporal — don't cry wolf
     else:
@@ -179,11 +174,9 @@ async def fix(req: FixRequest):
     There is deliberately no "restart worker" action — restarting a worker is a
     host-level operation and goes through scripts/deploy-workers.sh.
     """
-    from ...queue.snapshot import get_all_tasks, update_task_progress, init_db
     from ..temporal_client import start_sharded_download
-    init_db()
 
-    tasks = get_all_tasks()
+    tasks, _, _ = await run_blocking(_read_state)
     now = time.time()
     results = {}
     actions = req.actions or ["redispatch_orphaned"]
@@ -196,15 +189,11 @@ async def fix(req: FixRequest):
     if "redispatch_orphaned" in actions:
         redispatched = []
         try:
-            from ..temporal_client import get_client
-            client = await get_client()
-            running_ids = set()
-            for wf_type in ["DownloadDatasetWorkflow", "SplitDownloadWorkflow",
-                            "ShardedDownloadWorkflow", "ShardWorkerWorkflow"]:
-                async for wf in client.list_workflows(
-                    f'WorkflowType="{wf_type}" AND ExecutionStatus="Running"'
-                ):
-                    running_ids.add(wf.id)
+            from ..temporal_client import running_workflows
+            # Deadline required: this scan decides whether a task gets a
+            # SECOND coordinator. An untimed one leaves the operator's repair
+            # request hanging with no way to tell whether it took effect.
+            running_ids = set(await asyncio.wait_for(running_workflows(), timeout=15))
 
             downloading = [t for t in tasks if t.get("status") == "downloading"]
             for t in downloading:
@@ -223,20 +212,30 @@ async def fix(req: FixRequest):
             redispatched.append(f"ERROR: {e}")
         results["redispatch_orphaned"] = redispatched
 
+    def _rewrite(matches, **fields) -> list:
+        """Apply one status change per matching task, off the event loop."""
+        from ...queue.snapshot import update_task_progress
+
+        def _do():
+            touched = []
+            for t in matches:
+                update_task_progress(t["id"], **fields)
+                touched.append(t.get("name", t["id"]))
+            return touched
+
+        return _do
+
     if "reset_stuck" in actions:
-        reset = []
-        for t in tasks:
-            if t.get("status") == "downloading" and now - (t.get("updated_at") or 0) > DEAD_THRESHOLD:
-                update_task_progress(t["id"], status="pending", phase="reset_by_doctor")
-                reset.append(t.get("name", t["id"]))
-        results["reset_stuck"] = reset
+        stuck = [t for t in tasks
+                 if t.get("status") == "downloading"
+                 and now - (t.get("updated_at") or 0) > DEAD_THRESHOLD]
+        results["reset_stuck"] = await run_blocking(
+            _rewrite(stuck, status="pending", phase="reset_by_doctor"))
 
     if "skip_zombie" in actions:
-        skipped = []
-        for t in tasks:
-            if t.get("status") == "failed" and (t.get("retry_count") or 0) >= 8:
-                update_task_progress(t["id"], status="revoked", phase=None)
-                skipped.append(t.get("name", t["id"]))
-        results["skip_zombie"] = skipped
+        zombies = [t for t in tasks
+                   if t.get("status") == "failed" and (t.get("retry_count") or 0) >= 8]
+        results["skip_zombie"] = await run_blocking(
+            _rewrite(zombies, status="revoked", phase=None))
 
     return results

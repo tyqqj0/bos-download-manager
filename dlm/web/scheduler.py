@@ -17,6 +17,15 @@ TRANSFER_INTERVAL = 60
 RECONCILE_INTERVAL = 300  # 5 minutes
 DISPATCH_INTERVAL = 30  # pending-task dispatch cadence (one sharded task per source per cycle)
 
+# Every stage below must finish or give up. A `try/except` catches a failure
+# but not a hang: one await that never returns stops this `while True` for
+# good, and the process keeps serving HTTP the whole time while nothing is
+# dispatched, reconciled or verified again. That is the same "alive but the
+# control plane is dead" outcome as the 2026-07-31 fork hang, reached from a
+# different direction, so the loop bounds each stage rather than trusting the
+# callee. Generous: these are normally sub-second.
+STAGE_TIMEOUT = 60
+
 
 def _build_dashboard() -> dict:
     """Build dashboard from SQLite snapshot."""
@@ -167,7 +176,8 @@ async def background_scheduler():
             if now - last_dispatch > DISPATCH_INTERVAL:
                 try:
                     from .reconciler import auto_dispatch_pending
-                    dispatch_report = await auto_dispatch_pending()
+                    dispatch_report = await asyncio.wait_for(
+                        auto_dispatch_pending(), timeout=STAGE_TIMEOUT)
                     if dispatch_report.get("dispatched"):
                         logger.info(f"Auto-dispatch: {dispatch_report['dispatched']}")
                     cache.set("auto_dispatch_report", dispatch_report)
@@ -179,7 +189,8 @@ async def background_scheduler():
             if now - last_reconcile > RECONCILE_INTERVAL:
                 try:
                     from .reconciler import reconcile
-                    report = await reconcile()
+                    report = await asyncio.wait_for(
+                        reconcile(), timeout=STAGE_TIMEOUT)
                     if report.get("redispatched") or report.get("errors"):
                         logger.info(f"Reconciler report: {report}")
                     cache.set("reconciler_report", report)
@@ -189,7 +200,8 @@ async def background_scheduler():
                 # Detect idle workers (online but no workflow — failed splits)
                 try:
                     from .reconciler import detect_idle_workers
-                    idle_report = await detect_idle_workers()
+                    idle_report = await asyncio.wait_for(
+                        detect_idle_workers(), timeout=STAGE_TIMEOUT)
                     cache.set("idle_worker_report", idle_report)
                     if idle_report.get("idle_workers"):
                         logger.warning(
@@ -211,7 +223,8 @@ async def background_scheduler():
             if now - last_health_verify > RECONCILE_INTERVAL:
                 try:
                     from .health_verifier import verify_all_workers
-                    verify_report = await verify_all_workers()
+                    verify_report = await asyncio.wait_for(
+                        verify_all_workers(), timeout=STAGE_TIMEOUT)
                     cache.set("health_verify_report", verify_report)
                     if verify_report.get("anomalies"):
                         logger.warning(
