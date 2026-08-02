@@ -60,10 +60,19 @@ fi
 
 echo "[$(date)] Deploying to: $TARGETS"
 
+# One flaky host must never abort the fleet loop: on 2026-08-03 a single
+# transient kex_exchange_identification reset (BJ sshd MaxStartups
+# throttling) killed the run under `set -e`, leaving 7 hosts unverified —
+# the exact "silent partial deploy" this script exists to prevent. Every
+# per-host step retries, a host that still fails is recorded and skipped,
+# and the script exits nonzero at the end if any host is not clean.
+FAILED_HOSTS=""
+
 for key in $TARGETS; do
     ip="${WORKERS[$key]:-$CUSTOM_IP}"
     if [ -z "$ip" ]; then
         echo "  ERROR: Unknown worker '$key' (use --ip for dynamic hosts)"
+        FAILED_HOSTS="$FAILED_HOSTS $key"
         continue
     fi
     queue="${QUEUES[$key]:-}"
@@ -73,13 +82,26 @@ for key in $TARGETS; do
     fi
 
     echo "  [$key] $ip — syncing code..."
-    rsync -az --delete \
-        --exclude '.git' \
-        --exclude '__pycache__' \
-        --exclude '*.pyc' \
-        --exclude '.env' \
-        --exclude 'node_modules' \
-        "$REPO_DIR/" "root@$ip:$REMOTE_DIR/"
+    synced=false
+    for attempt in 1 2 3; do
+        if rsync -az --delete \
+            --exclude '.git' \
+            --exclude '__pycache__' \
+            --exclude '*.pyc' \
+            --exclude '.env' \
+            --exclude 'node_modules' \
+            "$REPO_DIR/" "root@$ip:$REMOTE_DIR/"; then
+            synced=true
+            break
+        fi
+        echo "  [$key] rsync attempt $attempt failed — retrying in 10s..."
+        sleep 10
+    done
+    if [ "$synced" = false ]; then
+        echo "  [$key] ERROR: rsync failed after 3 attempts — skipping host"
+        FAILED_HOSTS="$FAILED_HOSTS $key"
+        continue
+    fi
 
     # Sidecar unit: installed/refreshed on EVERY deploy, not only restarts.
     # The old `if [ -f ...service ]` check silently skipped hosts that never
@@ -87,7 +109,7 @@ for key in $TARGETS; do
     # for a month. rsync above already put the unit at deploy/, so install
     # from there. enable --now starts a missing sidecar but leaves a running
     # one alone (code reload happens in the restart branch, same as workers).
-    ssh "root@$ip" bash -s "$key" "$REMOTE_DIR" <<'SIDECAR_SCRIPT'
+    ssh "root@$ip" bash -s "$key" "$REMOTE_DIR" <<'SIDECAR_SCRIPT' || { echo "  [$key] ERROR: sidecar install ssh failed — skipping host"; FAILED_HOSTS="$FAILED_HOSTS $key"; continue; }
         SERVER_KEY="$1"
         REMOTE_DIR="$2"
         # The unit hardcodes /usr/bin/python3; a host where that interpreter
@@ -109,7 +131,7 @@ SIDECAR_SCRIPT
 
     if [ "$RESTART" = true ]; then
         echo "  [$key] $ip — restarting worker (queue=${queue:-default})..."
-        ssh "root@$ip" bash -s "$key" "$queue" <<'REMOTE_SCRIPT'
+        ssh "root@$ip" bash -s "$key" "$queue" <<'REMOTE_SCRIPT' || { echo "  [$key] ERROR: restart ssh failed"; FAILED_HOSTS="$FAILED_HOSTS $key"; continue; }
             SERVER_KEY="$1"
             TASK_QUEUE="${2:-}"
             pkill -f "dlm.temporal" 2>/dev/null || true
@@ -151,10 +173,27 @@ echo "  S1 (reference): $local_md5"
 for key in $TARGETS; do
     ip="${WORKERS[$key]:-$CUSTOM_IP}"
     [ -z "$ip" ] && continue
-    remote_md5=$(ssh "root@$ip" "cd $REMOTE_DIR && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1" 2>/dev/null || echo "UNREACHABLE")
+    # Retried: a manifest probe losing the ssh race must not report a host
+    # as MISMATCH when the deploy itself succeeded (bj1, 2026-08-03).
+    remote_md5="UNREACHABLE"
+    for attempt in 1 2 3; do
+        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1" 2>/dev/null); then
+            remote_md5="$m"
+            break
+        fi
+        sleep 5
+    done
     status="OK"
-    [ "$remote_md5" != "$local_md5" ] && status="MISMATCH"
+    if [ "$remote_md5" != "$local_md5" ]; then
+        status="MISMATCH"
+        FAILED_HOSTS="$FAILED_HOSTS $key"
+    fi
     echo "  $key: $remote_md5 [$status]"
 done
 
+if [ -n "$FAILED_HOSTS" ]; then
+    echo "[$(date)] Deploy INCOMPLETE — failed hosts:$FAILED_HOSTS"
+    echo "  Re-run: bash scripts/deploy-workers.sh$(for k in $FAILED_HOSTS; do printf ' --worker %s' "$k"; done)"
+    exit 1
+fi
 echo "[$(date)] Deploy complete."
