@@ -243,9 +243,21 @@ def main():
                         help="actually import (default: dry-run)")
     parser.add_argument("--only", default="",
                         help="run only the named dataset (re-run escape hatch)")
+    parser.add_argument("--manifest", default="",
+                        help="JSON file with the transfer list (overrides built-in)")
+    parser.add_argument("--allow-topup", action="store_true",
+                        help="import onto an existing smaller target instead of "
+                             "aborting. ONLY safe because the 2026-08-03 rh20t "
+                             "experiment proved overwrite/skip-same semantics "
+                             "(partial 268MB -> exactly BOS size, no duplication)")
     args = parser.parse_args()
 
     manifest = MANIFEST
+    if args.manifest:
+        with open(args.manifest) as f:
+            manifest = json.load(f)
+        for m in manifest:
+            assert m.get("name") and m.get("src") and m.get("category"), m
     if args.only:
         manifest = [m for m in MANIFEST if m["name"] == args.only]
         if not manifest:
@@ -279,15 +291,18 @@ def main():
                      f"world changed since reconciliation")
         parent = f"{RAW}/{category}"
         jfs = jfs_folder_size(dcloud, parent, name)
-        if jfs and jfs >= bos_bytes:
+        if jfs and jfs >= bos_bytes and not item.get("force"):
             log(f"  skip (target already complete): {name} jfs={jfs:,} >= bos={bos_bytes:,}")
             state[name] = {"status": "verified", "jfs_bytes": jfs,
                            "bos_bytes": bos_bytes, "note": "pre-existing"}
             continue
-        if jfs:
+        if jfs and not args.allow_topup and not item.get("force"):
             sys.exit(f"ABORT pre-flight: {parent}/{name} exists with {jfs:,} B "
-                     f"< {bos_bytes:,} B — partial target, import merge semantics "
-                     f"unverified; needs a human decision")
+                     f"< {bos_bytes:,} B — partial target; re-run with "
+                     f"--allow-topup (overwrite/skip-same semantics proven "
+                     f"2026-08-03) or resolve by hand")
+        if jfs:
+            log(f"  top-up: {name} target has {jfs:,} B < bos {bos_bytes:,} B")
         plan.append({**item, "bos_bytes": bos_bytes, "bos_objects": bos_objects,
                      "parent": parent, "target": f"{parent}/{name}"})
         log(f"  plan: {src} ({bos_bytes:,} B / {bos_objects} obj) -> {parent}/{name}")
@@ -342,7 +357,12 @@ def main():
         # ---- Verify 2: scope — target children ⊆ source children. Catches
         # prefix bleed and nesting, which the size check cannot see.
         try:
-            src_children = bos_top_children(bos, src)
+            # A top-up target may legitimately hold children from an earlier
+            # import of a sibling copy of the same dataset — manifest items
+            # can list every legitimate source under "scope_srcs".
+            src_children = set()
+            for sp in item.get("scope_srcs") or [src]:
+                src_children |= bos_top_children(bos, sp)
             dst_children = jfs_children(dcloud, item["target"])
         except Exception as e:
             src_children, dst_children = None, None
