@@ -210,8 +210,19 @@ async def filter_filelist_against_bos(filelist_path: str, task_input: TaskInput)
             "remaining_bytes": sum(f.get("size", 0) for f in remaining),
         }
 
-    activity.heartbeat("listing BOS objects for resume filter...")
-    result = await asyncio.to_thread(_filter)
+    # Heartbeat concurrently: with tens of thousands of objects already at
+    # the target prefix the paginated listing outlives the heartbeat timeout
+    # (same failure mode list_repo_files had on large repos).
+    async def _heartbeat_while_filtering():
+        while True:
+            activity.heartbeat("listing BOS objects for resume filter...")
+            await asyncio.sleep(30)
+
+    heartbeat_task = asyncio.create_task(_heartbeat_while_filtering())
+    try:
+        result = await asyncio.to_thread(_filter)
+    finally:
+        heartbeat_task.cancel()
     logger.info(
         "BOS resume filter for %s: skipped %d files (%.1f GB), %d remaining (%.1f GB)",
         task_input.name, result["skipped_files"],
