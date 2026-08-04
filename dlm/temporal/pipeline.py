@@ -201,13 +201,55 @@ class PipelineEngine:
             err_str = str(e)
             if "403" in err_str or "forbidden" in err_str.lower():
                 raise _AccessDenied(f"Access denied for {file_info.path}: {err_str[:200]}")
+            if "File name too long" in err_str:
+                # The SDK flattens the full repo path into a lock-file name,
+                # which overflows the 255-byte filename limit on deep paths.
+                # Fetch the raw file over HTTP instead.
+                try:
+                    local_path = self._download_via_http_modelscope(file_info, token)
+                    self._emit_event("file_downloaded", {
+                        "file": file_info.path,
+                        "size_bytes": file_info.size,
+                        "duration_s": round(time.time() - t0, 1),
+                        "endpoint": "modelscope-http",
+                    })
+                    return local_path
+                except Exception as e2:
+                    err_str = f"{err_str[:150]}; http fallback failed: {e2}"
             self._emit_event("file_failed", {
                 "file": file_info.path,
                 "error": err_str[:200],
                 "endpoint": "modelscope",
             })
-            logger.warning(f"ModelScope download failed for {file_info.path}: {e}")
+            logger.warning(f"ModelScope download failed for {file_info.path}: {err_str}")
             return None
+
+    def _download_via_http_modelscope(self, file_info: FileInfo, token: "str | None") -> Path:
+        """Raw-file fetch bypassing the SDK's path-derived lock files."""
+        import requests
+        from urllib.parse import quote
+
+        kind = "datasets" if self.task.type == "dataset" else "models"
+        url = (
+            f"https://www.modelscope.cn/api/v1/{kind}/{self.task.repo_id}"
+            f"/repo?Revision=master&FilePath={quote(file_info.path, safe='')}"
+        )
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        dest = self.staging_dir / file_info.path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
+        with requests.get(url, stream=True, timeout=HTTP_TIMEOUT, headers=headers) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        f.write(chunk)
+        size = tmp.stat().st_size
+        if file_info.size and size != file_info.size:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"size mismatch for {file_info.path}: got {size}, expected {file_info.size}")
+        tmp.replace(dest)
+        return dest
 
     async def _producer(self, files: list[FileInfo], queue: asyncio.Queue):
         """Download files using thread pool, put completed FileInfo onto queue."""
