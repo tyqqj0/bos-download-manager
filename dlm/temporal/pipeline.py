@@ -13,6 +13,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import shutil
@@ -199,14 +200,14 @@ class PipelineEngine:
             return Path(local_path)
         except Exception as e:
             err_str = str(e)
-            if "403" in err_str or "forbidden" in err_str.lower():
-                raise _AccessDenied(f"Access denied for {file_info.path}: {err_str[:200]}")
-            if "File name too long" in err_str:
+            if isinstance(e, OSError) and e.errno == errno.ENAMETOOLONG:
                 # The SDK flattens the full repo path into a lock-file name,
                 # which overflows the 255-byte filename limit on deep paths.
-                # Fetch the raw file over HTTP instead.
+                # Fetch the raw file over HTTP instead. (Checked before the
+                # 403 guard: the OSError message embeds the full path, which
+                # may itself contain "403".)
                 try:
-                    local_path = self._download_via_http_modelscope(file_info, token)
+                    local_path = self._download_via_http_modelscope(file_info, token, cancel_event)
                     self._emit_event("file_downloaded", {
                         "file": file_info.path,
                         "size_bytes": file_info.size,
@@ -216,6 +217,8 @@ class PipelineEngine:
                     return local_path
                 except Exception as e2:
                     err_str = f"{err_str[:150]}; http fallback failed: {e2}"
+            elif "403" in err_str or "forbidden" in err_str.lower():
+                raise _AccessDenied(f"Access denied for {file_info.path}: {err_str[:200]}")
             self._emit_event("file_failed", {
                 "file": file_info.path,
                 "error": err_str[:200],
@@ -224,7 +227,9 @@ class PipelineEngine:
             logger.warning(f"ModelScope download failed for {file_info.path}: {err_str}")
             return None
 
-    def _download_via_http_modelscope(self, file_info: FileInfo, token: "str | None") -> Path:
+    def _download_via_http_modelscope(
+        self, file_info: FileInfo, token: "str | None", cancel_event=None
+    ) -> Path:
         """Raw-file fetch bypassing the SDK's path-derived lock files."""
         import requests
         from urllib.parse import quote
@@ -234,22 +239,42 @@ class PipelineEngine:
             f"https://www.modelscope.cn/api/v1/{kind}/{self.task.repo_id}"
             f"/repo?Revision=master&FilePath={quote(file_info.path, safe='')}"
         )
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
         dest = self.staging_dir / file_info.path
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".part")
-        with requests.get(url, stream=True, timeout=HTTP_TIMEOUT, headers=headers) as r:
-            r.raise_for_status()
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    if chunk:
-                        f.write(chunk)
-        size = tmp.stat().st_size
-        if file_info.size and size != file_info.size:
-            tmp.unlink(missing_ok=True)
-            raise RuntimeError(f"size mismatch for {file_info.path}: got {size}, expected {file_info.size}")
-        tmp.replace(dest)
-        return dest
+
+        header_sets = [{"Authorization": f"Bearer {token}"}] if token else [{}]
+        if token:
+            header_sets.append({})  # stale token can 401 where anonymous succeeds
+
+        last_exc: Exception = RuntimeError("no attempt made")
+        for headers in header_sets:
+            try:
+                with requests.get(
+                    url, stream=True, timeout=(10, HTTP_TIMEOUT), headers=headers
+                ) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=1 << 20):
+                            if cancel_event and cancel_event.is_set():
+                                raise RuntimeError(f"cancelled: {file_info.path}")
+                            if chunk:
+                                f.write(chunk)
+                size = tmp.stat().st_size
+                if file_info.size and size != file_info.size:
+                    raise RuntimeError(
+                        f"size mismatch for {file_info.path}: got {size}, expected {file_info.size}"
+                    )
+                tmp.replace(dest)
+                return dest
+            except Exception as exc:
+                tmp.unlink(missing_ok=True)
+                last_exc = exc
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status in (401, 403) and headers:
+                    continue  # retry anonymously
+                raise
+        raise last_exc
 
     async def _producer(self, files: list[FileInfo], queue: asyncio.Queue):
         """Download files using thread pool, put completed FileInfo onto queue."""
@@ -360,6 +385,7 @@ class PipelineEngine:
                 for candidate in [
                     target_path,
                     Path(str(target_path) + ".incomplete"),
+                    Path(str(target_path) + ".part"),
                     self.staging_dir / "._____temp" / file_info.path,
                 ]:
                     if candidate.exists():
