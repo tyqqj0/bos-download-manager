@@ -31,6 +31,31 @@ v1 有 5 组 BLOCKER 级漏洞,已全部在本版闭合(见 §6 修订记录)。
 - **R9** workflows.py 确定性;新旧并存灰度;回滚可行
 - **R10** 可观测性不降级;orphan 恢复在新形态有等价物
 
+## 1.5 验收规则(A1-A10,与 R 一一对应,全部可执行)
+
+- **A1**(R1)web 新建任务不填分片 → 派发后 5 分钟内,池内全部存活机器各有
+  1 个 running 批行(SQL 可查);dashboard 显示全员活跃
+- **A2**(R2)双任务实测:A 独占池后启动同源 B → 10 分钟内 B 获得 ≥1 批;
+  A 完成后 5 分钟内其机器全部被 B 接管;稳态时两任务 running 批行数之和=池大小
+- **A3**(R3)P0+P1 并行:稳态 P0 running 批数 > P1(窗口比生效);
+  pause 后 60s 内该任务 0 running 批行、无新批、进度报文停;resume 无损
+  (BOS filter 跳过已传,对象数不涨即无重复);skip 后 temporal describe
+  确认协调器 closed
+- **A4**(R4)试跑中 kill 一台 worker 进程 → 批次经心跳超时+退避被他机接走
+  (批行 server 变更为证),任务最终 done;机器恢复后下一窗口重算周期重新领批
+- **A5**(R5)故意 terminate 再 resume 一次 → 终态后 BOS 对象数+字节与源清单
+  一致(RoboDojo 式全量核对),对象数不超(无重复上传)
+- **A6**(R6)describe_task_queue:pool-hf 轮询者仅 w*,pool-ms 仅 bj*
+- **A7**(R7)任一时刻单机 running 池批行 ≤1(SQL);低盘机器不接批
+  (重试退避日志为证);背压日志正常出现
+- **A8**(R8)单测+实测:终态任务收到迟到 assign/status/progress → 状态不变
+- **A9**(R9)CI replay 测试通过(存量 history 回放);两阶段部署清单 16/16
+  全绿;回滚演练:半程 pool 任务 reshard 回 sharded 并成功续跑
+- **A10**(R10)试跑期 doctor/alerts 零误报;批次聚合视图正常;
+  停掉全池 worker → 15 分钟内池巡检告警触发
+- **A0(硬约束)**:实施与灰度全过程,存量下载任务(尤其 Egocentric-100K)
+  不被终止;所有部署走无损重启;验收失败即回滚,不带病切默认
+
 ## 2. 核心设计(v2)
 
 ### 2.1 骨架(不变)
