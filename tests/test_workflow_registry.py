@@ -16,29 +16,37 @@ from __future__ import annotations
 import inspect
 
 
-def _is_workflow_defn(cls) -> bool:
-    """Whether `cls` was decorated with `@temporalio.workflow.defn`.
+def _workflow_defn_name(cls) -> str | None:
+    """The registered Temporal type name of `cls`, or None if it is not a
+    `@temporalio.workflow.defn` class.
 
-    `_Definition.from_class` is the documented way to answer this (it
-    returns None for a plain class); `__temporal_workflow_definition` is
-    the attribute the decorator actually stamps on the class and is kept
-    as a fallback in case the private `_Definition` API moves again.
+    The registered name — not the Python class name — is what visibility
+    queries and WORKFLOW_TYPES must match; `@workflow.defn(name=...)` makes
+    the two diverge. `_Definition.from_class` is the documented way to read
+    it (returns None for a plain class); `__temporal_workflow_definition` is
+    the attribute the decorator actually stamps on the class and is kept as
+    a fallback in case the private `_Definition` API moves again.
     """
     from temporalio import workflow
 
     definition_cls = getattr(workflow, "_Definition", None)
     if definition_cls is not None and hasattr(definition_cls, "from_class"):
-        return definition_cls.from_class(cls) is not None
-    return hasattr(cls, "__temporal_workflow_definition")
+        definition = definition_cls.from_class(cls)
+        return definition.name if definition is not None else None
+    definition = getattr(cls, "__temporal_workflow_definition", None)
+    return getattr(definition, "name", cls.__name__) if definition is not None else None
 
 
 def _defn_class_names() -> set[str]:
     from dlm.temporal import workflows
 
+    # No __module__ filter: a defn class imported into workflows.py from a
+    # sibling module still gets registered on the worker, so it must still
+    # be covered here.
     return {
-        name
-        for name, obj in inspect.getmembers(workflows, inspect.isclass)
-        if obj.__module__ == workflows.__name__ and _is_workflow_defn(obj)
+        registered
+        for _, obj in inspect.getmembers(workflows, inspect.isclass)
+        if (registered := _workflow_defn_name(obj)) is not None
     }
 
 
@@ -71,3 +79,12 @@ def test_every_workflow_type_has_an_id_prefix():
 
     missing = [t for t in WORKFLOW_TYPES if t not in WORKFLOW_ID_PREFIXES]
     assert not missing, f"workflow types with no WORKFLOW_ID_PREFIXES entry: {missing}"
+
+
+def test_pool_prefix_value():
+    """Every other prefix value is transitively locked by test_fleet's literal
+    ID strings; `pool-` has no consumer test until T5, so pin it here — T5's
+    workflow IDs and the sweep code must agree on it."""
+    from dlm.web.temporal_client import WORKFLOW_ID_PREFIXES
+
+    assert WORKFLOW_ID_PREFIXES["PoolDownloadWorkflow"] == "pool-"
