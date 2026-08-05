@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 from ..core.naming import shard_row_id, split_shard_name
 from .models import TaskInput, FileInfo, PipelineStats, ShardInput
@@ -695,16 +696,15 @@ async def pool_alive_workers(source: str) -> int:
     return int(resp.json().get("count", 0))
 
 
-class BatchLimitExceededError(Exception):
-    """chunk_filelist would produce more batches than the runtime cap allows.
-
-    Non-retryable: the same filelist always chunks into the same batch
-    count, so retrying `chunk_filelist` cannot fix this — the task needs to
-    be split or re-sharded. Callers should either list
-    `"BatchLimitExceededError"` in their `RetryPolicy.non_retryable_error_types`
-    or call this activity with `maximum_attempts=1`.
-    """
-
+# "BatchLimitExceededError" — the Temporal error `type` chunk_filelist raises
+# (as an `ApplicationError(..., type="BatchLimitExceededError", non_retryable=True)`)
+# when a filelist would produce more batches than the runtime cap allows. The
+# same filelist always chunks into the same batch count, so retrying
+# chunk_filelist cannot fix this — the task needs to be split or re-sharded.
+# `non_retryable=True` on the raise makes this a property of the error itself,
+# not something callers must remember to list in
+# `RetryPolicy.non_retryable_error_types` (though listing the type name there
+# too is harmless belt-and-suspenders).
 
 # Per-batch limits (spec-fixed, not env/fleet-config — unlike POOL_MAX_BATCHES
 # these aren't an operator dial, they're the shape of a Temporal-payload-sized
@@ -746,18 +746,32 @@ def _chunk_files(
         else:
             normal.append(f)
 
+    # `open_bins` holds indices of bins that haven't hit max_files yet — the
+    # only ones first-fit can still place a file in. A bin that reaches
+    # max_files is removed permanently (files only ever get added, never
+    # removed, so a closed bin never re-opens). This does not change which
+    # bin any file lands in — it only skips rescanning bins the plain
+    # `len(bins[i]) < max_files` check would have rejected anyway — but it
+    # bounds the rescan cost for the common case of many small files filling
+    # up max_files-sized bins (bare first-fit is O(files * bins), which was
+    # ~8.6s at 500k files and ~20s near the batch-count cap).
     bins: list[list[dict]] = []
     bin_bytes: list[int] = []
+    open_bins: list[int] = []
     for f in normal:
         size = f.get("size", 0)
-        for i in range(len(bins)):
-            if len(bins[i]) < max_files and bin_bytes[i] + size <= max_bytes:
-                bins[i].append(f)
-                bin_bytes[i] += size
+        for idx in open_bins:
+            if bin_bytes[idx] + size <= max_bytes:
+                bins[idx].append(f)
+                bin_bytes[idx] += size
+                if len(bins[idx]) >= max_files:
+                    open_bins.remove(idx)
                 break
         else:
             bins.append([f])
             bin_bytes.append(size)
+            if len(bins[-1]) < max_files:
+                open_bins.append(len(bins) - 1)
 
     return big_batches + bins
 
@@ -773,17 +787,31 @@ async def chunk_filelist(
 
     Must run on the listing worker — filtered_path lives on its local disk
     (same pinning reason as list_repo_files/filter_filelist_against_bos/
-    partition_files_greedy).
+    partition_files_greedy). A MISSING file is treated as lost state (the
+    filter step's output can vanish to a staging wipe or disk pressure), not
+    as an empty filelist — it raises RuntimeError rather than silently
+    returning zero batches, which would otherwise read as "already fully
+    filtered, nothing to download" and complete the task with zero bytes
+    downloaded. A present-but-empty `[]` file is the legitimate no-op and
+    still returns zero batches without raising.
 
     Batching: see `_chunk_files` (<=BATCH_MAX_FILES files, <=BATCH_MAX_BYTES
-    bytes per batch, oversized files isolated, deterministic).
+    bytes per batch, oversized files isolated, deterministic). The read of
+    filtered_path and the chunking are heartbeated together with the upload
+    phase (one concurrent heartbeat task spanning all three) — `_chunk_files`
+    is quadratic in file count and can itself run for many seconds, which
+    must not go unheartbeated on the worker's event loop (same failure mode
+    filter_filelist_against_bos guards against).
 
     max_batches is a runtime guard, not just a test assertion: a task that
     would chunk past it needs to be split or re-sharded, not scheduled. On
-    overflow raises BatchLimitExceededError (see its docstring for how the
-    caller should mark it non-retryable) — the coordinator surfaces this as
-    the batch's failure, which the existing "task failed" alert path picks
-    up once wired to a terminal write (activities only raise; G4).
+    overflow raises `temporalio.exceptions.ApplicationError` with
+    `type="BatchLimitExceededError"` and `non_retryable=True` — non-retryability
+    is carried by the raise itself, so callers don't need to remember to list
+    the type in `RetryPolicy.non_retryable_error_types`. The coordinator
+    surfaces this as the batch's failure, which the existing "task failed"
+    alert path picks up once wired to a terminal write (activities only
+    raise; G4).
 
     Uploads each batch to
     `META_BUCKET:download-manager/batchlists/{task_input.name}/batch-{i}.json`.
@@ -797,24 +825,22 @@ async def chunk_filelist(
     with no BOS calls.
     """
     path = Path(filtered_path)
-    all_files = json.loads(path.read_text()) if path.exists() else []
 
-    batches = _chunk_files(all_files)
-
-    if len(batches) > max_batches:
-        raise BatchLimitExceededError(
-            f"{task_input.name}: {len(all_files)} files chunk into "
-            f"{len(batches)} batches, over the cap of {max_batches} — "
-            f"split the task or re-shard instead of scheduling"
-        )
-
-    if not batches:
-        return {"batch_keys": [], "counts": [], "bytes": []}
+    def _read_and_chunk():
+        if not path.exists():
+            raise RuntimeError(
+                f"chunk_filelist: filtered filelist missing at "
+                f"{filtered_path} for {task_input.name} — this is lost "
+                f"state, not an empty filelist; re-run the BOS resume "
+                f"filter step before chunking"
+            )
+        files = json.loads(path.read_text())
+        return files, _chunk_files(files)
 
     from ..core.bos import create_bos_client, upload_file
     from ..constants import META_BUCKET
 
-    def _write_and_upload():
+    def _write_and_upload(batches):
         ak = os.environ.get("BAIDU_AK", "")
         sk = os.environ.get("BAIDU_SK", "")
         endpoint = os.environ.get("BOS_ENDPOINT", "https://bj.bcebos.com")
@@ -835,17 +861,37 @@ async def chunk_filelist(
             byte_totals.append(batch_bytes)
         return batch_keys, counts, byte_totals
 
+    # Heartbeat concurrently across read + chunk + upload (started before any
+    # of that work begins) — see the docstring note on why the read/chunk
+    # phase alone can be slow enough to need it.
     async def _heartbeat_while_chunking():
         while True:
-            activity.heartbeat(f"uploading batch lists for {task_input.name}...")
+            activity.heartbeat(f"chunking filelist for {task_input.name}...")
             await asyncio.sleep(30)
 
-    activity.heartbeat(f"chunking {len(all_files)} files into {len(batches)} batches...")
     heartbeat_task = asyncio.create_task(_heartbeat_while_chunking())
     try:
-        batch_keys, counts, byte_totals = await asyncio.to_thread(_write_and_upload)
+        all_files, batches = await asyncio.to_thread(_read_and_chunk)
+
+        if len(batches) > max_batches:
+            raise ApplicationError(
+                f"{task_input.name}: {len(all_files)} files chunk into "
+                f"{len(batches)} batches, over the cap of {max_batches} — "
+                f"split the task or re-shard instead of scheduling",
+                type="BatchLimitExceededError",
+                non_retryable=True,
+            )
+
+        if not batches:
+            return {"batch_keys": [], "counts": [], "bytes": []}
+
+        activity.heartbeat(
+            f"uploading {len(batches)} batch lists for {task_input.name}..."
+        )
+        batch_keys, counts, byte_totals = await asyncio.to_thread(
+            _write_and_upload, batches
+        )
     finally:
         heartbeat_task.cancel()
-    activity.heartbeat(f"uploaded {len(batch_keys)} batch lists")
 
     return {"batch_keys": batch_keys, "counts": counts, "bytes": byte_totals}

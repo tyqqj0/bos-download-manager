@@ -13,11 +13,11 @@ import asyncio
 import json
 
 import pytest
+from temporalio.exceptions import ApplicationError
 
 from dlm.temporal.activities import (
     BATCH_MAX_BYTES,
     BATCH_MAX_FILES,
-    BatchLimitExceededError,
     _chunk_files,
     chunk_filelist,
 )
@@ -158,13 +158,24 @@ def test_chunk_filelist_uploads_one_manifest_per_batch(tmp_path, fake_bos):
     assert sum(result["counts"]) == len(files)
     assert sum(result["bytes"]) == sum(f["size"] for f in files)
 
+    all_manifest_paths = []
     for key, count in zip(result["batch_keys"], result["counts"]):
         assert key.startswith("download-manager/batchlists/pool-task/batch-")
         manifest = json.loads(fake_bos[("westlake-autolab-databuilder-meta", key)])
         assert len(manifest) == count
+        all_manifest_paths.extend(f["path"] for f in manifest)
+
+    # Round-trip integrity: the union of paths across all uploaded batch
+    # manifests must equal exactly the input filelist's path set — catches
+    # contents written under the wrong batch key, and dropped/duplicated
+    # files that a length-only check would miss.
+    assert sorted(all_manifest_paths) == sorted(f["path"] for f in files)
 
 
 def test_chunk_filelist_empty_input_makes_no_bos_calls(tmp_path, fake_bos):
+    # A PRESENT file containing `[]` is the legitimate no-op (fully filtered,
+    # nothing left to download) — unlike a MISSING file, it must return zero
+    # batches without raising.
     filtered = tmp_path / ".filelist.filtered.json"
     filtered.write_text(json.dumps([]))
 
@@ -174,12 +185,18 @@ def test_chunk_filelist_empty_input_makes_no_bos_calls(tmp_path, fake_bos):
     assert fake_bos == {}
 
 
-def test_chunk_filelist_missing_file_treated_as_empty(tmp_path, fake_bos):
+def test_chunk_filelist_missing_file_raises(tmp_path, fake_bos):
+    # A missing filtered filelist is lost state (staging wipe, disk
+    # pressure) — not a legitimate "nothing left to download" — so it must
+    # raise rather than silently returning zero batches, which the
+    # coordinator would otherwise read as "fully filtered" and complete the
+    # task with zero bytes downloaded.
     missing = tmp_path / "does-not-exist.json"
 
-    result = _run(chunk_filelist, str(missing), _task_input())
+    with pytest.raises(RuntimeError, match=str(missing)):
+        _run(chunk_filelist, str(missing), _task_input())
 
-    assert result == {"batch_keys": [], "counts": [], "bytes": []}
+    assert fake_bos == {}
 
 
 def test_chunk_filelist_over_cap_raises_non_retryable(tmp_path, fake_bos):
@@ -189,8 +206,11 @@ def test_chunk_filelist_over_cap_raises_non_retryable(tmp_path, fake_bos):
     filtered = tmp_path / ".filelist.filtered.json"
     filtered.write_text(json.dumps(files))
 
-    with pytest.raises(BatchLimitExceededError):
+    with pytest.raises(ApplicationError) as exc_info:
         _run(chunk_filelist, str(filtered), _task_input(), max_batches=2)
+
+    assert exc_info.value.type == "BatchLimitExceededError"
+    assert exc_info.value.non_retryable is True
 
     # The cap check must happen before any BOS upload — a rejected task
     # must not leave partial batch manifests behind.
