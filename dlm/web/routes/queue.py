@@ -412,6 +412,99 @@ async def create_shards(body: dict):
     return await _run_blocking(do_create)
 
 
+@router.post("/pool/batches/create")
+async def create_pool_batches(body: dict):
+    """Idempotent batch-row creation for the pool path (dispatch_mode='pool').
+
+    /shards/create's delete-then-create semantics don't carry over here: the
+    sharded coordinator only ever calls it once, before any shard has
+    started, so blowing away stale rows first is safe. The pool coordinator
+    can retry create_pool_batches_in_db (start_to_close=5min, retry x3), and
+    by the time a retry lands, run_pool_batch activities may already be
+    assigning/reporting against the rows the first attempt created — delete
+    them and that progress is gone.
+
+    Idempotency key: `expected_count` plus, row for row, an exact match of
+    (shard_index, filelist_key, total_files, total_bytes) against what's
+    already on file. A hit still resets every non-done row to
+    pending/server=NULL/speed=0 — a retry can follow a crash mid-window, and
+    any row a dead attempt marked running must be picked up again.
+
+    Body: task_id, shard_infos (list of {shard_index, filelist_key,
+    total_files, total_bytes}), expected_count (optional, defaults to
+    len(shard_infos); a mismatch against shard_infos is a caller bug, not an
+    idempotency question).
+    """
+    task_id = body.get("task_id", "")
+    batch_infos = body.get("shard_infos", [])
+    expected_count = body.get("expected_count", len(batch_infos))
+    if not task_id or not batch_infos:
+        return {"error": "task_id and shard_infos required"}
+    if expected_count != len(batch_infos):
+        return {"error": f"expected_count={expected_count} does not match "
+                          f"len(shard_infos)={len(batch_infos)}"}
+
+    def key(shard_index, filelist_key, total_files, total_bytes):
+        return (shard_index, filelist_key or "", total_files, total_bytes)
+
+    def do_create():
+        snapshot.init_db()
+        conn = snapshot._conn()
+        existing = snapshot.get_shards_by_task(task_id)
+
+        incoming = sorted(
+            key(info["shard_index"], info.get("filelist_key", ""),
+                info["total_files"], info["total_bytes"])
+            for info in batch_infos
+        )
+
+        if existing and len(existing) == expected_count:
+            on_file = sorted(
+                key(r["shard_index"], r.get("filelist_key"), r["total_files"], r["total_bytes"])
+                for r in existing
+            )
+            if on_file == incoming:
+                # Idempotent hit. 'done' rows are left alone — their upload
+                # already landed — everything else goes back to pending so
+                # the window loop re-issues it.
+                conn.execute(
+                    "UPDATE shards SET status='pending', server=NULL, speed_mbps=0 "
+                    "WHERE task_id=? AND status!='done'",
+                    (task_id,),
+                )
+                conn.commit()
+                return {
+                    "ok": True, "idempotent": True,
+                    "shard_ids": [r["id"] for r in sorted(existing, key=lambda r: r["shard_index"])],
+                }
+
+        if existing:
+            return {"error": f"batch rows already exist for {task_id} and do not match the requested set"}
+
+        now = time.time()
+        shard_ids = []
+        rows = []
+        for info in batch_infos:
+            idx = info["shard_index"]
+            shard_id = shard_row_id(task_id, idx)
+            shard_ids.append(shard_id)
+            rows.append((
+                shard_id, task_id, idx, "pending",
+                info["total_files"], info["total_bytes"],
+                info.get("filelist_key", ""), now,
+            ))
+        # Single transaction — a 700-row loop of individual commits is what
+        # blew /shards/create's client-side timeout on the sharded path.
+        conn.executemany(
+            "INSERT INTO shards (id, task_id, shard_index, status, total_files, "
+            "total_bytes, filelist_key, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        return {"ok": True, "idempotent": False, "shard_ids": shard_ids}
+    return await _run_blocking(do_create)
+
+
 @router.post("/shards/status")
 async def update_shard_status_api(body: dict):
     """Update shard status. Called by update_shard_status activity."""
@@ -423,6 +516,16 @@ async def update_shard_status_api(body: dict):
 
     def do_update():
         snapshot.init_db()
+        shard = snapshot.get_shard(shard_id)
+        if not shard:
+            return {"error": f"Shard {shard_id} not found"}
+        # A dying workflow's late write must not resurrect a task an operator
+        # already stopped — same rule as /api/shard-progress and
+        # /api/task-progress, returned as 200/ignored so old workers never
+        # see (and retry against) an error.
+        parent = snapshot.get_task(shard.get("task_id") or "")
+        if parent and parent.get("status") in TERMINAL_STATUSES:
+            return {"ok": True, "ignored": True}
         if status in ("done", "failed"):
             snapshot.complete_shard(shard_id, status)
             if error:
@@ -432,6 +535,11 @@ async def update_shard_status_api(body: dict):
             if error:
                 fields["error"] = error
             snapshot.update_shard_progress(shard_id, **fields)
+        # A shard reaching a terminal status makes its last write here — if
+        # the 5s debounce swallowed it, the task's aggregate would stay
+        # stale until the workflow's own end-of-run aggregate call.
+        if status in ("done", "failed") and shard.get("task_id"):
+            _aggregate_task(shard["task_id"], force=True)
         return {"ok": True}
     return await _run_blocking(do_update)
 
@@ -446,37 +554,73 @@ async def assign_shard_server_api(body: dict):
 
     def do_assign():
         snapshot.init_db()
+        shard = snapshot.get_shard(shard_id)
+        if not shard:
+            return {"error": f"Shard {shard_id} not found"}
+        parent = snapshot.get_task(shard.get("task_id") or "")
+        if parent and parent.get("status") in TERMINAL_STATUSES:
+            return {"ok": True, "ignored": True}
         snapshot.update_shard_progress(shard_id, server=server_key,
                                        started_at=_now())
         return {"ok": True}
     return await _run_blocking(do_assign)
 
 
-def _aggregate_task(task_id: str) -> dict:
-    """Aggregate shard progress into task-level fields. Must be called inside a blocking executor."""
-    shards = snapshot.get_shards_by_task(task_id)
-    if not shards:
+_AGGREGATE_DEBOUNCE_SECONDS = 5
+# task_id -> last time _aggregate_task actually ran (module-level: this
+# process is the only writer of task-level aggregates).
+_last_aggregate_ts: dict = {}
+
+
+def _aggregate_task(task_id: str, force: bool = False) -> dict:
+    """Aggregate shard progress into task-level fields. Must be called inside a blocking executor.
+
+    A single SQL aggregate pass, not a fetch-all-rows-and-sum-in-Python —
+    under pool-mode report volumes (hundreds of shard rows per task,
+    reporting every 15s) the old approach walked O(shards) Python objects on
+    every single progress ping and started queueing behind S1's SQLite write
+    lock. Debounced to once per 5s per task; callers that know a shard just
+    made its last possible write (reached done/failed) must pass
+    force=True — otherwise that write can be the one the debounce eats, and
+    nothing else will ever correct the task's totals for it.
+    """
+    now = time.time()
+    if not force and now - _last_aggregate_ts.get(task_id, 0) < _AGGREGATE_DEBOUNCE_SECONDS:
+        return {"ok": True, "skipped": "debounced"}
+    _last_aggregate_ts[task_id] = now
+
+    conn = snapshot._conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n, "
+        "COALESCE(SUM(done_bytes), 0) AS done_bytes, "
+        "COALESCE(SUM(total_bytes), 0) AS total_bytes, "
+        "COALESCE(SUM(speed_mbps), 0) AS speed, "
+        "COUNT(*) FILTER (WHERE status = 'done') AS done_shards "
+        "FROM shards WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["n"] == 0:
         return {"ok": True, "shards": 0}
-    done_bytes = sum(s.get("done_bytes", 0) for s in shards)
-    total_bytes = sum(s.get("total_bytes", 0) for s in shards)
-    speed = sum(s.get("speed_mbps", 0) for s in shards)
-    done_shards = sum(1 for s in shards if s.get("status") == "done")
+
+    done_bytes = row["done_bytes"]
+    total_bytes = row["total_bytes"]
+    total_shards = row["n"]
+    done_shards = row["done_shards"]
 
     pct = round(done_bytes / total_bytes * 100, 1) if total_bytes > 0 else 0
     downloaded_gb = done_bytes / (1024 ** 3)
     size_gb = total_bytes / (1024 ** 3)
 
     snapshot.update_task_progress(
-        task_id, speed_mbps=speed, progress_pct=pct,
+        task_id, speed_mbps=row["speed"], progress_pct=pct,
         downloaded_gb=round(downloaded_gb, 2),
     )
-    conn = snapshot._conn()
     conn.execute(
         "UPDATE tasks SET done_shards = ?, total_shards = ?, size_gb = ? WHERE id = ?",
-        (done_shards, len(shards), round(size_gb, 2), task_id),
+        (done_shards, total_shards, round(size_gb, 2), task_id),
     )
     conn.commit()
-    return {"ok": True, "done_shards": done_shards, "total_shards": len(shards)}
+    return {"ok": True, "done_shards": done_shards, "total_shards": total_shards}
 
 
 @router.post("/shards/resume-info")
@@ -507,14 +651,18 @@ async def report_resume_info_api(body: dict):
 
 @router.post("/shards/aggregate")
 async def aggregate_task_api(body: dict):
-    """Aggregate shard progress into task-level. Called by aggregate_task_from_shards activity."""
+    """Aggregate shard progress into task-level. Called by aggregate_task_from_shards activity.
+
+    This is the workflow's deliberate end-of-run aggregate, not one of the
+    repeated progress pings the debounce exists for — it must always run.
+    """
     task_id = body.get("task_id", "")
     if not task_id:
         return {"error": "task_id required"}
 
     def do_aggregate():
         snapshot.init_db()
-        return _aggregate_task(task_id)
+        return _aggregate_task(task_id, force=True)
     return await _run_blocking(do_aggregate)
 
 

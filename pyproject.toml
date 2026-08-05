@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 web = ["fastapi>=0.100", "uvicorn>=0.20"]
 transfer = ["pycryptodome>=3.18", "requests>=2.28"]
+dev = ["pytest>=7.0"]
 
 [project.scripts]
 dlm = "dlm.cli:cli"
@@ -27,3 +28,6 @@ dlm = "dlm.cli:cli"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dlm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

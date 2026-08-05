@@ -9,12 +9,21 @@ rather than re-deriving.
 
 from __future__ import annotations
 
+import os
 import time
 
 WORKER_TIMEOUT = 180  # seconds without a heartbeat before a worker is offline
 MIN_SHARD_DISK_GB = 70  # a worker below this is not offered new shards
 STALE_THRESHOLD = 600  # 10 min without a task update = suspicious
 DEAD_THRESHOLD = 1800  # 30 min without a task update = definitely dead
+
+# Pool dispatch (work-stealing) policy — kept here alongside the other fleet
+# knobs (MIN_SHARD_DISK_GB etc.) rather than scattered per-module, since a
+# gate on "how many pool tasks may run at once" is fleet state exactly like
+# "how many workers are idle".
+POOL_MAX_CONCURRENT_TASKS = int(os.environ.get("DLM_POOL_MAX_CONCURRENT_TASKS", "4"))
+DEFAULT_DISPATCH_MODE = os.environ.get("DLM_DEFAULT_DISPATCH_MODE", "sharded")
+POOL_MAX_BATCHES = 1500  # a task chunking past this many batches needs splitting, not a bigger pool
 
 # Terminal/operator states. A progress report must never move a task out of
 # one of these — a dying workflow's late report used to resurrect tasks an

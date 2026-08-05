@@ -107,6 +107,12 @@ def init_db():
         ("resume_skipped_files", "INTEGER", "0"),
         ("resume_skipped_gb", "REAL", "0"),
         ("claimed_at", "REAL", "0"),
+        # Pool dispatch (work-stealing) groundwork — dispatch_mode picks the
+        # coordinator a task runs under, coordinator_phase is the listing
+        # guard's replacement for the NOT EXISTS(shards) probe once pool
+        # tasks can have batch rows before dispatching starts.
+        ("dispatch_mode", "TEXT", "'sharded'"),
+        ("coordinator_phase", "TEXT", "NULL"),
     ]:
         try:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")
@@ -387,9 +393,29 @@ def get_shards_by_status(status: str) -> list:
     return [dict(r) for r in rows]
 
 
+# Mirror of dlm.web.fleet.TERMINAL_STATUSES. snapshot.py is imported by the
+# web layer, the workers, and the CLI — importing dlm.web.fleet here to save
+# one tuple would invert that dependency, so the tuple is replicated instead.
+_TERMINAL_TASK_STATUSES = ("paused", "preempted", "revoked", "skipped", "failed", "done")
+
+
 def get_running_shards() -> list:
+    """Shard rows still running, whose parent task hasn't been stopped.
+
+    A cancelled/paused/revoked task's in-flight shard rows used to stay
+    `running` forever — nothing rewrites them once the workflow that would
+    have completed them is gone — which pinned their servers "busy" for
+    every caller (auto_dispatch, idle-worker queries, doctor) until the row
+    was deleted by a resume/reshard. The JOIN excludes those stale rows at
+    the source instead of requiring every caller to filter them out.
+    """
     conn = _conn()
-    rows = conn.execute("SELECT * FROM shards WHERE status = 'running'").fetchall()
+    placeholders = ", ".join("?" * len(_TERMINAL_TASK_STATUSES))
+    rows = conn.execute(
+        f"SELECT s.* FROM shards s JOIN tasks t ON t.id = s.task_id "
+        f"WHERE s.status = 'running' AND t.status NOT IN ({placeholders})",
+        _TERMINAL_TASK_STATUSES,
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
