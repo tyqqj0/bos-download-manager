@@ -315,7 +315,10 @@ def test_pool_batches_create_partial_insert_failure_leaves_no_rows(db, monkeypat
         with pytest.raises(sqlite3.OperationalError):
             _call(create_pool_batches({"task_id": "t-pool", "shard_infos": infos}))
     finally:
-        monkeypatch.undo()
+        # Restore only _conn — monkeypatch.undo() would also revert the db
+        # fixture's DB_PATH patch, and a later executor thread with no cached
+        # connection would then open the real /data/dlm.db.
+        monkeypatch.setattr(db, "_conn", real_conn_fn)
 
     assert db.get_shards_by_task("t-pool") == []  # rollback ate the partial insert
 

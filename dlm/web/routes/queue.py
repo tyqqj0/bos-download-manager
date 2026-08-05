@@ -513,23 +513,32 @@ async def create_pool_batches(body: dict):
         # executemany runs clean; on any real failure it rolls back instead
         # of leaving a stray open transaction on this thread's connection
         # for the next request on this pool thread to inherit and commit.
-        with conn:
-            conn.executemany(
-                "INSERT OR IGNORE INTO shards (id, task_id, shard_index, status, total_files, "
-                "total_bytes, filelist_key, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
+        # The re-read lives inside the transaction: the losing side of a race
+        # needs to see the winner's rows and confirm they're the same logical
+        # batch before calling it success — and if a concurrent call carried a
+        # *different* batch set, OR IGNORE would have let its non-colliding
+        # indices land next to the winner's. Raising here rolls those strays
+        # back instead of persisting a mixed row set that would wedge the
+        # task's idempotency check forever.
+        class _BatchMismatch(Exception):
+            pass
 
-        # Re-read rather than trust this call's own insert — the losing side
-        # of a race needs to see the winner's rows and confirm they're the
-        # same logical batch before calling it success.
-        final = snapshot.get_shards_by_task(task_id)
-        if matches_incoming(final):
-            return {
-                "ok": True, "idempotent": False,
-                "shard_ids": [r["id"] for r in sorted(final, key=lambda r: r["shard_index"])],
-            }
-        return {"error": f"batch rows already exist for {task_id} and do not match the requested set"}
+        try:
+            with conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO shards (id, task_id, shard_index, status, total_files, "
+                    "total_bytes, filelist_key, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                final = snapshot.get_shards_by_task(task_id)
+                if not matches_incoming(final):
+                    raise _BatchMismatch()
+        except _BatchMismatch:
+            return {"error": f"batch rows already exist for {task_id} and do not match the requested set"}
+        return {
+            "ok": True, "idempotent": False,
+            "shard_ids": [r["id"] for r in sorted(final, key=lambda r: r["shard_index"])],
+        }
     return await _run_blocking(do_create)
 
 

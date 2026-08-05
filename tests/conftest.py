@@ -1,8 +1,7 @@
 """Shared fixtures for the pytest suite.
 
-Run: python3 -m pytest tests/ -q   (python -m, not bare pytest — dlm isn't
-installed, and -m prepends the repo root running dlm.queue.snapshot etc.
-importable without a package install)
+Run: pytest tests/ -q  (pyproject sets pythonpath=["."], so bare pytest works
+without a package install; python3 -m pytest works too)
 """
 
 from __future__ import annotations
