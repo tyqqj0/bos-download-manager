@@ -39,13 +39,26 @@ def has_live_workflow(task_id: str, running_ids) -> bool:
     it — a second coordinator downloading what is already downloading. The
     doctor's fix path had drifted from its own report path in exactly this
     way (it omitted the legacy `{task_id}-part` children).
+
+    ID construction is read from `dlm.web.temporal_client`'s registry
+    (`WORKFLOW_ID_PREFIXES`), not re-inlined here: this function, plus
+    `cancel_workflow`/`terminate_workflow_and_wait`, are the three sites
+    whose independently hand-copied prefixes used to drift. Iterating
+    `PARENT_WORKFLOW_TYPES` (rather than three named types) means a future
+    task-level workflow type is recognized as soon as it is added to that
+    registry — no fourth hardcode to remember here.
     """
-    legacy = f"dl-{task_id}"
+    from .temporal_client import (
+        LEGACY_DOWNLOAD_ID_PREFIX,
+        PARENT_WORKFLOW_TYPES,
+        SHARD_WORKER_ID_PREFIX,
+        WORKFLOW_ID_PREFIXES,
+    )
+
+    legacy = f"{LEGACY_DOWNLOAD_ID_PREFIX}{task_id}"
     return (
-        legacy in running_ids
-        or f"split-download-{task_id}" in running_ids
-        or f"sharded-{task_id}" in running_ids
-        or any(wid.startswith(f"shard-s-{task_id}-") for wid in running_ids)
+        any(f"{WORKFLOW_ID_PREFIXES[t]}{task_id}" in running_ids for t in PARENT_WORKFLOW_TYPES)
+        or any(wid.startswith(f"{SHARD_WORKER_ID_PREFIX}s-{task_id}-") for wid in running_ids)
         or any(wid.startswith(f"{task_id}-part") for wid in running_ids)
         or any(wid.startswith(f"{legacy}-") for wid in running_ids)
     )

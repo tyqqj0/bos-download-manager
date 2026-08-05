@@ -23,11 +23,15 @@ _client_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # The download workflow types, in one place. Six sites used to inline this
 # same list, and each was a place a new workflow type could be forgotten.
+# `PoolDownloadWorkflow` is listed ahead of its class existing (T5 adds it) —
+# tests/test_workflow_registry.py asserts the defn classes in workflows.py
+# are a *subset* of this tuple, so listing it early is safe.
 WORKFLOW_TYPES = (
     "DownloadDatasetWorkflow",
     "SplitDownloadWorkflow",
     "ShardedDownloadWorkflow",
     "ShardWorkerWorkflow",
+    "PoolDownloadWorkflow",
 )
 
 # The coordinator/parent types — what fleet-wide cancel operates on. Children
@@ -38,6 +42,31 @@ WORKFLOW_TYPES = (
 # reconciler never re-dispatches. Parent-only cancel leaves the task in
 # `downloading`, where orphan re-dispatch reclaims it losslessly.
 PARENT_WORKFLOW_TYPES = tuple(t for t in WORKFLOW_TYPES if t != "ShardWorkerWorkflow")
+
+# Workflow-ID prefix for each type — the second half of the registry. Three
+# call sites (fleet.has_live_workflow, cancel_workflow,
+# terminate_workflow_and_wait) used to hand-copy these same prefix literals,
+# and each copy could drift independently (that history is why this table
+# exists instead of a fourth copy). ShardWorkerWorkflow's IDs are built from
+# a *shard* id, not a task id (`shard-` + naming.shard_row_id(task_id, idx)
+# = f"shard-s-{task_id}-{idx}") — callers that need the task-id-keyed IDs
+# should iterate PARENT_WORKFLOW_TYPES, not WORKFLOW_TYPES, against this map.
+WORKFLOW_ID_PREFIXES = {
+    "DownloadDatasetWorkflow": "dl-",
+    "SplitDownloadWorkflow": "split-download-",
+    "ShardedDownloadWorkflow": "sharded-",
+    "ShardWorkerWorkflow": "shard-",
+    "PoolDownloadWorkflow": "pool-",
+}
+
+# Named aliases for the two prefixes fleet.has_live_workflow needs outside a
+# type-list iteration (the legacy single-node ID and the shard-child prefix).
+# Importing these by name — instead of indexing WORKFLOW_ID_PREFIXES with a
+# literal type-name string — keeps fleet.py free of workflow-type literals,
+# which test_event_loop_safety.py's AST scan treats as a re-inlined copy of
+# WORKFLOW_TYPES.
+LEGACY_DOWNLOAD_ID_PREFIX = WORKFLOW_ID_PREFIXES["DownloadDatasetWorkflow"]
+SHARD_WORKER_ID_PREFIX = WORKFLOW_ID_PREFIXES["ShardWorkerWorkflow"]
 
 CONNECT_TIMEOUT = 5  # seconds to reach the frontend; connect() has no deadline
 QUERY_TIMEOUT = timedelta(seconds=15)  # per list/describe RPC
@@ -106,7 +135,7 @@ async def start_download(task_dict: dict, task_queue: str = "download-workers"):
         size_gb=task_dict.get("size_gb", 0),
     )
 
-    workflow_id = f"dl-{task_dict['id']}"
+    workflow_id = f"{WORKFLOW_ID_PREFIXES['DownloadDatasetWorkflow']}{task_dict['id']}"
     handle = await client.start_workflow(
         DownloadDatasetWorkflow.run,
         args=[task_input],
@@ -137,7 +166,7 @@ async def start_split_download(task_dict: dict, worker_count: int = 2):
     handle = await client.start_workflow(
         SplitDownloadWorkflow.run,
         args=[task_input, worker_count],
-        id=f"split-download-{task_dict['id']}",
+        id=f"{WORKFLOW_ID_PREFIXES['SplitDownloadWorkflow']}{task_dict['id']}",
         task_queue="download-workers",
     )
     logger.info(f"Started split workflow for {task_dict['name']} ({worker_count} workers)")
@@ -162,7 +191,7 @@ async def start_sharded_download(task_dict: dict):
         shard_count=int(task_dict.get("max_workers") or 0),
     )
 
-    workflow_id = f"sharded-{task_dict['id']}"
+    workflow_id = f"{WORKFLOW_ID_PREFIXES['ShardedDownloadWorkflow']}{task_dict['id']}"
     handle = await client.start_workflow(
         ShardedDownloadWorkflow.run,
         task_input,
@@ -188,11 +217,7 @@ async def _find_running_workflow_ids(client, task_id: str) -> list:
 async def cancel_workflow(task_id: str):
     """Cancel running workflow(s) for a task — handles all ID patterns."""
     client = await connected_client()
-    wf_ids = {
-        f"dl-{task_id}",
-        f"split-download-{task_id}",
-        f"sharded-{task_id}",
-    }
+    wf_ids = {f"{WORKFLOW_ID_PREFIXES[t]}{task_id}" for t in PARENT_WORKFLOW_TYPES}
     wf_ids.update(await _find_running_workflow_ids(client, task_id))
 
     for wf_id in wf_ids:
@@ -208,9 +233,10 @@ async def cancel_workflow(task_id: str):
         from ..queue.snapshot import get_shards_by_task, init_db
         init_db()
         shards = get_shards_by_task(task_id)
+        shard_prefix = WORKFLOW_ID_PREFIXES["ShardWorkerWorkflow"]
         for shard in shards:
             try:
-                handle = client.get_workflow_handle(f"shard-{shard['id']}")
+                handle = client.get_workflow_handle(f"{shard_prefix}{shard['id']}")
                 await handle.cancel(rpc_timeout=QUERY_TIMEOUT)
             except Exception:
                 pass
@@ -230,14 +256,15 @@ async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> boo
     from temporalio.client import WorkflowExecutionStatus
 
     client = await connected_client()
-    wf_ids = {f"dl-{task_id}", f"split-download-{task_id}", f"sharded-{task_id}"}
+    wf_ids = {f"{WORKFLOW_ID_PREFIXES[t]}{task_id}" for t in PARENT_WORKFLOW_TYPES}
     wf_ids.update(await _find_running_workflow_ids(client, task_id))
     handles = [client.get_workflow_handle(wf_id) for wf_id in wf_ids]
     try:
         from ..queue.snapshot import get_shards_by_task, init_db
         init_db()
+        shard_prefix = WORKFLOW_ID_PREFIXES["ShardWorkerWorkflow"]
         for shard in get_shards_by_task(task_id):
-            handles.append(client.get_workflow_handle(f"shard-{shard['id']}"))
+            handles.append(client.get_workflow_handle(f"{shard_prefix}{shard['id']}"))
     except Exception:
         pass
 
