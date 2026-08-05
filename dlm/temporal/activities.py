@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -895,3 +896,293 @@ async def chunk_filelist(
         heartbeat_task.cancel()
 
     return {"batch_keys": batch_keys, "counts": counts, "bytes": byte_totals}
+
+
+# ── Pool execution (T4) ─────────────────────────────────────────
+
+
+class _RetryableDiskLow(Exception):
+    """Insufficient disk to safely start a pool batch on this worker.
+
+    Deliberately a plain Exception (retryable — no ApplicationError /
+    non_retryable marker): the pool workflow's batch retry policy backs off
+    (~5min per the design doc) and re-attempts, by which time this worker
+    may have freed space from other pipelines finishing, or a later
+    schedule tick sends the retry to a different worker entirely.
+    """
+
+
+# A worker can run several PipelineEngine instances against the same
+# /data/staging volume at once: up to 2 from its personal queue (see
+# dlm/temporal/__main__.py's max_concurrent_activities=2 for personal_queue)
+# + 1 from the shared per-source queue + 1 from the pool queue (this
+# activity) = 4 possible concurrent pipelines. check_disk_space's own
+# per-pipeline default (25GB — the floor ShardWorkerWorkflow's single-shard
+# preflight already uses) times that count is the margin this activity must
+# clear before it starts its own download, or it can starve — or be
+# starved by — pipelines it can't see from inside this one activity call.
+POOL_COEXISTING_PIPELINES = 4  # 2 private + 1 shared + 1 pool
+POOL_DISK_FLOOR_GB = POOL_COEXISTING_PIPELINES * 25  # = 100
+
+
+def _pool_batch_staging_dir(task_name: str, batch_index: int) -> Path:
+    """Staging path for one pool batch — isolated per batch so a retried or
+    concurrently-running batch of the same task never collides with another
+    batch's files (mirrors the sharded path's per-shard staging isolation,
+    `{task}/shard-N/`, generalized to `{task}/pool-batch-N/`)."""
+    return STAGING_PATH / task_name / f"pool-batch-{batch_index}"
+
+
+def _head_skip_filter(files: list[dict], task_input: TaskInput) -> tuple[list[dict], int, int]:
+    """Unconditional per-file HEAD check against the task's flat BOS prefix.
+
+    The pool path has no positional progress marker (`.progress.json`) —
+    unlike a shard's ordered filelist, a batch has no stable "how far did I
+    get" offset, and a retried batch can land on a completely different
+    worker with an empty local staging dir. This HEAD check IS the resume
+    mechanism: a file already on BOS under the task's flat prefix with the
+    exact expected size is dropped before it is ever re-downloaded.
+
+    Deliberately one HEAD per file rather than a bulk `list_objects` pass
+    like `filter_filelist_against_bos` uses: a batch is capped at
+    BATCH_MAX_FILES (500) files, small enough that checking exactly the
+    files this batch cares about costs far fewer round trips than paginating
+    the whole task prefix (which can hold hundreds of thousands of objects
+    for a large dataset) on every single batch.
+
+    Returns (remaining_files, skipped_files, skipped_bytes).
+    """
+    from ..core.config import load_config
+    from ..core.bos import bos_target, create_bos_client
+
+    config = load_config()
+    bos = create_bos_client(
+        config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
+    )
+    bucket, prefix = bos_target(task_input)
+
+    def _check(f: dict) -> tuple[dict, bool]:
+        key = prefix + f.get("path", "")
+        try:
+            meta = bos.get_object_meta_data(bucket, key)
+            existing_size = int(meta.metadata.content_length)
+        except Exception:
+            return f, False
+        return f, existing_size == f.get("size")
+
+    remaining: list[dict] = []
+    skipped_files = 0
+    skipped_bytes = 0
+    if files:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for f, already_present in pool.map(_check, files):
+                if already_present:
+                    skipped_files += 1
+                    skipped_bytes += f.get("size", 0)
+                else:
+                    remaining.append(f)
+    return remaining, skipped_files, skipped_bytes
+
+
+@activity.defn
+async def run_pool_batch(task_input: TaskInput, batch_index: int, filelist_key: str) -> dict:
+    """Download+upload one pool batch's files to the task's flat BOS prefix.
+
+    Self-contained — unlike a shard, no per-batch child workflow drives this
+    (the pool window loop just fires one `run_pool_batch` call per batch
+    slot via `workflow.start_activity` and moves on), so every step a shard
+    spreads across ShardWorkerWorkflow + run_pipeline_batch lives in this
+    one activity: server assignment, running/done status, disk preflight,
+    the download+upload pipeline, and progress reporting.
+
+    Batch row id: `shard_row_id(task_input.id, batch_index)` — the same
+    `shards` table row T1's `/api/pool/batches/create` created; `filelist_key`
+    is one of T3 `chunk_filelist`'s returned `batch_keys[i]`
+    (`download-manager/batchlists/{task_input.name}/batch-{i}.json`).
+
+    Sequence (spec T4, order is the contract):
+      1. Wipe this batch's own staging dir first — an idempotent restart
+         starts clean rather than trying to resume a half-downloaded local
+         file a previous attempt (on this worker or another) left behind.
+         BOS-side resume is HEAD-skip's job, not local disk state.
+      2. POST directly to `/api/shards/assign` (server=this worker) and
+         `/api/shards/status` (status=running) via `requests` — NOT the
+         `assign_shard_server`/`update_shard_status` *activities*: those are
+         Temporal activities themselves, and an activity cannot invoke
+         another activity through Temporal's execution machinery; going
+         straight to HTTP also keeps this call's behavior independent of
+         theirs per G1 (their return semantics must not change on the
+         sharded path's behalf). Either response coming back
+         `{"ignored": true}` means an operator already stopped the parent
+         task (paused/revoked/etc, see TERMINAL_STATUSES) — stop
+         immediately, download nothing, return `{"ignored": True}` cleanly.
+      3. Disk preflight scaled for coexisting pipelines (`POOL_DISK_FLOOR_GB`)
+         — raises `_RetryableDiskLow` (retryable; no status write) rather
+         than starting a download that starves the host.
+      4. Pull the batch manifest from BOS (`download_shard_filelist`,
+         reused verbatim), apply the unconditional HEAD-skip filter, then
+         hand the remainder to `PipelineEngine.run()` exactly the way
+         `run_pipeline_batch` does (same heartbeat_fn/progress_fn shape).
+      5. Success: clean staging, report final stats — POST
+         `/api/shard-progress` with the true totals (skipped + downloaded)
+         BEFORE `/api/shards/status` status=done, because `/shards/status`
+         itself only reads `status`/`error` from the body and does not
+         persist byte/file counts (see that route) — then return stats.
+      6. Any other exception: clean staging, raise (never POST
+         status=failed — G4, only the coordinator writes that terminal
+         state); the raised message includes `server_key` for triage.
+      7. `asyncio.CancelledError` (Temporal activity cancellation, e.g. the
+         task was paused mid-batch): re-raised immediately with no cleanup
+         and no status POST of any kind. `PipelineEngine.run()` already
+         handles the cancellation itself (stops in-flight downloads,
+         preserves staging for a possible resume) before its own re-raise —
+         this mirrors `run_pipeline_batch`, which adds no CancelledError
+         handling of its own either; that behavior lives in the engine.
+
+    Returns (on a real run) `{"ignored": False, downloaded_files,
+    uploaded_files, uploaded_bytes, skipped_files, skipped_bytes,
+    total_files, total_bytes}`; on an ignored (stopped-task) short-circuit,
+    just `{"ignored": True}`.
+    """
+    import time
+    import requests
+    from .pipeline import PipelineEngine
+
+    server_key = os.environ.get("DLM_SERVER_KEY", "")
+    batch_id = shard_row_id(task_input.id, batch_index)
+    staging_dir = _pool_batch_staging_dir(task_input.name, batch_index)
+
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    def _post(path: str, payload: dict) -> dict:
+        resp = requests.post(f"{_coordinator()}{path}", json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    assign_resp = await asyncio.to_thread(
+        _post, "/api/shards/assign", {"shard_id": batch_id, "server_key": server_key}
+    )
+    if assign_resp.get("error"):
+        raise RuntimeError(f"{server_key}: assign failed for batch {batch_id}: {assign_resp['error']}")
+    if assign_resp.get("ignored"):
+        return {"ignored": True}
+
+    status_resp = await asyncio.to_thread(
+        _post, "/api/shards/status", {"shard_id": batch_id, "status": "running"}
+    )
+    if status_resp.get("error"):
+        raise RuntimeError(f"{server_key}: status=running failed for batch {batch_id}: {status_resp['error']}")
+    if status_resp.get("ignored"):
+        return {"ignored": True}
+
+    if not await check_disk_space(min_free_gb=POOL_DISK_FLOOR_GB):
+        raise _RetryableDiskLow(
+            f"{server_key}: < {POOL_DISK_FLOOR_GB}GB free for pool batch "
+            f"{batch_index} of {task_input.name} (coexistence floor: "
+            f"{POOL_COEXISTING_PIPELINES} possible concurrent pipelines)"
+        )
+
+    try:
+        local_filelist = await download_shard_filelist(filelist_key, str(staging_dir))
+        raw_files = json.loads(Path(local_filelist).read_text())
+
+        remaining, skipped_files, skipped_bytes = await asyncio.to_thread(
+            _head_skip_filter, raw_files, task_input
+        )
+        activity.heartbeat(
+            f"pool batch {batch_index}: {skipped_files} already on BOS, "
+            f"{len(remaining)} to download"
+        )
+
+        files = [FileInfo(path=f["path"], size=f["size"]) for f in remaining]
+
+        def heartbeat_fn(msg: str):
+            activity.heartbeat(msg)
+
+        last_report_time = [0.0]
+
+        def progress_fn(downloaded_bytes: int, total_bytes: int, speed_bps: float):
+            """Report cumulative batch progress to S1 every 15s.
+
+            Wrapped in try/except so a coordinator hiccup never breaks the
+            engine's `_speed_reporter` loop — same self-protection
+            `run_pipeline_batch`'s own progress_fn applies (spec item 7).
+            """
+            now = time.time()
+            if now - last_report_time[0] < 15:
+                return
+            last_report_time[0] = now
+            try:
+                speed_mbps = speed_bps * 8 / 1_000_000
+                requests.post(
+                    f"{_coordinator()}/api/shard-progress",
+                    json={
+                        "shard_id": batch_id,
+                        # done_files is a coarse mid-run signal (skipped files
+                        # already known-complete; in-flight files aren't
+                        # individually tracked here) — done_bytes is what the
+                        # task-level aggregate actually sums, and it's exact.
+                        "done_files": skipped_files,
+                        "done_bytes": skipped_bytes + downloaded_bytes,
+                        "speed_mbps": round(speed_mbps, 1),
+                    },
+                    timeout=5,
+                )
+            except Exception as e:
+                logger.debug(f"Pool batch progress report failed: {e}")
+
+        engine = PipelineEngine(task_input, staging_dir, heartbeat_fn, progress_fn)
+        stats = await engine.run(files)
+
+        if stats.failed_files > 0:
+            raise RuntimeError(
+                f"{server_key}: pool batch {batch_index} of {task_input.name} "
+                f"incomplete: {stats.failed_files}/{stats.total_files} files "
+                f"failed (downloaded={stats.downloaded_files}, "
+                f"uploaded={stats.uploaded_files})"
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"{server_key}: pool batch {batch_index} of {task_input.name} "
+            f"failed: {e}"
+        ) from e
+
+    shutil.rmtree(staging_dir, ignore_errors=True)
+
+    total_files = skipped_files + stats.uploaded_files
+    total_bytes = skipped_bytes + stats.uploaded_bytes
+
+    final_resp = await asyncio.to_thread(
+        _post, "/api/shard-progress",
+        {"shard_id": batch_id, "done_files": total_files,
+         "done_bytes": total_bytes, "speed_mbps": 0},
+    )
+    if final_resp.get("error"):
+        raise RuntimeError(
+            f"{server_key}: final progress report failed for batch {batch_id}: "
+            f"{final_resp['error']}"
+        )
+
+    done_resp = await asyncio.to_thread(
+        _post, "/api/shards/status", {"shard_id": batch_id, "status": "done"}
+    )
+    if done_resp.get("error"):
+        raise RuntimeError(
+            f"{server_key}: status=done failed for batch {batch_id}: "
+            f"{done_resp['error']}"
+        )
+
+    return {
+        "ignored": False,
+        "downloaded_files": stats.downloaded_files,
+        "uploaded_files": stats.uploaded_files,
+        "uploaded_bytes": stats.uploaded_bytes,
+        "skipped_files": skipped_files,
+        "skipped_bytes": skipped_bytes,
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+    }
