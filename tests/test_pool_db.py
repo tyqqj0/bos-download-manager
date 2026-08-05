@@ -245,6 +245,88 @@ def test_pool_batches_create_rejects_expected_count_mismatch(db):
     assert db.get_shards_by_task("t-pool") == []
 
 
+def test_pool_batches_create_on_terminal_task_is_ignored_not_written(db):
+    """A late coordinator retry after an operator revokes the task must not
+    resurrect it — mirrors the /shards/status and /shards/assign guards."""
+    from dlm.web.routes.queue import create_pool_batches
+
+    _task(db, "t-revoked", "revoked")
+    db.upsert_shard({"id": "s-t-revoked-0", "task_id": "t-revoked", "shard_index": 0,
+                      "status": "failed", "server": "bj3",
+                      "total_files": 1, "total_bytes": 1})
+
+    result = _call(create_pool_batches({
+        "task_id": "t-revoked", "shard_infos": _batch_infos(3),
+    }))
+
+    assert result == {"ok": True, "ignored": True}
+    row = db.get_shard("s-t-revoked-0")
+    assert row["status"] == "failed"  # untouched, not reset to pending
+    assert row["server"] == "bj3"
+    assert len(db.get_shards_by_task("t-revoked")) == 1  # no new rows created
+
+
+def test_pool_batches_create_on_nonexistent_task_is_ignored(db):
+    from dlm.web.routes.queue import create_pool_batches
+
+    result = _call(create_pool_batches({
+        "task_id": "t-nope", "shard_infos": _batch_infos(3),
+    }))
+
+    assert result == {"ok": True, "ignored": True, "reason": "task not found"}
+    assert db.get_shards_by_task("t-nope") == []
+
+
+def test_pool_batches_create_partial_insert_failure_leaves_no_rows(db, monkeypatch):
+    """A crash mid-executemany must not leave a stray open transaction on the
+    pool thread's connection for the next request to inherit and commit —
+    the exact bug the `with conn:` transaction wrap guards against."""
+    import sqlite3
+
+    from dlm.web.routes.queue import create_pool_batches
+
+    _task(db, "t-pool", "downloading")
+    infos = _batch_infos(3)
+
+    # sqlite3.Connection is an immutable C type, so the flaky executemany goes
+    # on a delegating proxy handed out by a patched snapshot._conn instead.
+    class FlakyConn:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def __enter__(self):
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._real.__exit__(*exc)
+
+        def executemany(self, sql, seq):
+            rows = list(seq)
+            self._real.execute(sql, rows[0])  # one row lands, uncommitted...
+            raise sqlite3.OperationalError("simulated mid-batch failure")
+
+    real_conn_fn = db._conn
+    monkeypatch.setattr(db, "_conn", lambda: FlakyConn(real_conn_fn()))
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            _call(create_pool_batches({"task_id": "t-pool", "shard_infos": infos}))
+    finally:
+        monkeypatch.undo()
+
+    assert db.get_shards_by_task("t-pool") == []  # rollback ate the partial insert
+
+    # A subsequent correct call on the same (now-restored) connection must
+    # still succeed cleanly — no stray open transaction left behind.
+    result = _call(create_pool_batches({"task_id": "t-pool", "shard_infos": infos}))
+    assert result["ok"] is True
+    assert result["idempotent"] is False
+    assert len(db.get_shards_by_task("t-pool")) == 3
+
+
 # ── _aggregate_task: SQL aggregate + 5s debounce ───────────────────────
 
 

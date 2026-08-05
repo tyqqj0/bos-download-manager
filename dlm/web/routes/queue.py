@@ -447,61 +447,89 @@ async def create_pool_batches(body: dict):
     def key(shard_index, filelist_key, total_files, total_bytes):
         return (shard_index, filelist_key or "", total_files, total_bytes)
 
+    incoming = sorted(
+        key(info["shard_index"], info.get("filelist_key", ""),
+            info["total_files"], info["total_bytes"])
+        for info in batch_infos
+    )
+
+    def matches_incoming(rows) -> bool:
+        if len(rows) != expected_count:
+            return False
+        on_file = sorted(
+            key(r["shard_index"], r.get("filelist_key"), r["total_files"], r["total_bytes"])
+            for r in rows
+        )
+        return on_file == incoming
+
     def do_create():
         snapshot.init_db()
         conn = snapshot._conn()
+
+        # A late coordinator retry after an operator pauses/revokes the task
+        # must not rewrite that stopped task's shard rows back to pending —
+        # same rule as the /shards/status and /shards/assign guards above.
+        # Checked before any read/write below.
+        task = snapshot.get_task(task_id)
+        if not task:
+            return {"ok": True, "ignored": True, "reason": "task not found"}
+        if task.get("status") in TERMINAL_STATUSES:
+            return {"ok": True, "ignored": True}
+
         existing = snapshot.get_shards_by_task(task_id)
 
-        incoming = sorted(
-            key(info["shard_index"], info.get("filelist_key", ""),
-                info["total_files"], info["total_bytes"])
-            for info in batch_infos
-        )
-
-        if existing and len(existing) == expected_count:
-            on_file = sorted(
-                key(r["shard_index"], r.get("filelist_key"), r["total_files"], r["total_bytes"])
-                for r in existing
-            )
-            if on_file == incoming:
-                # Idempotent hit. 'done' rows are left alone — their upload
-                # already landed — everything else goes back to pending so
-                # the window loop re-issues it.
+        if existing and matches_incoming(existing):
+            # Idempotent hit. 'done' rows are left alone — their upload
+            # already landed — everything else goes back to pending so
+            # the window loop re-issues it.
+            with conn:
                 conn.execute(
                     "UPDATE shards SET status='pending', server=NULL, speed_mbps=0 "
                     "WHERE task_id=? AND status!='done'",
                     (task_id,),
                 )
-                conn.commit()
-                return {
-                    "ok": True, "idempotent": True,
-                    "shard_ids": [r["id"] for r in sorted(existing, key=lambda r: r["shard_index"])],
-                }
+            return {
+                "ok": True, "idempotent": True,
+                "shard_ids": [r["id"] for r in sorted(existing, key=lambda r: r["shard_index"])],
+            }
 
         if existing:
             return {"error": f"batch rows already exist for {task_id} and do not match the requested set"}
 
         now = time.time()
-        shard_ids = []
         rows = []
         for info in batch_infos:
             idx = info["shard_index"]
-            shard_id = shard_row_id(task_id, idx)
-            shard_ids.append(shard_id)
             rows.append((
-                shard_id, task_id, idx, "pending",
+                shard_row_id(task_id, idx), task_id, idx, "pending",
                 info["total_files"], info["total_bytes"],
                 info.get("filelist_key", ""), now,
             ))
-        # Single transaction — a 700-row loop of individual commits is what
-        # blew /shards/create's client-side timeout on the sharded path.
-        conn.executemany(
-            "INSERT INTO shards (id, task_id, shard_index, status, total_files, "
-            "total_bytes, filelist_key, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        conn.commit()
-        return {"ok": True, "idempotent": False, "shard_ids": shard_ids}
+        # OR IGNORE + a spanning `with conn:` transaction: shard_row_id is
+        # deterministic on (task_id, shard_index), so a concurrent retry
+        # racing this same call computes identical row ids — its insert
+        # collides on the primary key and is dropped instead of raising
+        # IntegrityError into a 500. `with conn:` commits only if
+        # executemany runs clean; on any real failure it rolls back instead
+        # of leaving a stray open transaction on this thread's connection
+        # for the next request on this pool thread to inherit and commit.
+        with conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO shards (id, task_id, shard_index, status, total_files, "
+                "total_bytes, filelist_key, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+        # Re-read rather than trust this call's own insert — the losing side
+        # of a race needs to see the winner's rows and confirm they're the
+        # same logical batch before calling it success.
+        final = snapshot.get_shards_by_task(task_id)
+        if matches_incoming(final):
+            return {
+                "ok": True, "idempotent": False,
+                "shard_ids": [r["id"] for r in sorted(final, key=lambda r: r["shard_index"])],
+            }
+        return {"error": f"batch rows already exist for {task_id} and do not match the requested set"}
     return await _run_blocking(do_create)
 
 
