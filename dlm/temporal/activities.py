@@ -821,7 +821,7 @@ async def chunk_filelist(
       batch_keys[i]: BOS key of batch i's file list
       counts[i]:     file count in batch i
       bytes[i]:      total bytes in batch i
-    Empty filelist returns {"batch_keys": [], "counts": [], "bytes": []}
+    A present-but-empty filelist returns {"batch_keys": [], "counts": [], "bytes": []}
     with no BOS calls.
     """
     path = Path(filtered_path)
