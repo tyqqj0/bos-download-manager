@@ -666,3 +666,186 @@ async def assign_shard_server(shard_id: str, server_key: str):
         json={"shard_id": shard_id, "server_key": server_key},
         timeout=30,
     )
+
+
+# ── Pool activities (T3) ────────────────────────────────────
+
+
+@activity.defn
+async def pool_alive_workers(source: str) -> int:
+    """Count of alive workers that serve `source` ("hf" | "modelscope").
+
+    "Alive" is a fresh heartbeat (`dlm.web.fleet.WORKER_TIMEOUT`), NOT idle.
+    The pool workflow computes its window size from total serving capacity
+    (P) — if this only counted idle workers, a fully-loaded pool would
+    report P=0 and the window loop would deadlock waiting for slots that
+    aren't "gone", just busy with other pool batches.
+
+    Queries the coordinator's `/api/pool/alive-workers` — activities run on
+    workers, and the workers table is S1-local SQLite (same reason
+    `query_idle_workers` goes over HTTP instead of importing `dlm.queue`).
+    """
+    import requests
+    resp = requests.get(
+        f"{_coordinator()}/api/pool/alive-workers",
+        params={"source": source},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return int(resp.json().get("count", 0))
+
+
+class BatchLimitExceededError(Exception):
+    """chunk_filelist would produce more batches than the runtime cap allows.
+
+    Non-retryable: the same filelist always chunks into the same batch
+    count, so retrying `chunk_filelist` cannot fix this — the task needs to
+    be split or re-sharded. Callers should either list
+    `"BatchLimitExceededError"` in their `RetryPolicy.non_retryable_error_types`
+    or call this activity with `maximum_attempts=1`.
+    """
+
+
+# Per-batch limits (spec-fixed, not env/fleet-config — unlike POOL_MAX_BATCHES
+# these aren't an operator dial, they're the shape of a Temporal-payload-sized
+# batch manifest).
+BATCH_MAX_FILES = 500
+BATCH_MAX_BYTES = 32 * 1024 ** 3  # 32 GiB
+
+# Mirrors dlm.web.fleet.POOL_MAX_BATCHES. Activities run on workers and must
+# not import dlm.web (coordinator-only, wrong dependency direction) — kept
+# as a chunk_filelist parameter instead of a duplicated worker-side env
+# read, so there is exactly one place (fleet.py) that owns the number and
+# the workflow (which already knows fleet policy) is free to pass it
+# through explicitly. deploy-workers.sh's md5 manifest gate keeps worker and
+# coordinator code — and therefore this default and fleet.py's — in sync.
+POOL_MAX_BATCHES_DEFAULT = 1500
+
+
+def _chunk_files(
+    files: list[dict], max_files: int = BATCH_MAX_FILES, max_bytes: int = BATCH_MAX_BYTES
+) -> list[list[dict]]:
+    """Split files into batches of <= max_files and <= max_bytes each.
+
+    A single file over max_bytes gets its own singleton batch instead of
+    blocking every other file behind it ("big files isolated").
+
+    First-fit-decreasing: stable-sort by size descending (ties keep input
+    order, so identical input always yields identical output), then place
+    each file in the first open batch it still fits in, else open a new one.
+    Deterministic — required so a retried chunk_filelist call reproduces the
+    exact same batch numbering/contents.
+    """
+    ordered = sorted(files, key=lambda f: f.get("size", 0), reverse=True)
+
+    big_batches: list[list[dict]] = []
+    normal: list[dict] = []
+    for f in ordered:
+        if f.get("size", 0) > max_bytes:
+            big_batches.append([f])
+        else:
+            normal.append(f)
+
+    bins: list[list[dict]] = []
+    bin_bytes: list[int] = []
+    for f in normal:
+        size = f.get("size", 0)
+        for i in range(len(bins)):
+            if len(bins[i]) < max_files and bin_bytes[i] + size <= max_bytes:
+                bins[i].append(f)
+                bin_bytes[i] += size
+                break
+        else:
+            bins.append([f])
+            bin_bytes.append(size)
+
+    return big_batches + bins
+
+
+@activity.defn
+async def chunk_filelist(
+    filtered_path: str,
+    task_input: TaskInput,
+    max_batches: int = POOL_MAX_BATCHES_DEFAULT,
+) -> dict:
+    """Chunk a (BOS-filtered) filelist into pool batches, uploading each
+    batch's own file list to BOS so any worker can pick it up.
+
+    Must run on the listing worker — filtered_path lives on its local disk
+    (same pinning reason as list_repo_files/filter_filelist_against_bos/
+    partition_files_greedy).
+
+    Batching: see `_chunk_files` (<=BATCH_MAX_FILES files, <=BATCH_MAX_BYTES
+    bytes per batch, oversized files isolated, deterministic).
+
+    max_batches is a runtime guard, not just a test assertion: a task that
+    would chunk past it needs to be split or re-sharded, not scheduled. On
+    overflow raises BatchLimitExceededError (see its docstring for how the
+    caller should mark it non-retryable) — the coordinator surfaces this as
+    the batch's failure, which the existing "task failed" alert path picks
+    up once wired to a terminal write (activities only raise; G4).
+
+    Uploads each batch to
+    `META_BUCKET:download-manager/batchlists/{task_input.name}/batch-{i}.json`.
+
+    Returns {batch_keys, counts, bytes} — three lists, all indexed by batch
+    number i:
+      batch_keys[i]: BOS key of batch i's file list
+      counts[i]:     file count in batch i
+      bytes[i]:      total bytes in batch i
+    Empty filelist returns {"batch_keys": [], "counts": [], "bytes": []}
+    with no BOS calls.
+    """
+    path = Path(filtered_path)
+    all_files = json.loads(path.read_text()) if path.exists() else []
+
+    batches = _chunk_files(all_files)
+
+    if len(batches) > max_batches:
+        raise BatchLimitExceededError(
+            f"{task_input.name}: {len(all_files)} files chunk into "
+            f"{len(batches)} batches, over the cap of {max_batches} — "
+            f"split the task or re-shard instead of scheduling"
+        )
+
+    if not batches:
+        return {"batch_keys": [], "counts": [], "bytes": []}
+
+    from ..core.bos import create_bos_client, upload_file
+    from ..constants import META_BUCKET
+
+    def _write_and_upload():
+        ak = os.environ.get("BAIDU_AK", "")
+        sk = os.environ.get("BAIDU_SK", "")
+        endpoint = os.environ.get("BOS_ENDPOINT", "https://bj.bcebos.com")
+        bos = create_bos_client(ak, sk, endpoint)
+
+        parent = path.parent
+        batch_keys, counts, byte_totals = [], [], []
+        for i, batch in enumerate(batches):
+            batch_bytes = sum(f.get("size", 0) for f in batch)
+            local = parent / f".batch-{i}.json"
+            local.write_text(json.dumps(batch))
+
+            bos_key = f"download-manager/batchlists/{task_input.name}/batch-{i}.json"
+            upload_file(bos, META_BUCKET, bos_key, str(local))
+
+            batch_keys.append(bos_key)
+            counts.append(len(batch))
+            byte_totals.append(batch_bytes)
+        return batch_keys, counts, byte_totals
+
+    async def _heartbeat_while_chunking():
+        while True:
+            activity.heartbeat(f"uploading batch lists for {task_input.name}...")
+            await asyncio.sleep(30)
+
+    activity.heartbeat(f"chunking {len(all_files)} files into {len(batches)} batches...")
+    heartbeat_task = asyncio.create_task(_heartbeat_while_chunking())
+    try:
+        batch_keys, counts, byte_totals = await asyncio.to_thread(_write_and_upload)
+    finally:
+        heartbeat_task.cancel()
+    activity.heartbeat(f"uploaded {len(batch_keys)} batch lists")
+
+    return {"batch_keys": batch_keys, "counts": counts, "bytes": byte_totals}

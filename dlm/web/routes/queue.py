@@ -742,6 +742,29 @@ async def query_idle_workers_api(source: str = "hf", exclude_task: str = ""):
     return await _run_blocking(do_query)
 
 
+@router.get("/pool/alive-workers")
+async def pool_alive_workers_api(source: str = "hf"):
+    """Count of alive workers serving `source`. Called by the
+    pool_alive_workers activity (T3).
+
+    Deliberately NOT idle-workers: alive ∩ worker_serves, ignoring
+    busy/disk. The pool workflow sizes its window from total serving
+    capacity — an idle-only count would read 0 while the pool is fully
+    loaded (every worker busy with other pool batches, not absent) and the
+    window loop would deadlock waiting for slots that will never "open".
+    """
+    from ..fleet import alive_workers, worker_serves
+
+    def do_query():
+        snapshot.init_db()
+        matched = [
+            w.get("server_key") for w in alive_workers(snapshot.get_workers())
+            if worker_serves(w.get("server_key") or "", source)
+        ]
+        return {"count": len(matched), "workers": matched}
+    return await _run_blocking(do_query)
+
+
 @router.post("/queue/reshard")
 async def reshard_task(body: dict):
     """Change a task's shard count via lossless restart.
