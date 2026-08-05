@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -109,6 +110,9 @@ class _FakePipelineEngine:
     test below that keeps this honest against the real class."""
 
     instances = []
+    call_log = None  # set by pool_batch_env to the shared POST log, so
+                     # ordering assertions can place engine start among the
+                     # HTTP calls rather than only relative to each other
 
     def __init__(self, task_input, staging_dir, heartbeat_fn, progress_fn=None):
         self.task_input = task_input
@@ -117,6 +121,8 @@ class _FakePipelineEngine:
         self.progress_fn = progress_fn
         self.run_called_with = None
         _FakePipelineEngine.instances.append(self)
+        if _FakePipelineEngine.call_log is not None:
+            _FakePipelineEngine.call_log.append(("<engine-start>", None))
 
     async def run(self, files):
         self.run_called_with = files
@@ -209,14 +215,16 @@ def pool_batch_env(tmp_path, monkeypatch):
     monkeypatch.setattr(activities, "_head_skip_filter",
                          lambda files, task_input: (files, 0, 0))
 
-    async def fake_check_disk_space(min_free_gb=25):
-        return True
-
-    monkeypatch.setattr(activities, "check_disk_space", fake_check_disk_space)
+    # Real disk_usage on the test machine would make these tests
+    # environment-dependent; pin a comfortably-above-floor volume.
+    monkeypatch.setattr(activities, "_pool_disk_floor_gb", lambda: (52, 500.0, 200.0))
     monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine", _FakePipelineEngine)
     _FakePipelineEngine.instances.clear()
+    _FakePipelineEngine.call_log = calls
 
-    return calls
+    yield calls
+
+    _FakePipelineEngine.call_log = None
 
 
 def _calls_by_path(calls, suffix):
@@ -280,9 +288,12 @@ def test_assign_and_running_status_posted_before_download(pool_batch_env):
     assign_idx = next(i for i, u in enumerate(urls) if u.endswith("/api/shards/assign"))
     running_idx = next(i for i, (u, b) in enumerate(calls)
                         if u.endswith("/api/shards/status") and b.get("status") == "running")
+    # engine start is in the same log, so "before download" is asserted
+    # against the download actually starting, not just against the done post
+    engine_idx = urls.index("<engine-start>")
     done_idx = next(i for i, (u, b) in enumerate(calls)
                      if u.endswith("/api/shards/status") and b.get("status") == "done")
-    assert assign_idx < running_idx < done_idx
+    assert assign_idx < running_idx < engine_idx < done_idx
 
     # assign body carries this worker's server key; batch row id convention
     # matches T1's shard_row_id(task_id, batch_index)
@@ -294,14 +305,17 @@ def test_assign_and_running_status_posted_before_download(pool_batch_env):
 def test_disk_floor_raises_retryable_without_any_status_post(pool_batch_env, monkeypatch):
     calls = pool_batch_env
 
-    async def fake_check_disk_space(min_free_gb=25):
-        assert min_free_gb == activities.POOL_DISK_FLOOR_GB
-        return False
+    # free (10GB) below the computed floor (52GB) on a 200GB volume
+    monkeypatch.setattr(activities, "_pool_disk_floor_gb", lambda: (52, 10.0, 200.0))
 
-    monkeypatch.setattr(activities, "check_disk_space", fake_check_disk_space)
-
-    with pytest.raises(activities._RetryableDiskLow):
+    with pytest.raises(activities._RetryableDiskLow) as excinfo:
         _run_activity(activities.run_pool_batch, _task_input(), 0, "k")
+
+    # the message must let an operator act without reading the code: what was
+    # free, what was required, on how big a volume, and what to override
+    msg = str(excinfo.value)
+    assert "10.0GB free" in msg and "52GB floor" in msg
+    assert "200GB staging volume" in msg and "min_free_gb" in msg
 
     # assign + running were posted (spec: those happen before the disk
     # check), but nothing about done/failed ever went out.
@@ -309,6 +323,56 @@ def test_disk_floor_raises_retryable_without_any_status_post(pool_batch_env, mon
     status_calls = _calls_by_path(calls, "/api/shards/status")
     assert all(b.get("status") == "running" for _, b in status_calls)
     assert not _FakePipelineEngine.instances
+
+
+def test_explicit_min_free_gb_overrides_computed_floor(pool_batch_env, monkeypatch):
+    """The coordinator owns the fleet-wide floor; an explicit parameter wins
+    over the relative default in both directions."""
+    # computed floor would reject (free 30 < 52), the override accepts
+    monkeypatch.setattr(activities, "_pool_disk_floor_gb", lambda: (52, 30.0, 200.0))
+    result = _run_activity(activities.run_pool_batch, _task_input(), 0, "k", 25)
+    assert result["ignored"] is False
+
+    # computed floor would accept (free 100 > 52), the override rejects
+    monkeypatch.setattr(activities, "_pool_disk_floor_gb", lambda: (52, 100.0, 200.0))
+    with pytest.raises(activities._RetryableDiskLow, match="120GB floor"):
+        _run_activity(activities.run_pool_batch, _task_input(), 0, "k", 120)
+
+
+def test_pool_disk_floor_is_relative_to_volume_size(monkeypatch, tmp_path):
+    """A fixed floor is unsatisfiable in principle on a small volume; the
+    default tracks the engine's own backpressure line (pipeline.py:91-95)
+    plus one batch's headroom."""
+    import collections
+    import shutil as shutil_mod
+
+    monkeypatch.setattr(activities, "STAGING_PATH", tmp_path)
+    Usage = collections.namedtuple("Usage", "total used free")
+    gib = 1024 ** 3
+
+    # 2TB volume: 30% of total dominates the 20GB absolute minimum, and the
+    # half-volume cap is far above the sum
+    monkeypatch.setattr(shutil_mod, "disk_usage",
+                        lambda p: Usage(2000 * gib, 0, 900 * gib))
+    floor, free, total = activities._pool_disk_floor_gb()
+    assert floor == int(2000 * 0.30 + 32)
+    assert (round(free), round(total)) == (900, 2000)
+
+    # 200GB worker (the real fleet): floor sits just above the engine's own
+    # 60GB backoff line, so a worker at ~95GB free may still take a batch
+    monkeypatch.setattr(shutil_mod, "disk_usage",
+                        lambda p: Usage(200 * gib, 0, 95 * gib))
+    floor, _, _ = activities._pool_disk_floor_gb()
+    assert floor == int(200 * 0.30 + 32) == 92
+    assert 95 > floor
+
+    # 50GB volume: the sum (20+32) would exceed half the volume, so the cap
+    # keeps the floor satisfiable — a fixed 100GB never could be
+    monkeypatch.setattr(shutil_mod, "disk_usage",
+                        lambda p: Usage(50 * gib, 0, 45 * gib))
+    floor, _, _ = activities._pool_disk_floor_gb()
+    assert floor == 25
+    assert floor < 50
 
 
 def test_engine_failure_raises_and_never_posts_failed_status(pool_batch_env, monkeypatch):
@@ -321,6 +385,27 @@ def test_engine_failure_raises_and_never_posts_failed_status(pool_batch_env, mon
     statuses_posted = [b.get("status") for u, b in calls if u.endswith("/api/shards/status")]
     assert "failed" not in statuses_posted
     assert "done" not in statuses_posted
+
+
+def test_cancellation_posts_nothing_and_preserves_staging(pool_batch_env, monkeypatch, tmp_path):
+    """Temporal cancels the activity when the task is paused mid-batch. The
+    engine handles stopping its own transfers; this activity must add no
+    status write of any kind and must leave staging for the resume."""
+    class _CancellingPipelineEngine(_FakePipelineEngine):
+        async def run(self, files):
+            (Path(self.staging_dir) / "partial.bin").write_bytes(b"x" * 8)
+            raise asyncio.CancelledError()
+
+    calls = pool_batch_env
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine", _CancellingPipelineEngine)
+
+    with pytest.raises(asyncio.CancelledError):
+        _run_activity(activities.run_pool_batch, _task_input(), 5, "k")
+
+    statuses_posted = [b.get("status") for u, b in calls if u.endswith("/api/shards/status")]
+    assert statuses_posted == ["running"]  # nothing after running
+    staging = tmp_path / "pool-task" / "pool-batch-5"
+    assert (staging / "partial.bin").exists()
 
 
 def test_success_reports_final_progress_then_done(pool_batch_env, monkeypatch):

@@ -916,13 +916,41 @@ class _RetryableDiskLow(Exception):
 # /data/staging volume at once: up to 2 from its personal queue (see
 # dlm/temporal/__main__.py's max_concurrent_activities=2 for personal_queue)
 # + 1 from the shared per-source queue + 1 from the pool queue (this
-# activity) = 4 possible concurrent pipelines. check_disk_space's own
-# per-pipeline default (25GB — the floor ShardWorkerWorkflow's single-shard
-# preflight already uses) times that count is the margin this activity must
-# clear before it starts its own download, or it can starve — or be
-# starved by — pipelines it can't see from inside this one activity call.
-POOL_COEXISTING_PIPELINES = 4  # 2 private + 1 shared + 1 pool
-POOL_DISK_FLOOR_GB = POOL_COEXISTING_PIPELINES * 25  # = 100
+# activity). What actually bounds a running pipeline's disk use, though, is
+# the engine's own backpressure line — a *relative* threshold, not a fixed
+# margin — so the coexistence floor is derived from that same line rather
+# than from a multiple of the single-shard start gate.
+#
+# NOTE: the formula duplicates pipeline.py:91-95 (`_disk_free_threshold_gb`,
+# `max(total * DISK_FREE_MIN_PCT, DISK_FREE_ABSOLUTE_MIN_GB)`) instead of
+# importing it: that helper is module-private to the engine, and G1 forbids
+# touching pipeline.py to widen its interface. Keep the two in sync — if the
+# engine's backpressure policy changes, this floor must follow.
+POOL_DISK_BACKPRESSURE_PCT = 0.30   # mirrors pipeline.DISK_FREE_MIN_PCT
+POOL_DISK_BACKPRESSURE_MIN_GB = 20  # mirrors pipeline.DISK_FREE_ABSOLUTE_MIN_GB
+
+
+def _pool_disk_floor_gb() -> tuple[int, float, float]:
+    """Default coexistence floor: the engine's refuse-to-accumulate line plus
+    room for one full batch.
+
+    Returns `(floor_gb, free_gb, total_gb)` — the caller reports all three so
+    a rejected batch says why, on which volume, and what to override.
+
+    Below `max(30% of volume, 20GB)` the engine stops accumulating and aborts
+    outright (pipeline.py:373-374), so starting a batch without that much
+    headroom *plus* one batch's worth (BATCH_MAX_BYTES) means the batch
+    cannot finish on this worker. Capped at half the volume so the floor is
+    always satisfiable in principle: on a volume too small for that sum, a
+    batch should fail with a real disk error mid-run, not spin forever in a
+    preflight that no amount of freed space can pass.
+    """
+    stat = shutil.disk_usage(STAGING_PATH)
+    total_gb = stat.total / (1024 ** 3)
+    free_gb = stat.free / (1024 ** 3)
+    engine_line = max(total_gb * POOL_DISK_BACKPRESSURE_PCT, POOL_DISK_BACKPRESSURE_MIN_GB)
+    floor = min(engine_line + BATCH_MAX_BYTES / (1024 ** 3), total_gb * 0.5)
+    return int(floor), free_gb, total_gb
 
 
 def _pool_batch_staging_dir(task_name: str, batch_index: int) -> Path:
@@ -985,7 +1013,12 @@ def _head_skip_filter(files: list[dict], task_input: TaskInput) -> tuple[list[di
 
 
 @activity.defn
-async def run_pool_batch(task_input: TaskInput, batch_index: int, filelist_key: str) -> dict:
+async def run_pool_batch(
+    task_input: TaskInput,
+    batch_index: int,
+    filelist_key: str,
+    min_free_gb: int | None = None,
+) -> dict:
     """Download+upload one pool batch's files to the task's flat BOS prefix.
 
     Self-contained — unlike a shard, no per-batch child workflow drives this
@@ -1016,9 +1049,11 @@ async def run_pool_batch(task_input: TaskInput, batch_index: int, filelist_key: 
          `{"ignored": true}` means an operator already stopped the parent
          task (paused/revoked/etc, see TERMINAL_STATUSES) — stop
          immediately, download nothing, return `{"ignored": True}` cleanly.
-      3. Disk preflight scaled for coexisting pipelines (`POOL_DISK_FLOOR_GB`)
-         — raises `_RetryableDiskLow` (retryable; no status write) rather
-         than starting a download that starves the host.
+      3. Disk preflight against a coexistence floor — `min_free_gb` when the
+         caller passes one (the coordinator owns the fleet-wide value), else
+         `_pool_disk_floor_gb()`'s relative default — raising
+         `_RetryableDiskLow` (retryable; no status write) rather than
+         starting a download that cannot finish on this worker.
       4. Pull the batch manifest from BOS (`download_shard_filelist`,
          reused verbatim), apply the unconditional HEAD-skip filter, then
          hand the remainder to `PipelineEngine.run()` exactly the way
@@ -1056,40 +1091,72 @@ async def run_pool_batch(task_input: TaskInput, batch_index: int, filelist_key: 
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     def _post(path: str, payload: dict) -> dict:
-        resp = requests.post(f"{_coordinator()}{path}", json=payload, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = requests.post(f"{_coordinator()}{path}", json=payload, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            # Bare HTTPError/timeouts carry no task context; triage from a
+            # Temporal failure message needs to know which worker, batch and
+            # endpoint were involved.
+            raise RuntimeError(
+                f"{server_key}: POST {path} failed for batch {batch_id} "
+                f"of {task_input.name}: {type(e).__name__}: {e}"
+            ) from e
 
-    assign_resp = await asyncio.to_thread(
-        _post, "/api/shards/assign", {"shard_id": batch_id, "server_key": server_key}
-    )
-    if assign_resp.get("error"):
-        raise RuntimeError(f"{server_key}: assign failed for batch {batch_id}: {assign_resp['error']}")
-    if assign_resp.get("ignored"):
-        return {"ignored": True}
+    # Everything up to engine.run() is network-bound and can outlive a
+    # heartbeat timeout on its own: two coordinator POSTs at 30s each (S1
+    # wedging is a known failure mode), the manifest fetch from BOS, and up
+    # to BATCH_MAX_FILES HEADs. The engine phase heartbeats via heartbeat_fn,
+    # so this concurrent beater is cancelled right before handing over —
+    # same pattern as filter_filelist_against_bos / chunk_filelist.
+    preflight_done = False
 
-    status_resp = await asyncio.to_thread(
-        _post, "/api/shards/status", {"shard_id": batch_id, "status": "running"}
-    )
-    if status_resp.get("error"):
-        raise RuntimeError(f"{server_key}: status=running failed for batch {batch_id}: {status_resp['error']}")
-    if status_resp.get("ignored"):
-        return {"ignored": True}
+    async def _heartbeat_while_preflight():
+        while not preflight_done:
+            activity.heartbeat(f"pool batch {batch_index}: preflight (assign/manifest/HEAD sweep)")
+            await asyncio.sleep(30)
 
-    if not await check_disk_space(min_free_gb=POOL_DISK_FLOOR_GB):
-        raise _RetryableDiskLow(
-            f"{server_key}: < {POOL_DISK_FLOOR_GB}GB free for pool batch "
-            f"{batch_index} of {task_input.name} (coexistence floor: "
-            f"{POOL_COEXISTING_PIPELINES} possible concurrent pipelines)"
-        )
-
+    heartbeat_task = asyncio.create_task(_heartbeat_while_preflight())
     try:
+        assign_resp = await asyncio.to_thread(
+            _post, "/api/shards/assign", {"shard_id": batch_id, "server_key": server_key}
+        )
+        if assign_resp.get("error"):
+            raise RuntimeError(f"{server_key}: assign failed for batch {batch_id}: {assign_resp['error']}")
+        if assign_resp.get("ignored"):
+            return {"ignored": True}
+
+        status_resp = await asyncio.to_thread(
+            _post, "/api/shards/status", {"shard_id": batch_id, "status": "running"}
+        )
+        if status_resp.get("error"):
+            raise RuntimeError(f"{server_key}: status=running failed for batch {batch_id}: {status_resp['error']}")
+        if status_resp.get("ignored"):
+            return {"ignored": True}
+
+        floor_gb, free_gb, total_gb = await asyncio.to_thread(_pool_disk_floor_gb)
+        if min_free_gb is not None:
+            floor_gb = min_free_gb
+        if free_gb < floor_gb:
+            raise _RetryableDiskLow(
+                f"{server_key}: {free_gb:.1f}GB free < {floor_gb}GB floor for pool batch "
+                f"{batch_index} of {task_input.name} on a {total_gb:.0f}GB staging volume "
+                f"(default floor = engine backpressure line + one batch; override with "
+                f"run_pool_batch's min_free_gb)"
+            )
+
         local_filelist = await download_shard_filelist(filelist_key, str(staging_dir))
         raw_files = json.loads(Path(local_filelist).read_text())
 
         remaining, skipped_files, skipped_bytes = await asyncio.to_thread(
             _head_skip_filter, raw_files, task_input
         )
+    finally:
+        preflight_done = True
+        heartbeat_task.cancel()
+
+    try:
         activity.heartbeat(
             f"pool batch {batch_index}: {skipped_files} already on BOS, "
             f"{len(remaining)} to download"
