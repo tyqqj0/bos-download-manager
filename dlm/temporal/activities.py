@@ -921,13 +921,10 @@ class _RetryableDiskLow(Exception):
 # margin — so the coexistence floor is derived from that same line rather
 # than from a multiple of the single-shard start gate.
 #
-# NOTE: the formula duplicates pipeline.py:91-95 (`_disk_free_threshold_gb`,
-# `max(total * DISK_FREE_MIN_PCT, DISK_FREE_ABSOLUTE_MIN_GB)`) instead of
-# importing it: that helper is module-private to the engine, and G1 forbids
-# touching pipeline.py to widen its interface. Keep the two in sync — if the
-# engine's backpressure policy changes, this floor must follow.
-POOL_DISK_BACKPRESSURE_PCT = 0.30   # mirrors pipeline.DISK_FREE_MIN_PCT
-POOL_DISK_BACKPRESSURE_MIN_GB = 20  # mirrors pipeline.DISK_FREE_ABSOLUTE_MIN_GB
+# The two constants come straight from the engine (they are public module
+# names; only `_disk_free_threshold_gb` itself is private, and G1 forbids
+# widening pipeline.py's interface to export it). Only the formula *shape* is
+# restated here, and the drift-guard test asserts it still matches.
 
 
 def _pool_disk_floor_gb() -> tuple[int, float, float]:
@@ -945,10 +942,12 @@ def _pool_disk_floor_gb() -> tuple[int, float, float]:
     batch should fail with a real disk error mid-run, not spin forever in a
     preflight that no amount of freed space can pass.
     """
+    from .pipeline import DISK_FREE_ABSOLUTE_MIN_GB, DISK_FREE_MIN_PCT
+
     stat = shutil.disk_usage(STAGING_PATH)
     total_gb = stat.total / (1024 ** 3)
     free_gb = stat.free / (1024 ** 3)
-    engine_line = max(total_gb * POOL_DISK_BACKPRESSURE_PCT, POOL_DISK_BACKPRESSURE_MIN_GB)
+    engine_line = max(total_gb * DISK_FREE_MIN_PCT, DISK_FREE_ABSOLUTE_MIN_GB)
     floor = min(engine_line + BATCH_MAX_BYTES / (1024 ** 3), total_gb * 0.5)
     return int(floor), free_gb, total_gb
 
@@ -1017,7 +1016,7 @@ async def run_pool_batch(
     task_input: TaskInput,
     batch_index: int,
     filelist_key: str,
-    min_free_gb: int | None = None,
+    min_free_gb: Optional[int] = None,
 ) -> dict:
     """Download+upload one pool batch's files to the task's flat BOS prefix.
 
@@ -1152,6 +1151,21 @@ async def run_pool_batch(
         remaining, skipped_files, skipped_bytes = await asyncio.to_thread(
             _head_skip_filter, raw_files, task_input
         )
+    except asyncio.CancelledError:
+        raise
+    except (_RetryableDiskLow, RuntimeError):
+        # Already carries its own context (disk floor detail, or _post's
+        # server_key/endpoint wrapper) — re-raise untouched.
+        raise
+    except Exception as e:
+        # A BOS outage on the manifest fetch, a corrupt manifest, or a config
+        # failure inside the HEAD sweep would otherwise propagate raw: same
+        # server_key context and staging cleanup the post-engine handler gives.
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"{server_key}: pool batch {batch_index} of {task_input.name} "
+            f"preflight failed: {type(e).__name__}: {e}"
+        ) from e
     finally:
         preflight_done = True
         heartbeat_task.cancel()

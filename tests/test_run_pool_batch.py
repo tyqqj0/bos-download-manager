@@ -217,7 +217,7 @@ def pool_batch_env(tmp_path, monkeypatch):
 
     # Real disk_usage on the test machine would make these tests
     # environment-dependent; pin a comfortably-above-floor volume.
-    monkeypatch.setattr(activities, "_pool_disk_floor_gb", lambda: (52, 500.0, 200.0))
+    monkeypatch.setattr(activities, "_pool_disk_floor_gb", lambda: (52, 150.0, 200.0))
     monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine", _FakePipelineEngine)
     _FakePipelineEngine.instances.clear()
     _FakePipelineEngine.call_log = calls
@@ -337,6 +337,19 @@ def test_explicit_min_free_gb_overrides_computed_floor(pool_batch_env, monkeypat
     monkeypatch.setattr(activities, "_pool_disk_floor_gb", lambda: (52, 100.0, 200.0))
     with pytest.raises(activities._RetryableDiskLow, match="120GB floor"):
         _run_activity(activities.run_pool_batch, _task_input(), 0, "k", 120)
+
+
+def test_pool_disk_floor_tracks_the_engines_own_backpressure_line():
+    """Drift guard for the floor's formula shape. The two constants are
+    imported from the engine, so they can't drift; what can drift is the
+    engine's *formula* — if `_disk_free_threshold_gb` stops being
+    `max(total * PCT, ABSOLUTE_MIN)`, the pool floor is no longer derived
+    from the line it claims to track."""
+    import shutil as shutil_mod
+    from dlm.temporal import pipeline
+
+    src = inspect.getsource(pipeline._disk_free_threshold_gb)
+    assert "max(total_gb * DISK_FREE_MIN_PCT, DISK_FREE_ABSOLUTE_MIN_GB)" in src
 
 
 def test_pool_disk_floor_is_relative_to_volume_size(monkeypatch, tmp_path):
