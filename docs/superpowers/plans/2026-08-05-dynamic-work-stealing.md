@@ -191,8 +191,10 @@ ShardWorkerWorkflow **字节不动**(replay 安全充分条件)。
    (或干脆全 `dlm/**/*.py` 聚合 md5);部署改**两阶段**:先全 16 台
    `--no-restart` 同步并核清单,清单全绿再统一重启(消灭"半新半旧"窗口)。
 3. **模式门禁**:web 在 `DLM_DEFAULT_DISPATCH_MODE=pool` 或手动置 pool 时,
-   先 `describe_task_queue(pool-{source})` 确认轮询者数 ≥ 池预期,
-   不满足拒绝派发(一次 RPC,是唯一权威信号 —— worker 心跳不带队列信息)。
+   先查池队列轮询者数 ≥ 池预期,不满足拒绝派发(唯一权威信号 —— worker
+   心跳不带队列信息)。实现细节:raw gRPC `DescribeTaskQueueRequest`,
+   **`task_queue_type=TASK_QUEUE_TYPE_ACTIVITY`**(池 Worker 不注册
+   workflow,查 WORKFLOW 类型恒为 0)。
 4. 上线顺序:部署+门禁 → 单个小任务手动 pool 试跑(双任务优先级实测一并做)
    → 观察一轮 → 默认切 pool → 旧任务自然跑完 → 稳定 ≥1 周删旧路径。
 5. 回滚:默认切回 sharded;在跑池任务 `/queue/reshard {dispatch_mode:'sharded'}`
@@ -217,6 +219,10 @@ ShardWorkerWorkflow **字节不动**(replay 安全充分条件)。
 
 跨池借调 / 批内断点(.progress.json 池模式退役,由无条件 HEAD-skip 顶替)/
 严格公平调度器 / legacy DownloadDatasetWorkflow / 传输链路 —— 均不动。
+web add 表单的 shard_count 输入框也**不做**:R1 下分片数由池自动涌现;
+灰度期需手控时走 `/api/queue/add` 的 `shard_count` 或 `/queue/reshard`
+(注:UI 实际调用的 `/api/tasks` 从未支持过 shard_count,这才是最初
+"网页没法选分片"抱怨的根因;池模式直接消灭该需求)。
 
 ## 6. v1 → v2 修订记录(评审发现摘要)
 
@@ -226,6 +232,12 @@ ShardWorkerWorkflow **字节不动**(replay 安全充分条件)。
 ③ 窗口来源与公平算术错误(死锁/50-50/冻结)→ §2.3-7 动态窗口;
 ④ 空池无计时器静默停摆 → §2.3-4 + 池巡检;
 ⑤ 部署/回滚门禁缺失(清单不含 __main__.py、reshard 三重失效)→ §3/§2.6。
-另修 IMPORTANT 级 14 项(HEAD-skip 条件、shielded 清理、create 幂等、
-聚合去抖、dashboard 聚合、preempt 存量 bug、guard 两洞、staging GC 等),
-细节见评审原文(会话产物)与本文对应小节。
+另修 IMPORTANT 级 14 项(全列,均有对应小节与实施任务):
+① HEAD-skip 无条件化(§2.4-b)② 取消清理 shielded(§2.3-6)
+③ 批次建行幂等化(§2.5,实施时为池专用新端点)④ 聚合去抖+SQL 化(§2.5)
+⑤ dashboard 按 server 聚合(§2.5)⑥ preempt server=NULL 存量 bug(§2.6)
+⑦ assign/status 两端点补 TERMINAL 守卫(§2.5)⑧ staging GC(§2.4-a/§2.5)
+⑨ 批次终态只由协调器写(§2.4-c)⑩ listing guard 改 coordinator_phase(§2.5)
+⑪ 池巡检替代 1800s 孤儿重派发(§2.5)⑫ task_stuck 豁免排队态(§2.5)
+⑬ cancel/reshard 跳过逐 shard 句柄+轮询预算(§2.6)
+⑭ get_running_shards JOIN 排除终态父任务(§2.5)。
