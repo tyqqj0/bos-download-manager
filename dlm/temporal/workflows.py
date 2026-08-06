@@ -813,6 +813,17 @@ POOL_BATCH_SCHEDULE_TO_CLOSE = timedelta(hours=48)
 POOL_BATCH_START_TO_CLOSE = timedelta(hours=12)
 POOL_BATCH_HEARTBEAT = timedelta(minutes=10)
 
+
+def pool_task_queue(source: str) -> str:
+    """The shared pool queue for a source.
+
+    Named here rather than inlined so the deploy side (which must start a
+    worker per pool queue, or batches queue forever with no error) can grep
+    for the string instead of reproducing it from prose. The workflow cannot
+    import `dlm.web.fleet`, so this is the single definition.
+    """
+    return "pool-ms" if source == "modelscope" else "pool-hf"
+
 # 5 minutes, not 30 seconds: a batch that failed because its worker died
 # should not be re-dispatched onto the same still-dying worker three times in
 # 90 seconds. Temporal has no anti-affinity, so backoff is the only lever.
@@ -987,10 +998,26 @@ class PoolDownloadWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
 
-        # Step 5: the window loop.
-        outcome = await self._run_window_loop(
-            task_input, shard_ids, batch_keys, list(range(num_batches))
-        )
+        # Step 5: the window loop. Bookkeeping-activity exhaustion (S1 down
+        # past ACTIVITY_RETRY's ~15 minutes) would otherwise propagate out of
+        # the workflow: in-flight batches cancelled mid-upload, no terminal
+        # report, and the task row left saying `downloading` behind a dead
+        # workflow — the "looks alive, nothing running" state the orphan
+        # reconciler exists to mop up, reached by a routine hiccup.
+        try:
+            outcome = await self._run_window_loop(
+                task_input, shard_ids, batch_keys, list(range(num_batches))
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return await self._fail(task_id, f"pool dispatch failed: {str(e)[:400]}")
+
+        if outcome["stopped"]:
+            # An operator stopped the task mid-window: every remaining batch
+            # declined to run. Its status is already whatever they set, and
+            # reporting `done` here would both lie and un-stop it.
+            return TaskResult(status="paused", error="task stopped during dispatch")
 
         # Step 6: one re-dispatch round for whatever failed. A single poison
         # worker can eat a batch's three attempts and fail an otherwise
@@ -1004,9 +1031,17 @@ class PoolDownloadWorkflow:
                       None, None, None, None, None],
                 start_to_close_timeout=timedelta(seconds=30),
             )
-            retry_outcome = await self._run_window_loop(
-                task_input, shard_ids, batch_keys, sorted(outcome["failed"])
-            )
+            try:
+                retry_outcome = await self._run_window_loop(
+                    task_input, shard_ids, batch_keys, sorted(outcome["failed"])
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                return await self._fail(
+                    task_id, f"pool re-dispatch failed: {str(e)[:400]}")
+            if retry_outcome["stopped"]:
+                return TaskResult(status="paused", error="task stopped during dispatch")
             retried_failures = retry_outcome["failed"]
             outcome["uploaded_files"] += retry_outcome["uploaded_files"]
             outcome["uploaded_bytes"] += retry_outcome["uploaded_bytes"]
@@ -1021,6 +1056,8 @@ class PoolDownloadWorkflow:
             return await self._fail(
                 task_id,
                 f"{len(retried_failures)}/{num_batches} batches failed after retry",
+                files_uploaded=outcome["uploaded_files"],
+                bytes_uploaded=outcome["uploaded_bytes"],
             )
 
         total_gb = outcome["uploaded_bytes"] / (1024 ** 3)
@@ -1035,13 +1072,22 @@ class PoolDownloadWorkflow:
             bytes_uploaded=outcome["uploaded_bytes"],
         )
 
-    async def _fail(self, task_id: str, error: str) -> TaskResult:
+    async def _fail(self, task_id: str, error: str, files_uploaded: int = 0,
+                    bytes_uploaded: int = 0) -> TaskResult:
+        """Report the task failed, carrying whatever did land.
+
+        A partly-successful task's bytes are real and already on BOS; a result
+        that reports zero would make the workflow history disagree with the
+        aggregate and with the bucket.
+        """
         await workflow.execute_activity(
             "report_to_dashboard",
             args=[task_id, "failed", None, None, None, None, None, error],
             start_to_close_timeout=timedelta(seconds=30),
         )
-        return TaskResult(status="failed", error=error)
+        return TaskResult(status="failed", error=error,
+                          files_uploaded=files_uploaded,
+                          bytes_uploaded=bytes_uploaded)
 
     async def _run_window_loop(
         self,
@@ -1053,10 +1099,13 @@ class PoolDownloadWorkflow:
         """Keep up to `window` batches in flight until `pending` is drained.
 
         `pending` is a list of batch indices, consumed in order. Returns
-        `{"failed": [idx...], "uploaded_files": int, "uploaded_bytes": int}`.
+        `{"stopped": bool, "failed": [idx...], "uploaded_files": int,
+        "uploaded_bytes": int}`. `stopped` means a batch reported that the
+        parent task is no longer runnable — the caller must not report a
+        terminal status of its own.
         """
         task_id = task_input.id
-        queue = f"pool-{'ms' if task_input.source == 'modelscope' else 'hf'}"
+        queue = pool_task_queue(task_input.source)
         # Priority 0-2 is the queue-jump band; Temporal's in-queue priority is
         # a free tie-break on top of the window, never the fairness mechanism.
         priority = Priority(priority_key=1 if (task_input.priority or 0) <= 2 else 3)
@@ -1067,6 +1116,7 @@ class PoolDownloadWorkflow:
         uploaded_files = 0
         uploaded_bytes = 0
         failed: list = []
+        stopped = False
 
         try:
             while remaining or in_flight:
@@ -1085,9 +1135,6 @@ class PoolDownloadWorkflow:
                         cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
                         priority=priority,
                     )
-
-                if not in_flight:
-                    break
 
                 # workflow.wait, never asyncio.wait — the latter's real sets
                 # iterate in process-dependent order and replay explodes.
@@ -1114,8 +1161,13 @@ class PoolDownloadWorkflow:
                         })
                         continue
                     if stats and stats.get("ignored"):
-                        # Parent task stopped: the batch declined to run and
-                        # the row must stay as the operator left it.
+                        # The batch found the parent task terminal and declined
+                        # to run — an operator stopped it. Stop dispatching:
+                        # draining the rest one `ignored` at a time would cost
+                        # a wake each and end by reporting `done` for a task
+                        # that downloaded nothing. Rows stay as they are; the
+                        # cleanup below releases whatever still claims a worker.
+                        stopped = True
                         continue
                     uploaded_files += (stats or {}).get("uploaded_files", 0)
                     uploaded_bytes += (stats or {}).get("uploaded_bytes", 0)
@@ -1133,29 +1185,63 @@ class PoolDownloadWorkflow:
                 for idx in [i for i, h in in_flight.items() if h.done()]:
                     in_flight.pop(idx, None)
 
+                if stopped:
+                    remaining = []
+                    if results:
+                        # Batches that really finished before the stop still
+                        # deserve their terminal rows; the endpoint's own
+                        # TERMINAL guard will drop them if the task is already
+                        # stopped, which is the correct outcome either way.
+                        await self._record(task_id, results)
+                    await self._release(task_id)
+                    break
+
                 # One bookkeeping activity per wake: writes the terminal batch
                 # rows and returns the recomputed window.
-                window_info = await workflow.execute_activity(
-                    "record_batches_and_window",
-                    args=[task_id, results],
-                    start_to_close_timeout=timedelta(minutes=5),
-                    retry_policy=ACTIVITY_RETRY,
-                )
-                window = max(1, int(window_info.get("window", 1)))
+                window_info = await self._record(task_id, results)
+                window = max(1, int((window_info or {}).get("window", 1)))
         except asyncio.CancelledError:
             # Shielded: a bare activity call here would itself be cancelled,
-            # leaving rows claiming workers that have already stopped.
-            await asyncio.shield(
-                workflow.execute_activity(
-                    "release_pool_batches",
-                    args=[task_id],
-                    start_to_close_timeout=timedelta(minutes=2),
-                )
-            )
+            # leaving rows claiming workers that have already stopped. Bounded
+            # (see _release) — an unbounded shielded retry would hold a
+            # cancelled workflow open indefinitely while S1 is wedged, and
+            # pause/reshard both wait for this workflow to close.
+            await asyncio.shield(self._release(task_id))
             raise
 
         return {
+            "stopped": stopped,
             "failed": failed,
             "uploaded_files": uploaded_files,
             "uploaded_bytes": uploaded_bytes,
         }
+
+    async def _record(self, task_id: str, results: list) -> dict:
+        """Write finished batches' terminal rows and read the next window."""
+        return await workflow.execute_activity(
+            "record_batches_and_window",
+            args=[task_id, results],
+            start_to_close_timeout=timedelta(minutes=5),
+            retry_policy=ACTIVITY_RETRY,
+        )
+
+    async def _release(self, task_id: str):
+        """Release rows that still claim a worker.
+
+        Bounded on purpose: this runs inside `asyncio.shield` on the
+        cancellation path, so the workflow cannot close until it resolves.
+        `schedule_to_close` caps the whole chain — without it, the default
+        unbounded retry policy would keep a paused task in "cancel requested"
+        for as long as S1 stays unreachable, and both pause and reshard block
+        on the workflow actually closing.
+        """
+        return await workflow.execute_activity(
+            "release_pool_batches",
+            args=[task_id],
+            schedule_to_close_timeout=timedelta(minutes=10),
+            start_to_close_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(seconds=15),
+                maximum_attempts=5,
+            ),
+        )

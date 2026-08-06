@@ -130,14 +130,18 @@ def upsert_task(task: dict):
         "progress_pct", "speed_mbps", "phase", "error", "error_class",
         "retry_count", "celery_task_id", "transfer_status", "transfer_task_id",
         "transfer_error", "created_at", "started_at", "completed_at", "updated_at",
-        "max_workers",
+        "max_workers", "dispatch_mode", "coordinator_phase",
     ]
     values = [task.get(c) for c in columns]
     placeholders = ", ".join(["?"] * len(columns))
     col_str = ", ".join(columns)
-    # COALESCE keeps the stored max_workers when a caller omits it from the dict
+    # COALESCE for the columns most callers don't know about: an update that
+    # omits them must not blank them. dispatch_mode in particular decides
+    # which coordinator a task gets — losing it silently reverts a pool task
+    # to sharded on the next progress write.
+    _preserve_if_omitted = ("max_workers", "dispatch_mode", "coordinator_phase")
     updates = ", ".join(
-        f"{c}=COALESCE(excluded.{c}, tasks.{c})" if c == "max_workers"
+        f"{c}=COALESCE(excluded.{c}, tasks.{c})" if c in _preserve_if_omitted
         else f"{c}=excluded.{c}"
         for c in columns if c != "id"
     )

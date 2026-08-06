@@ -1325,10 +1325,15 @@ async def record_batches_and_window(task_id: str, results: list[dict]) -> dict:
 
     `results` is `[{"batch_index": int, "shard_id": str, "status":
     "done"|"failed", "error": str|None}, ...]` — only batches that finished
-    since the last wake. Terminal batch rows are written here, i.e. by the
-    coordinator (G4: the activities that *run* batches only ever raise).
-    A row whose parent task is already terminal is skipped by the endpoint's
-    own guard, so a late wake cannot resurrect a stopped task.
+    since the last wake.
+
+    `failed` is written only from here, i.e. only by the coordinator (G4:
+    `run_pool_batch` raises rather than marking itself failed). `done` is NOT
+    coordinator-exclusive — a successful `run_pool_batch` already posts its
+    own `done` before returning, so this write is a redundant confirmation of
+    a row that is already terminal. Both are idempotent on the same row and
+    value; a row whose parent task is already terminal is skipped by the
+    endpoint's guard, so a late wake cannot resurrect a stopped task.
 
     Returns `{"window": int, "p": int, ...}` — the window this task may keep
     in flight until the next wake.

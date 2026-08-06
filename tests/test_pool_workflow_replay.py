@@ -296,6 +296,19 @@ def test_window_of_one_serializes_batches():
     assert stubs.batch_calls == [0, 1, 2]   # in order, never overlapping
 
 
+def test_recomputed_window_is_honored():
+    """The companion to the window=1 test, which on its own would pass even if
+    the recomputed window were ignored (1 is also the initial value). Here the
+    first wake widens the window, and concurrency must follow."""
+    stubs = _PoolActivityStubs(num_batches=6, windows=[3, 3, 3, 3, 3, 3],
+                               batch_seconds=0.4)
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "done"
+    assert stubs.max_concurrent >= 2, \
+        "the window returned by the bookkeeping activity was not applied"
+
+
 def test_failed_batch_is_redispatched_once_and_can_succeed():
     """Rule 8: a batch whose attempts were eaten by one bad worker gets a
     whole second dispatch round before the task is called failed."""
@@ -317,8 +330,11 @@ def test_batch_failing_both_rounds_fails_the_task():
     assert result.status == "failed"
     assert "1/3 batches failed after retry" in result.error
     assert stubs.batch_calls.count(2) == 2
-    # the healthy batches' bytes are still counted, not thrown away
     assert ("failed", None, result.error) in stubs.dashboard
+    # The two healthy batches' bytes are real and on BOS; a failed result that
+    # reported zero would disagree with the aggregate and with the bucket.
+    assert result.files_uploaded == 10      # 2 batches x 5
+    assert result.bytes_uploaded == 200
 
 
 def test_cancellation_releases_batch_rows():
@@ -367,3 +383,49 @@ def test_empty_remaining_after_filter_completes_without_batches():
     assert result.status == "done"
     assert stubs.batch_calls == []
     assert any(s == "done" for s, _, _ in stubs.dashboard)
+
+
+def test_batch_reporting_ignored_stops_the_loop_without_claiming_done():
+    """An operator pauses mid-window: run_pool_batch finds the parent task
+    terminal and declines. Draining the rest one `ignored` at a time would
+    cost a wake each and end by reporting `done` for a task that downloaded
+    almost nothing — and would skip the release, leaving rows still claiming
+    workers that have stopped."""
+    stubs = _PoolActivityStubs(num_batches=6, windows=[1] * 8)
+
+    real_batch = stubs.run_pool_batch
+
+    async def stop_after_first(task_input, batch_index, filelist_key):
+        if batch_index == 0:
+            return await real_batch(task_input, batch_index, filelist_key)
+        stubs.batch_calls.append(batch_index)
+        return {"ignored": True}
+
+    stubs.run_pool_batch = stop_after_first
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "paused"
+    # stopped at the first ignored batch rather than walking all six
+    assert stubs.batch_calls == [0, 1]
+    # nothing claimed a terminal task state on the operator's behalf
+    assert not any(s in ("done", "failed") for s, _, _ in stubs.dashboard)
+    # and the rows that still claimed a worker were released
+    assert stubs.released == ["t-pool-1"]
+
+
+def test_bookkeeping_failure_fails_the_task_instead_of_stranding_it():
+    """S1 unreachable past the retry policy must not let the ActivityError
+    escape the workflow: that cancels in-flight batches, writes no terminal
+    report, and leaves the task row saying `downloading` behind a dead
+    workflow."""
+    stubs = _PoolActivityStubs(num_batches=3)
+
+    async def always_fails(task_id, results):
+        raise ApplicationError("S1 unreachable", non_retryable=True)
+
+    stubs.record_batches_and_window = always_fails
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "failed"
+    assert "pool dispatch failed" in result.error
+    assert any(s == "failed" for s, _, _ in stubs.dashboard)
