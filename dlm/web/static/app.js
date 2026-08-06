@@ -793,6 +793,27 @@ function app() {
                 }));
         },
 
+        // The hero card's per-server rows, for either dispatch mode. A pool
+        // task carries `server_batches` — already aggregated per distinct
+        // server by the backend, because up to POOL_MAX_BATCHES (1500) batch
+        // rows must not become 1500 chips (decision F) — and a sharded task
+        // carries `shard_servers`, one entry per shard. Both expose
+        // server/speed_mbps/done_pct, which is all the card renders, so one
+        // accessor serves both and the sharded card renders exactly what it
+        // did before (G1). Before this existed the card gated on
+        // shard_servers alone and a pool task showed no per-server view.
+        dlServers(dl) {
+            return dl.server_batches || dl.shard_servers || [];
+        },
+
+        // "bj1,bj2 (1500 batches)" vs "w1,w2 (6 shards)": total_shards counts
+        // batch rows for a pool task, and its server list is deduplicated.
+        dlServersLabel(dl) {
+            const servers = this.dlServers(dl).map(s => s.server).join(',');
+            const unit = dl.server_batches ? 'batches' : 'shards';
+            return `${servers} (${dl.total_shards} ${unit})`;
+        },
+
         // The modal's error line: unbounded for a pool task's up-to-1500
         // rows, so cap what is shown there (first few + a count). The
         // sharded table stays as-is — shard counts are small.

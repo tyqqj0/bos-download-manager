@@ -995,6 +995,40 @@ def test_sharded_task_shard_servers_unchanged_g1_regression(db):
     assert dl["server"] == "w1,w1"  # non-deduplicated, exactly like today
 
 
+def test_the_hero_card_consumes_server_batches(db):
+    """Review finding I4: /api/dashboard's pool branch emits server_batches
+    and deliberately no shard_servers, but the Active Downloads hero card
+    gated every per-server block on dl.shard_servers — so a pool task lost
+    the per-server view T9 exists to provide, while the field built to supply
+    it had no consumer in dlm/web/static at all.
+
+    Text-level (there is no JS test harness here, and adding a node-dependent
+    test would make the deploy gate depend on node being installed on S1),
+    which is exactly why the accessor is one named function: both payload
+    shapes must reach the card through it, and no hero block may gate on the
+    sharded-only field.
+    """
+    from pathlib import Path
+
+    static = Path(__file__).resolve().parents[1] / "dlm" / "web" / "static"
+    index = (static / "index.html").read_text()
+    appjs = (static / "app.js").read_text()
+
+    start = index.index("<!-- Active Downloads (Hero) -->")
+    hero = index[start:index.index("<!-- Workers (compact chips) -->", start)]
+
+    assert "shard_servers" not in hero, (
+        "the hero card must not gate on the sharded-only field — a pool task "
+        "does not carry it")
+    # single chip / multi-server chip / phase badge / speed breakdown, plus the
+    # x-for over the rows themselves.
+    assert hero.count("dlServers(dl)") >= 4, hero.count("dlServers(dl)")
+    assert "dlServersLabel(dl)" in hero
+
+    # ...and the accessor reads both shapes, pool first.
+    assert "dl.server_batches || dl.shard_servers" in appjs
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 5. Busy signal (decision D — verify, don't manufacture a change)
 # ═══════════════════════════════════════════════════════════════════════
