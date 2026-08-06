@@ -177,7 +177,7 @@ def test_window_for_unknown_task_is_an_error(db):
 # ── POST /api/pool/batches/release ──────────────────────────────────
 
 
-def test_release_resets_claiming_rows_and_leaves_done_alone(db):
+def test_release_resets_claiming_rows_and_leaves_done_and_failed_alone(db):
     from dlm.web.routes.queue import release_pool_batches
 
     _task(db, "t-rel", status="paused")
@@ -190,16 +190,19 @@ def test_release_resets_claiming_rows_and_leaves_done_alone(db):
 
     out = _call(release_pool_batches({"task_id": "t-rel"}))
     assert out["ok"] is True
-    assert out["released"] == 2        # running + failed, not done
+    assert out["released"] == 1        # only the row claiming a worker
 
     rows = {r["id"]: r for r in db.get_shards_by_task("t-rel")}
     assert rows["s-t-rel-0"]["status"] == "pending"
     assert rows["s-t-rel-0"]["server"] is None
     assert rows["s-t-rel-0"]["speed_mbps"] == 0
-    assert rows["s-t-rel-2"]["status"] == "pending"
     # a done row's bytes are on BOS; its server attribution stays intact
     assert rows["s-t-rel-1"]["status"] == "done"
     assert rows["s-t-rel-1"]["server"] == "w4"
+    # a failed row keeps its status: it is the only per-batch attribution an
+    # operator has after "N/M batches failed". Re-dispatch resets it via the
+    # batch-create endpoint, not via release.
+    assert rows["s-t-rel-2"]["status"] == "failed"
 
 
 def test_release_is_idempotent_and_needs_a_task_id(db):

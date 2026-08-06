@@ -824,7 +824,15 @@ async def release_pool_batches(body: dict):
     The coordinator's cancellation path calls this (shielded) so a paused or
     reshard-bound task leaves no row claiming to be running on a worker that
     has already stopped — those rows are what busy_servers, the dashboard and
-    the reconciler read. `done` rows are left alone: their bytes are on BOS.
+    the reconciler read.
+
+    Only rows that actually claim a worker are released. `done` rows are left
+    alone (their bytes are on BOS) and so are `failed` ones: a failed batch's
+    status plus its error is the only per-batch attribution an operator has
+    after the fact, and resetting it to `pending` would make a task reporting
+    "3/717 batches failed" show 717 rows with nothing marked failed. Getting a
+    failed row back to `pending` for a genuine re-dispatch is the batch-create
+    endpoint's job, which does it as part of an idempotent hit.
 
     No TERMINAL guard: unlike assign/status this only ever *releases* rows,
     and the task being terminal is precisely when it is called.
@@ -839,7 +847,7 @@ async def release_pool_batches(body: dict):
         with conn:
             cur = conn.execute(
                 "UPDATE shards SET status='pending', server=NULL, speed_mbps=0 "
-                "WHERE task_id=? AND status!='done'",
+                "WHERE task_id=? AND status NOT IN ('done', 'failed')",
                 (task_id,),
             )
         return {"ok": True, "released": cur.rowcount}

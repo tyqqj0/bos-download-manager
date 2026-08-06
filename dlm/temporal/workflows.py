@@ -1091,6 +1091,8 @@ class PoolDownloadWorkflow:
         """
         try:
             await self._release(task_id)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             # Cleanup must never be the reason a failure goes unreported.
             pass
