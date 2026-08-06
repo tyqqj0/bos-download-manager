@@ -150,7 +150,15 @@ async def run_worker(args):
         ShardWorkerWorkflow,
     ]
 
-    queues = list(dict.fromkeys([task_queue, personal_queue]))
+    # A bj node's --task-queue is its own personal queue, so the two dedupe to
+    # one and it polled no shared queue at all. Coordinators then always ran on
+    # `download-workers` — HK-only — which is how a ModelScope listing landed
+    # on w6 and died with `No module named 'modelscope'` (t-20260806-cbf39e).
+    # Each node now also polls the shared coordinator queue for the source it
+    # serves; see dlm/web/fleet.coordinator_queue for the dispatch half.
+    from ..web.fleet import worker_coordinator_queue
+    shared_queue = worker_coordinator_queue(args.server_key)
+    queues = list(dict.fromkeys([task_queue, personal_queue, shared_queue]))
     logger.info(f"Starting worker: server_key={args.server_key}, queues={queues}")
     logger.info(f"Registered {len(workflows)} workflows, {len(activities)} activities")
 

@@ -144,10 +144,16 @@ async def start_split_download(task_dict: dict, worker_count: int = 2):
     return handle
 
 
-async def start_sharded_download(task_dict: dict):
-    """Start a ShardedDownloadWorkflow — auto-sharding coordinator."""
+async def start_sharded_download(task_dict: dict, task_queue: str | None = None):
+    """Start a ShardedDownloadWorkflow — auto-sharding coordinator.
+
+    `task_queue` must be one the source's own workers poll; see
+    fleet.coordinator_queue. Defaults to the shared HK queue, which is correct
+    for every source except ModelScope.
+    """
     from ..temporal.models import TaskInput
     from ..temporal.workflows import ShardedDownloadWorkflow
+    from .fleet import SHARED_COORDINATOR_QUEUE
 
     client = await connected_client()
     task_input = TaskInput(
@@ -162,14 +168,15 @@ async def start_sharded_download(task_dict: dict):
         shard_count=int(task_dict.get("max_workers") or 0),
     )
 
+    queue = task_queue or SHARED_COORDINATOR_QUEUE
     workflow_id = f"sharded-{task_dict['id']}"
     handle = await client.start_workflow(
         ShardedDownloadWorkflow.run,
         task_input,
         id=workflow_id,
-        task_queue="download-workers",
+        task_queue=queue,
     )
-    logger.info(f"Started sharded workflow {workflow_id}")
+    logger.info(f"Started sharded workflow {workflow_id} on queue {queue}")
     return handle
 
 

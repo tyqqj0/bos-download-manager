@@ -288,6 +288,7 @@ async def preempt_for_task(body: dict):
         return {"error": "urgent_task_id is required"}
 
     from ..temporal_client import cancel_workflow, start_sharded_download
+    from ..fleet import coordinator_queue
 
     def do_read():
         snapshot.init_db()
@@ -351,7 +352,8 @@ async def preempt_for_task(body: dict):
 
     # 3) Start the workflow (unified sharded path — BOS resume filter included)
     try:
-        await start_sharded_download(task)
+        await start_sharded_download(
+            task, task_queue=coordinator_queue(task.get("source", "hf")))
     except Exception as e:
         if "already started" not in str(e).lower():
             def do_revert():

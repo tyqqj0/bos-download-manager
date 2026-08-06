@@ -38,6 +38,7 @@ async def reconcile() -> dict:
         complete_task, init_db, _conn,
     )
     from .temporal_client import running_workflows, start_sharded_download
+    from .fleet import coordinator_queue
 
     init_db()
     report = {
@@ -123,7 +124,10 @@ async def reconcile() -> dict:
                         (time.time(), task_id),
                     )
                     conn2.commit()
-                    await start_sharded_download(task)
+                    await start_sharded_download(
+                        task,
+                        task_queue=coordinator_queue(task.get("source", "hf")),
+                    )
                     report["redispatched"].append(task.get("name", task_id))
                     logger.info(
                         f"Reconciler: re-dispatched {task.get('name', task_id)} "
@@ -180,7 +184,7 @@ async def auto_dispatch_pending() -> dict:
         # 1. Find alive workers (deduped by freshest heartbeat row)
         from .fleet import (
             alive_workers as compute_alive, busy_servers as compute_busy,
-            worker_serves,
+            coordinator_queue, worker_serves,
         )
 
         now = time.time()
@@ -269,12 +273,18 @@ async def auto_dispatch_pending() -> dict:
             # below must not let a second coordinator spawn this cycle
             sources_in_listing.add(task.get("source", "hf"))
 
+            # The source routing decided above has to survive into the
+            # coordinator: started on the shared HK queue, a ModelScope task
+            # lists its files on an HF node (see fleet.coordinator_queue).
+            queue = coordinator_queue(task.get("source", "hf"))
+
             try:
-                await start_sharded_download(task)
+                await start_sharded_download(task, task_queue=queue)
                 report["dispatched"].append({
                     "task": task.get("name", task["id"]),
                     "worker": "sharded",
                     "mode": "sharded",
+                    "queue": queue,
                 })
                 logger.info(f"Auto-dispatch: {task.get('name')} → sharded coordinator")
             except Exception as e:

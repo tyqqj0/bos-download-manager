@@ -175,6 +175,7 @@ async def fix(req: FixRequest):
     host-level operation and goes through scripts/deploy-workers.sh.
     """
     from ..temporal_client import start_sharded_download
+    from ..fleet import coordinator_queue
 
     tasks, _, _ = await run_blocking(_read_state)
     now = time.time()
@@ -203,7 +204,8 @@ async def fix(req: FixRequest):
                 try:
                     # Sharded path only — the legacy workflow has no BOS resume
                     # filter and would re-download everything already uploaded.
-                    await start_sharded_download(t)
+                    await start_sharded_download(
+                        t, task_queue=coordinator_queue(t.get("source", "hf")))
                     redispatched.append(t.get("name", task_id))
                 except Exception as e:
                     if "already started" not in str(e).lower():
