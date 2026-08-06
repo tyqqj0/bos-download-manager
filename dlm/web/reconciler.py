@@ -460,11 +460,13 @@ async def auto_dispatch_pending() -> dict:
         #    NULL counts as listing: a pool task that has never reached
         #    create_pool_batches has no phase yet, and reading NULL as "not
         #    listing" left its source completely unguarded during exactly the
-        #    window the guard exists for. The three claim routes that put a
-        #    task into `downloading` (this function, reconcile()'s orphan
-        #    re-dispatch, /queue/preempt) all reset a pool task's phase to
-        #    'listing' via snapshot.CLAIM_RESET_PHASE_SQL, so 'dispatching'
-        #    here always belongs to the coordinator currently running.
+        #    window the guard exists for. Two claim routes put a task into
+        #    `downloading` and reset a pool task's phase to 'listing' via
+        #    snapshot.CLAIM_RESET_PHASE_SQL: this function, and /queue/preempt.
+        #    reconcile()'s orphan re-dispatch is NOT a third one — decision C's
+        #    `continue` above means a pool task never reaches that UPDATE at
+        #    all, so 'dispatching' here always belongs to the coordinator
+        #    currently running.
         #    Exception, pre-existing and unchanged by this task: the doctor's
         #    orphan repair (routes/doctor.py) re-dispatches without touching
         #    claimed_at at all, so its coordinator is outside this guard for
