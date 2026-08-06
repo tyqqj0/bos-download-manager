@@ -10,6 +10,7 @@ workflows but leaves SQLite tasks in 'downloading' forever.
 
 import asyncio
 import logging
+import re
 import time
 
 logger = logging.getLogger("dlm.reconciler")
@@ -24,9 +25,17 @@ from .fleet import (  # noqa: E402
     DEAD_THRESHOLD,
     MIN_SHARD_DISK_GB as MIN_DISPATCH_DISK_GB,
     POOL_MAX_CONCURRENT_TASKS,
+    POOL_STARVED_ATTEMPT,
+    POOL_STARVED_SCHEDULED_S,
     STALE_THRESHOLD,
+    TERMINAL_STATUSES,
     has_live_workflow,
 )
+
+# Batch/shard row statuses that mean "this row is finished" (decision A/G).
+# Not the task-level TERMINAL_STATUSES — a row in the shards table only ever
+# takes pending/running/done/failed.
+_ROW_TERMINAL = ("done", "failed")
 
 
 async def reconcile() -> dict:
@@ -111,6 +120,27 @@ async def reconcile() -> dict:
                 "stale_seconds": int(stale_seconds),
             })
 
+            # Decision C: a pool coordinator's updated_at staleness is not
+            # evidence of trouble — it can legitimately sit in its window
+            # loop for hours while progress is written by batch activities,
+            # not the task row. Re-dispatching would also start a *second*
+            # PoolDownloadWorkflow, which re-runs list -> filter -> chunk and
+            # re-POSTs pool/batches/create; T1's ruling on a chunking
+            # mismatch is no-delete + error (non-retryable), so a re-dispatch
+            # against a changed filelist wedges the task instead of healing
+            # it. So: skip the re-dispatch entirely for a pool task, record
+            # it separately, and let the pool_starved alert (below) carry it
+            # to a human. The sharded branch underneath is untouched — G1
+            # requires it stay byte-identical, and it is what
+            # Egocentric-100K's self-healing rests on.
+            if (task.get("dispatch_mode") or "sharded") == "pool":
+                report.setdefault("pool_orphaned", []).append({
+                    "task_id": task_id,
+                    "name": task.get("name", ""),
+                    "stale_seconds": int(stale_seconds),
+                })
+                continue
+
             # Only re-dispatch if stale for > DEAD_THRESHOLD
             # (gives time for workflows that just started to appear)
             if stale_seconds > DEAD_THRESHOLD:
@@ -164,7 +194,147 @@ async def reconcile() -> dict:
             f"{report['redispatched']}"
         )
 
+    # Pool patrol (decision A) — three triggers, one pool_starved alert.
+    # Runs every RECONCILE_INTERVAL (5 min), comfortably inside A10's 15-min
+    # budget. Best-effort: a patrol failure must not fail the whole
+    # reconcile pass, since callers already rely on its other keys.
+    try:
+        report["pool_starved"] = await inspect_pool_tasks(downloading)
+    except Exception as e:
+        report["pool_starved"] = []
+        report["errors"].append(f"Pool patrol failed: {e}")
+        logger.error(f"Pool patrol failed: {e}")
+
     return report
+
+
+async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
+    """Three-trigger pool patrol -> `pool_starved` alerts (decision A).
+
+    `downloading` is the same list `reconcile()` already fetched — this
+    never queries SQLite itself beyond per-task batch rows. Every Temporal
+    RPC is best-effort: an inspection pass must never be able to stop the
+    scheduler loop, so a failed RPC is logged and skipped, not raised.
+
+    Trigger 1 (no pollers) is what A10's drill exercises — it fires within
+    one inspection cycle of the fleet's pollers going to zero. Triggers 2/3
+    (SCHEDULED aged out / attempt climbing) catch the slower failure shapes
+    a poller-count check alone would miss (see the plan-vs-timers analysis
+    in decision A). All three emit the same alert type, keyed per task so
+    the existing `_active_alerts` de-dupe in alerts.py collapses repeats.
+    """
+    from ..queue.snapshot import get_shards_by_task
+    from ..temporal.workflows import pool_task_queue
+    from .temporal_client import (
+        POOL_DOWNLOAD_ID_PREFIX,
+        _pool_poller_count,
+        connected_client,
+        pending_activities,
+    )
+
+    pool_tasks = [t for t in downloading if (t.get("dispatch_mode") or "sharded") == "pool"]
+    if not pool_tasks:
+        return []
+
+    now = time.time()
+    alerts: list[dict] = []
+    alerted_task_ids: set = set()
+
+    # Trigger 1: zero ACTIVITY pollers on a source with a downloading pool
+    # task holding >=1 non-terminal batch row. One poller-count RPC per
+    # affected source (not per task) — reused via T7's existing helper.
+    by_source: dict[str, list[dict]] = {}
+    for t in pool_tasks:
+        try:
+            batches = get_shards_by_task(t["id"])
+        except Exception as e:
+            logger.error(f"Pool patrol: cannot read batch rows for {t['id']}: {e}")
+            continue
+        if any(b.get("status") not in _ROW_TERMINAL for b in batches):
+            by_source.setdefault(t.get("source") or "hf", []).append(t)
+
+    if by_source:
+        try:
+            client = await connected_client()
+        except Exception as e:
+            logger.error(f"Pool patrol: cannot connect to Temporal: {e}")
+            client = None
+
+        if client is not None:
+            for source, tasks_for_source in by_source.items():
+                queue_name = pool_task_queue(source)
+                try:
+                    pollers = await _pool_poller_count(client, queue_name)
+                except Exception as e:
+                    logger.error(
+                        f"Pool patrol: poller-count RPC failed for {queue_name}: {e}"
+                    )
+                    continue
+                if pollers > 0:
+                    continue
+                for t in tasks_for_source:
+                    alerts.append({
+                        "severity": "critical",
+                        "type": "pool_starved",
+                        "task_id": t["id"],
+                        "task_name": t.get("name", ""),
+                        "source": source,
+                        "trigger": "no_pollers",
+                        "pollers": pollers,
+                        "message": (
+                            f"Pool task {t.get('name', t['id'])} ({source}): "
+                            f"{queue_name} has 0 activity pollers"
+                        ),
+                    })
+                    alerted_task_ids.add(t["id"])
+
+    # Triggers 2/3: pending-activity inspection per pool task, skipping any
+    # task trigger 1 already flagged (one alert per task; CRITICAL wins).
+    for t in pool_tasks:
+        if t["id"] in alerted_task_ids:
+            continue
+        workflow_id = f"{POOL_DOWNLOAD_ID_PREFIX}{t['id']}"
+        try:
+            rows = await pending_activities(workflow_id)
+        except Exception as e:
+            logger.error(f"Pool patrol: pending_activities failed for {t['id']}: {e}")
+            continue
+
+        for row in rows:
+            if row.get("state") == "SCHEDULED" and row.get("scheduled_at") is not None:
+                age = now - row["scheduled_at"]
+                if age > POOL_STARVED_SCHEDULED_S:
+                    alerts.append({
+                        "severity": "warning",
+                        "type": "pool_starved",
+                        "task_id": t["id"],
+                        "task_name": t.get("name", ""),
+                        "source": t.get("source") or "hf",
+                        "trigger": "scheduled_stuck",
+                        "scheduled_age_s": int(age),
+                        "message": (
+                            f"Pool task {t.get('name', t['id'])}: a batch activity has "
+                            f"been SCHEDULED for {int(age)}s"
+                        ),
+                    })
+                    break
+            if (row.get("attempt") or 0) >= POOL_STARVED_ATTEMPT:
+                alerts.append({
+                    "severity": "warning",
+                    "type": "pool_starved",
+                    "task_id": t["id"],
+                    "task_name": t.get("name", ""),
+                    "source": t.get("source") or "hf",
+                    "trigger": "attempt_climbing",
+                    "attempt": row["attempt"],
+                    "message": (
+                        f"Pool task {t.get('name', t['id'])}: a batch activity is on "
+                        f"attempt {row['attempt']}"
+                    ),
+                })
+                break
+
+    return alerts
 
 
 async def auto_dispatch_pending() -> dict:
@@ -503,3 +673,143 @@ def zero_stale_speeds():
     except Exception:
         pass
     conn.commit()
+
+
+# ── Staging GC (decision G) ─────────────────────────────────────────
+
+# Same filter routes/servers.py's cleanup endpoint already applies before
+# shlex.quote-ing a task name into a shell command — kept identical rather
+# than re-derived, since it is the last line of defence between a task name
+# and `rm -rf`.
+_SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-/]+$')
+
+
+def select_staging_gc(dirs_by_server: dict, tasks: list[dict]) -> dict:
+    """Decide what staging directories are safe to remove. Pure — no ssh, no
+    filesystem access — so this is the whole GC's test surface (decision G).
+
+    `dirs_by_server` is `{server_key: [dir_name, ...]}`, one entry per
+    top-level name actually found under STAGING_PATH on that server (the
+    impure fan-out in `staging_gc()` below is what produces this via `ls`).
+    `tasks` is every task row (`get_all_tasks()`), matched by `name` — task
+    `name` is not unique in this schema, so a directory is only removable
+    when *every* task row sharing that name is terminal (rule 3).
+
+    Returns `{"remove": [...], "keep": [...], "unknown": [...], "skipped": [...]}`.
+    Each entry carries `server`/`name` plus, for `remove`, the terminal
+    `status`(es) that authorised it (rule 5 wants that in the removal log).
+    """
+    by_name: dict[str, list[dict]] = {}
+    for t in tasks:
+        name = t.get("name")
+        if name:
+            by_name.setdefault(name, []).append(t)
+
+    remove, keep, unknown, skipped = [], [], [], []
+    for server, names in dirs_by_server.items():
+        for name in names:
+            if not _SAFE_NAME_RE.match(name):
+                # A name failing the filter is skipped, not quoted-and-hoped
+                # (rule 4) — whatever it is, it never reaches `rm -rf`.
+                skipped.append({"server": server, "name": name, "reason": "metacharacters"})
+                continue
+
+            rows = by_name.get(name)
+            if not rows:
+                # Reported, never removed (rule 2) — may be a legacy dir or
+                # a task whose row was deleted while data was still in flight.
+                unknown.append({"server": server, "name": name})
+                continue
+
+            non_terminal = [r for r in rows if r.get("status") not in TERMINAL_STATUSES]
+            if non_terminal:
+                # Any non-terminal task with this name blocks it (rule 3) —
+                # names collide, so this is the full row set, not the first hit.
+                keep.append({
+                    "server": server, "name": name,
+                    "reason": f"non-terminal status(es): "
+                              f"{sorted({r.get('status') for r in non_terminal})}",
+                })
+                continue
+
+            remove.append({
+                "server": server, "name": name,
+                "status": sorted({r.get("status") for r in rows}),
+            })
+
+    return {"remove": remove, "keep": keep, "unknown": unknown, "skipped": skipped}
+
+
+def staging_gc(dry_run: bool = False) -> dict:
+    """Periodic staging GC (decision G) — local disk only, terminal tasks only.
+
+    Lists every enabled remote server's STAGING_PATH over ssh, runs the pure
+    `select_staging_gc` above to decide what is safe, and — unless
+    `dry_run` — removes exactly those directories with `rm -rf`, keeping the
+    same metacharacter filter + `shlex.quote` routes/servers.py's manual
+    cleanup endpoint already uses (that endpoint can't reach pool/sharded
+    staging at all: it matches on `task.server == key`, which is NULL for
+    every modern task — this sweep discovers directories independently via
+    `ls` instead of trusting that column).
+
+    Never touches BOS — this only ever runs `ls`/`rm -rf` against a worker's
+    local scratch path. Every per-host ssh failure is swallowed: S1->BJ ssh
+    is known-flaky and one unreachable host must not abort the sweep (the
+    scheduler additionally wraps the whole call in asyncio.wait_for, so a
+    hang here cannot stop the loop either).
+    """
+    import shlex
+
+    from ..core.servers import load_servers
+    from ..core.ssh import ssh_exec, ssh_parallel
+    from ..queue.snapshot import get_all_tasks, init_db
+    from ..worker.disk import STAGING_PATH
+
+    init_db()
+    tasks = get_all_tasks()
+    servers = [s for s in load_servers().values() if s.enabled and not s.local]
+
+    errors: list[str] = []
+    if not servers:
+        return {"dry_run": dry_run, "candidates": [], "removed": [],
+                 "kept": [], "unknown": [], "skipped": [], "errors": errors}
+
+    listing = ssh_parallel(servers, f"ls -1 {STAGING_PATH} 2>/dev/null", timeout=15)
+
+    dirs_by_server: dict = {}
+    for server in servers:
+        out, ok = listing.get(server.key, ("", False))
+        if not ok:
+            errors.append(f"{server.key}: could not list {STAGING_PATH}")
+            continue
+        dirs_by_server[server.key] = [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+    plan = select_staging_gc(dirs_by_server, tasks)
+
+    removed = []
+    if not dry_run:
+        by_key = {s.key: s for s in servers}
+        for item in plan["remove"]:
+            server = by_key.get(item["server"])
+            if server is None:
+                continue
+            target = shlex.quote(f"{STAGING_PATH}/{item['name']}")
+            out, ok = ssh_exec(server.host, server.user, f"rm -rf {target}", timeout=30)
+            if ok:
+                removed.append(item)
+                logger.info(
+                    f"Staging GC: removed {item['name']} on {server.key} "
+                    f"(task status={item['status']})"
+                )
+            else:
+                errors.append(f"{server.key}: rm failed for {item['name']}: {out}")
+
+    return {
+        "dry_run": dry_run,
+        "candidates": plan["remove"],
+        "removed": removed,
+        "kept": plan["keep"],
+        "unknown": plan["unknown"],
+        "skipped": plan["skipped"],
+        "errors": errors,
+    }
