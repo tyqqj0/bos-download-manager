@@ -22,9 +22,13 @@ def _call(coro):
 
 
 def _task(db, task_id, status="downloading", *, mode="pool", priority=5, source="hf"):
-    db.upsert_task({"id": task_id, "name": task_id, "repo_id": "org/x",
-                    "status": status, "priority": priority, "source": source,
-                    "dispatch_mode": mode})
+    """mode=None omits dispatch_mode entirely, i.e. what every existing caller
+    does — the case where the schema default has to be applied."""
+    row = {"id": task_id, "name": task_id, "repo_id": "org/x",
+           "status": status, "priority": priority, "source": source}
+    if mode is not None:
+        row["dispatch_mode"] = mode
+    db.upsert_task(row)
 
 
 def _worker(db, key, *, fresh=True):
@@ -228,3 +232,19 @@ def test_release_does_not_touch_another_task(db):
 
     other = db.get_shards_by_task("t-b")[0]
     assert other["status"] == "running" and other["server"] == "w2"
+
+
+def test_upsert_task_defaults_dispatch_mode_rather_than_nulling_it(db):
+    """Naming dispatch_mode in upsert_task's column list means an omitted key
+    INSERTs an explicit NULL, which overrides the schema DEFAULT. Every task
+    is created through this path, so the default has to be applied here."""
+    _task(db, "t-plain", status="pending", mode=None)
+    assert db.get_task("t-plain")["dispatch_mode"] == "sharded"
+
+
+def test_upsert_task_preserves_pool_mode_across_a_partial_write(db):
+    """A progress write that omits dispatch_mode must not revert a running
+    pool task to sharded."""
+    _task(db, "t-pool-x", status="pending", mode="pool")
+    _task(db, "t-pool-x", status="downloading", mode=None)
+    assert db.get_task("t-pool-x")["dispatch_mode"] == "pool"

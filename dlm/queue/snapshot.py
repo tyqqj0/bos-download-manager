@@ -111,6 +111,9 @@ def init_db():
         # coordinator a task runs under, coordinator_phase is the listing
         # guard's replacement for the NOT EXISTS(shards) probe once pool
         # tasks can have batch rows before dispatching starts.
+        # Both are COALESCE-preserved in upsert_task, so a phase moves between
+        # named values only: passing None leaves the stored phase alone rather
+        # than clearing it. Use a named terminal phase, not None, to say "done".
         ("dispatch_mode", "TEXT", "'sharded'"),
         ("coordinator_phase", "TEXT", "NULL"),
     ]:
@@ -150,6 +153,18 @@ def upsert_task(task: dict):
         f"INSERT INTO tasks ({col_str}) VALUES ({placeholders}) "
         f"ON CONFLICT(id) DO UPDATE SET {updates}",
         values,
+    )
+    # Naming dispatch_mode in the column list means an omitted key INSERTs an
+    # explicit NULL, which overrides the schema DEFAULT — so a task created by
+    # any of the callers that don't know about the column would have no mode at
+    # all. Defaulting in Python instead would break the COALESCE above: an
+    # update that supplied 'sharded' would revert a running pool task. Applying
+    # it here covers both — on insert the NULL becomes 'sharded', on update
+    # COALESCE has already preserved whatever was stored.
+    conn.execute(
+        "UPDATE tasks SET dispatch_mode='sharded' "
+        "WHERE id=? AND dispatch_mode IS NULL",
+        (task.get("id"),),
     )
     conn.commit()
 

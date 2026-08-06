@@ -305,7 +305,7 @@ def test_recomputed_window_is_honored():
     result = asyncio.run(_run_pool_workflow(stubs))
 
     assert result.status == "done"
-    assert stubs.max_concurrent >= 2, \
+    assert stubs.max_concurrent == 3, \
         "the window returned by the bookkeeping activity was not applied"
 
 
@@ -391,7 +391,9 @@ def test_batch_reporting_ignored_stops_the_loop_without_claiming_done():
     cost a wake each and end by reporting `done` for a task that downloaded
     almost nothing — and would skip the release, leaving rows still claiming
     workers that have stopped."""
-    stubs = _PoolActivityStubs(num_batches=6, windows=[1] * 8)
+    # window 2 so batch 0 (a genuine finisher) and batch 1 (ignored) land in
+    # the same wake — that is the path that records real results *and* stops.
+    stubs = _PoolActivityStubs(num_batches=6, windows=[2] * 8)
 
     real_batch = stubs.run_pool_batch
 
@@ -405,8 +407,13 @@ def test_batch_reporting_ignored_stops_the_loop_without_claiming_done():
     result = asyncio.run(_run_pool_workflow(stubs))
 
     assert result.status == "paused"
-    # stopped at the first ignored batch rather than walking all six
-    assert stubs.batch_calls == [0, 1]
+    # Stopped early rather than walking all six. Asserted as a bound, not an
+    # exact list: with a window of 2 the order in which two activities record
+    # their start is real-time dependent.
+    assert len(stubs.batch_calls) < 6
+    assert 5 not in stubs.batch_calls
+    # batch 0 genuinely finished, so its terminal row was still recorded
+    assert 0 in [r["batch_index"] for rs in stubs.recorded for r in rs]
     # nothing claimed a terminal task state on the operator's behalf
     assert not any(s in ("done", "failed") for s, _, _ in stubs.dashboard)
     # and the rows that still claimed a worker were released

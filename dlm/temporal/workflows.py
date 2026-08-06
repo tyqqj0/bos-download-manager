@@ -1012,7 +1012,6 @@ class PoolDownloadWorkflow:
             raise
         except Exception as e:
             return await self._fail(task_id, f"pool dispatch failed: {str(e)[:400]}")
-
         if outcome["stopped"]:
             # An operator stopped the task mid-window: every remaining batch
             # declined to run. Its status is already whatever they set, and
@@ -1039,7 +1038,9 @@ class PoolDownloadWorkflow:
                 raise
             except Exception as e:
                 return await self._fail(
-                    task_id, f"pool re-dispatch failed: {str(e)[:400]}")
+                    task_id, f"pool re-dispatch failed: {str(e)[:400]}",
+                    files_uploaded=outcome["uploaded_files"],
+                    bytes_uploaded=outcome["uploaded_bytes"])
             if retry_outcome["stopped"]:
                 return TaskResult(status="paused", error="task stopped during dispatch")
             retried_failures = retry_outcome["failed"]
@@ -1079,7 +1080,20 @@ class PoolDownloadWorkflow:
         A partly-successful task's bytes are real and already on BOS; a result
         that reports zero would make the workflow history disagree with the
         aggregate and with the bucket.
+
+        Releases batch rows first: an abnormal exit leaves rows attributing
+        workers that stopped, same as the cancel path. Harmless before any row
+        exists (the endpoint just reports zero released). Note the dashboard
+        report below carries no retry policy — Temporal's default is unbounded,
+        so this blocks until S1 answers rather than failing fast. That is
+        deliberate and matches the sharded coordinator: a task whose failure
+        never got reported is the orphan state we are avoiding.
         """
+        try:
+            await self._release(task_id)
+        except Exception:
+            # Cleanup must never be the reason a failure goes unreported.
+            pass
         await workflow.execute_activity(
             "report_to_dashboard",
             args=[task_id, "failed", None, None, None, None, None, error],
@@ -1187,13 +1201,22 @@ class PoolDownloadWorkflow:
 
                 if stopped:
                     remaining = []
-                    if results:
-                        # Batches that really finished before the stop still
-                        # deserve their terminal rows; the endpoint's own
-                        # TERMINAL guard will drop them if the task is already
-                        # stopped, which is the correct outcome either way.
-                        await self._record(task_id, results)
-                    await self._release(task_id)
+                    # Neither cleanup may turn an operator's pause into a
+                    # `failed` report: the task is stopped, and claiming a
+                    # terminal status on their behalf is the very thing the
+                    # stop is protecting against.
+                    try:
+                        if results:
+                            # Batches that really finished before the stop still
+                            # deserve their terminal rows; the endpoint's own
+                            # TERMINAL guard will drop them if the task is
+                            # already stopped, which is correct either way.
+                            await self._record(task_id, results)
+                        await self._release(task_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
                     break
 
                 # One bookkeeping activity per wake: writes the terminal batch
