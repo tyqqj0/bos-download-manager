@@ -278,6 +278,21 @@ class PipelineEngine:
                 token=token,
             )
             p = Path(local_path)
+            # The ModelScope SDK hands back a path with no size verification
+            # of its own — unlike the HF path (trusts hf_hub_download's
+            # internal integrity checks) and the HTTP fallback just below
+            # (checks explicitly). A truncated/empty SDK download used to
+            # sail straight through to the uploader and land on BOS as a
+            # short or 0-byte object while the shard reported success (the
+            # RoboDojo incident). Route a mismatch through the same
+            # exception handling as any other failed attempt below, so it
+            # retries instead of raising past the retry loop.
+            size = p.stat().st_size
+            if file_info.size and size != file_info.size:
+                p.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"size mismatch for {file_info.path}: got {size}, expected {file_info.size}"
+                )
             self._emit_event("file_downloaded", {
                 "file": file_info.path,
                 "size_bytes": file_info.size,
@@ -647,6 +662,25 @@ class PipelineEngine:
             for attempt in range(MAX_UPLOAD_RETRIES):
                 t0 = time.time()
                 try:
+                    # Second of two independent guards against a short/empty
+                    # file reaching BOS: defect 5 already verifies size for
+                    # every download path, so this should never trip — but
+                    # it makes the failure mode impossible to reach BOS even
+                    # if a future download path forgets that check. Do not
+                    # delete this as "redundant" — it is the last gate.
+                    actual_size = local_path.stat().st_size
+                    if fi.size and actual_size != fi.size:
+                        logger.error(
+                            f"Pre-upload size check failed for {fi.path}: "
+                            f"got {actual_size}, expected {fi.size} — not uploading"
+                        )
+                        self.stats.failed_files += 1
+                        self._emit_event("file_failed", {
+                            "file": fi.path,
+                            "error": f"size mismatch: got {actual_size}, expected {fi.size}",
+                            "phase": "pre_upload_verify",
+                        })
+                        return
                     await asyncio.to_thread(
                         upload_file,
                         self._bos_client,
@@ -656,10 +690,15 @@ class PipelineEngine:
                     )
                     local_path.unlink(missing_ok=True)
                     self.stats.uploaded_files += 1
-                    self.stats.uploaded_bytes += fi.size
+                    # Credit what was actually uploaded (measured just above,
+                    # right before the call), not fi.size — the size the
+                    # *source* claims. Crediting the claimed size is how the
+                    # RoboDojo incident's dashboard showed 900MB uploaded for
+                    # each of 103 objects that landed on BOS as 0 bytes.
+                    self.stats.uploaded_bytes += actual_size
                     self._emit_event("file_uploaded", {
                         "file": fi.path,
-                        "size_bytes": fi.size,
+                        "size_bytes": actual_size,
                         "duration_s": round(time.time() - t0, 1),
                     })
                     return

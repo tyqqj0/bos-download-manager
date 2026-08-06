@@ -22,6 +22,7 @@ Run: python3 -m pytest tests/test_pipeline_integrity.py -q
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,51 @@ def _engine(tmp_path, monkeypatch, source="hf") -> pipeline.PipelineEngine:
     monkeypatch.setattr(pipeline, "STAGING_PATH", tmp_path)
     task = TaskInput(id="t1", name="task", repo_id="org/name", source=source)
     return pipeline.PipelineEngine(task, tmp_path, heartbeat_fn=lambda *_: None)
+
+
+# ---------------------------------------------------------------------------
+# Defect 5 — ModelScope SDK downloads were never size-verified.
+# ---------------------------------------------------------------------------
+
+def test_robodojo_regression_modelscope_short_file_never_uploaded(tmp_path, monkeypatch):
+    """RoboDojo regression: a truncated/empty ModelScope SDK download must be
+    treated as a failed attempt (retried, then counted), never handed to the
+    uploader as if it succeeded. This was the root cause of the incident —
+    the SDK path was the only one of three download paths with no
+    post-download size check, so a 0-byte file sailed through as "done"."""
+    monkeypatch.setattr(pipeline, "MAX_FILE_RETRIES", 2)
+    monkeypatch.setattr(pipeline, "STALL_CHECK_INTERVAL", 0.01)
+
+    engine = _engine(tmp_path, monkeypatch, source="modelscope")
+    engine._executor = ThreadPoolExecutor(max_workers=2)
+    engine._concurrency = 2
+
+    file_info = FileInfo(path="data/episode_0000001.hdf5", size=900_000_000)
+
+    calls = []
+
+    def fake_dataset_file_download(dataset_id, file_path, local_dir, token=None):
+        dest = Path(local_dir) / file_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"")  # 0 bytes, like the incident — SDK call "succeeds"
+        calls.append(file_path)
+        return str(dest)
+
+    fake_module = types.ModuleType("modelscope")
+    fake_module.dataset_file_download = fake_dataset_file_download
+    monkeypatch.setitem(sys.modules, "modelscope", fake_module)
+
+    queue = asyncio.Queue()
+    asyncio.run(engine._producer([file_info], queue))
+
+    assert len(calls) == 2, "must retry MAX_FILE_RETRIES times, not raise past the retry loop"
+    assert engine.stats.failed_files == 1, "counted as failed exactly once, not silently dropped"
+    assert engine.stats.downloaded_files == 0
+
+    queued = []
+    while not queue.empty():
+        queued.append(queue.get_nowait())
+    assert queued == [None], "a failed download must never reach the uploader"
 
 
 # ---------------------------------------------------------------------------
@@ -345,3 +391,65 @@ def test_cancelled_upload_does_not_kill_consumer(tmp_path, monkeypatch):
     assert uploaded == ["ok.bin"], "the second, non-cancelled upload must still run"
     assert engine.stats.failed_files == 1
     assert engine.stats.phase == "done", "_consumer must reach normal completion, not die mid-way"
+
+
+# ---------------------------------------------------------------------------
+# Defect 6 — no pre-upload size check, and uploaded_bytes credited the
+# claimed size instead of what was actually uploaded.
+# ---------------------------------------------------------------------------
+
+def test_pre_upload_size_mismatch_is_failed_and_not_uploaded(tmp_path, monkeypatch):
+    """An upload whose local file size disagrees with `fi.size` must be
+    counted failed and never sent to BOS — the second, independent guard
+    against exactly the 0-byte-object failure mode defect 5 already
+    prevents at the download step."""
+    import dlm.core.bos as bos_mod
+
+    engine = _engine(tmp_path, monkeypatch)
+    engine._bos_client = object()
+    engine._bucket = "bucket"
+    engine._prefix = "prefix/"
+
+    local = tmp_path / "f.bin"
+    local.write_bytes(b"")  # 0 bytes on disk — the RoboDojo failure mode
+
+    fi = FileInfo(path="f.bin", size=900_000_000)  # source claims ~900MB
+
+    called = []
+    monkeypatch.setattr(bos_mod, "upload_file", lambda *a, **k: called.append(a))
+
+    asyncio.run(engine._upload_one(fi, asyncio.Semaphore(1)))
+
+    assert called == [], "must never call upload_file for a mismatched file"
+    assert local.exists(), "must not delete the local file on a failed pre-check"
+    assert engine.stats.failed_files == 1
+    assert engine.stats.uploaded_bytes == 0
+
+
+def test_uploaded_bytes_credits_actual_size_not_claimed_size(tmp_path, monkeypatch):
+    """`uploaded_bytes` must reflect what was actually uploaded. Crediting
+    `fi.size` (the source's claim) instead is why the RoboDojo dashboard
+    showed ~900MB uploaded for each of 103 objects that landed on BOS as
+    0-byte objects. Use an unknown source size (0) to force a case where
+    the claimed and actual sizes could diverge — if the code credited
+    `fi.size` here it would record 0, not the real 777 bytes on disk."""
+    import dlm.core.bos as bos_mod
+
+    engine = _engine(tmp_path, monkeypatch)
+    engine._bos_client = object()
+    engine._bucket = "bucket"
+    engine._prefix = "prefix/"
+
+    local = tmp_path / "h.bin"
+    local.write_bytes(b"z" * 777)
+
+    fi = FileInfo(path="h.bin", size=0)  # source listing reported no size
+
+    monkeypatch.setattr(bos_mod, "upload_file", lambda *a, **k: None)
+
+    asyncio.run(engine._upload_one(fi, asyncio.Semaphore(1)))
+
+    assert engine.stats.uploaded_bytes == 777
+    assert engine.stats.uploaded_files == 1
+    assert not local.exists()
+
