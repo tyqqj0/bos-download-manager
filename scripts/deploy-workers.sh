@@ -181,6 +181,9 @@ for key in $TARGETS; do
     [ -z "$ip" ] && continue
     # Retried: a manifest probe losing the ssh race must not report a host
     # as MISMATCH when the deploy itself succeeded (bj1, 2026-08-03).
+    # NB: the retry only works because `set -o pipefail` is in force — without
+    # it, `cut` exiting 0 would make every attempt "succeed" and reinstate the
+    # false-MISMATCH bug this loop exists to fix.
     remote_md5="UNREACHABLE"
     for attempt in 1 2 3; do
         if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && $MANIFEST_CMD" 2>/dev/null); then
@@ -189,10 +192,21 @@ for key in $TARGETS; do
         fi
         sleep 5
     done
-    status="OK"
+    # A host can have matching code on disk and still be running the old
+    # process — it failed the version gate or its restart, so rsync landed but
+    # the worker never came back on it. Reporting a bare OK there is the exact
+    # "looks clean, is mixed-version" signal this manifest exists to prevent.
+    already_failed=""
+    case " $FAILED_HOSTS " in
+        *" $key "*) already_failed=1 ;;
+    esac
     if [ "$remote_md5" != "$local_md5" ]; then
         status="MISMATCH"
-        FAILED_HOSTS="$FAILED_HOSTS $key"
+        [ -n "$already_failed" ] || FAILED_HOSTS="$FAILED_HOSTS $key"
+    elif [ -n "$already_failed" ]; then
+        status="DISK-OK/PROCESS-STALE"
+    else
+        status="OK"
     fi
     echo "  $key: $remote_md5 [$status]"
 done
