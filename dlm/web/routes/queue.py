@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import asyncio
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from ...core.naming import shard_row_id
 from ...queue import snapshot
@@ -715,15 +715,41 @@ async def reshard_task(body: dict):
 
 
 @router.delete("/queue/{task_id}")
-async def delete_from_queue(task_id: str):
-    """Cancel workflow and delete task."""
-    from ..temporal_client import cancel_workflow
-    await cancel_workflow(task_id)
+async def delete_from_queue(task_id: str, force: bool = False):
+    """Cancel workflows and delete the task — terminate first, then the rows.
+
+    This used to fire `cancel_workflow` and delete regardless of the outcome.
+    Cancel is a request, not a guarantee: the coordinator may be mid-activity
+    for minutes. Deleting the rows underneath it removes the only handle on
+    that work — `get_running_shards` no longer lists it, so `busy_servers`
+    frees a host that is still writing to /data/staging, and a later
+    terminate cannot find the children it would have reached through those
+    rows. Same contract as DELETE /api/tasks/{id}: 502 and no mutation if the
+    workflows will not close, `?force=true` to delete anyway.
+    """
+    from ..temporal_client import terminate_workflow_and_wait
+
+    closed = False
+    try:
+        closed = await terminate_workflow_and_wait(task_id)
+    except Exception as e:
+        logger.error(f"delete_from_queue {task_id}: terminate failed: {e}")
+        if not force:
+            raise HTTPException(502, (
+                f"could not terminate workflows for {task_id}: {e} — nothing "
+                "deleted. Retry, or pass ?force=true."
+            ))
+    if not closed and not force:
+        raise HTTPException(502, (
+            f"workflows for {task_id} did not close within timeout — nothing "
+            "deleted. Retry, or pass ?force=true."
+        ))
 
     def do_delete():
         snapshot.init_db()
         snapshot.delete_task(task_id)
-        return {"ok": True, "task_id": task_id, "deleted": True}
+        return {"ok": True, "task_id": task_id, "deleted": True,
+                "workflows_closed": closed}
     return await _run_blocking(do_delete)
 
 

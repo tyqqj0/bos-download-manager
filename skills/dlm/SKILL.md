@@ -153,7 +153,8 @@ Six branches, each with a distinct trigger. Pick the matching branch and follow 
    - Requeue a failed/paused/revoked task: `POST /api/tasks/<id>/retry`
    - Revoke task (terminates its workflows first; 502 + no state change if they don't close): `POST /api/tasks/<id>/skip`
    - Retry task: `POST /api/tasks/<id>/retry`
-   - Cancel + delete: `DELETE /api/queue/<id>`
+   - Cancel + delete: `DELETE /api/queue/<id>` (terminates workflows first; 502 and
+     nothing deleted if they don't close)
    - Cleanup staging: `POST /api/servers/<key>/cleanup`
    - Restart a worker: the ONLY supported path is the deploy script on S1.
      Never hand-launch a worker over SSH — a `setsid`/`nohup` one-liner dies

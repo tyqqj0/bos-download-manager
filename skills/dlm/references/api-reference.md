@@ -24,9 +24,9 @@ Each active download: `id`, `name`, `server`, `speed_mbps`, `progress_pct`, `dow
 | POST | `/api/tasks/{id}/retry` | Requeue a failed/revoked/paused/pending task |
 | POST | `/api/queue/pause` | Pause (durable — progress reports cannot resurrect). Body: `task_id` |
 | POST | `/api/queue/resume` | Requeue a paused task. Body: `task_id` |
-| POST | `/api/queue/reshard` | Change shard count via lossless restart. Body: `task_id`, `shard_count` |
+| POST | `/api/queue/reshard` | Change shard count via lossless restart — terminates workflows first, refuses if they don't close. Body: `task_id`, `shard_count` |
 | POST | `/api/queue/preempt` | Pause a running task, start an urgent one. Body: `urgent_task_id`, `victim_task_id?` |
-| DELETE | `/api/queue/{id}` | Cancel workflow and delete task |
+| DELETE | `/api/queue/{id}` | Terminate workflows, THEN delete task (refuses 502 and deletes nothing if they don't close; `?force=true` deletes anyway) |
 
 ## Shards
 

@@ -30,8 +30,6 @@ from dlm.web.fleet import (
     SHARED_COORDINATOR_QUEUE,
     coordinator_queue,
     polled_queues,
-    source_for_worker,
-    worker_coordinator_queue,
     worker_serves,
 )
 
@@ -100,12 +98,29 @@ def test_no_worker_polls_a_coordinator_queue_for_a_source_it_cannot_serve(server
         assert coordinator_queue(source) not in registered
 
 
-@pytest.mark.parametrize("server_key", ALL_WORKERS)
-def test_worker_side_and_dispatch_side_agree(server_key):
-    """Two functions compute the shared queue — the worker registers one and
-    the dispatcher targets one. If they drift, coordinators queue forever."""
-    assert worker_coordinator_queue(server_key) == coordinator_queue(
-        source_for_worker(server_key))
+@pytest.mark.parametrize("source,expected", [
+    ("modelscope", "download-ms-workers"),
+    ("hf", "download-workers"),
+    ("wget", "download-workers"),
+    ("", "download-workers"),
+])
+def test_dispatch_side_targets_the_literal_queue_for_each_source(source, expected):
+    """The dispatch half, in literals.
+
+    This replaces an assertion that `worker_coordinator_queue(k) ==
+    coordinator_queue(source_for_worker(k))`, which is what
+    worker_coordinator_queue's one-line body *is* — it held no matter which
+    queue either side chose, so it could not fail while the routing was
+    wrong. The invariant it claimed to cover (worker registers what the
+    dispatcher targets) is what test_worker_registers_exactly_the_queues_it_should
+    and test_every_worker_polls_the_coordinator_queue_for_its_own_source pin,
+    against the literal table above.
+
+    Anything that is not ModelScope routes to HK, including a source this
+    code has never seen — a new source silently landing on the BJ nodes
+    would put HF-only credentials on the wrong side of the network.
+    """
+    assert coordinator_queue(source) == expected
 
 
 # --- the call site, not just the helper -------------------------------------
