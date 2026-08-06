@@ -712,6 +712,110 @@ def test_gc_considers_every_server_independently():
     assert sorted(r["server"] for r in out["remove"]) == ["w1", "w2"]
 
 
+@pytest.mark.parametrize("status", ["paused", "preempted"])
+def test_gc_never_removes_a_resumable_tasks_dir(status):
+    """`paused`/`preempted` are stopped but *resumable* (pipeline.py logs
+    "staging preserved for resume" when it cancels), and CLAUDE.md's hard
+    constraint is "staging cleanup only for done/skipped/failed tasks".
+    Gating on absence from TERMINAL_STATUSES conflated the two sets and made
+    a paused Egocentric-100K's partial files plus its md5-guarded
+    .progress.json markers a GC candidate on seven workers."""
+    from dlm.web.reconciler import select_staging_gc
+
+    out = select_staging_gc({"w1": ["repo-resumable"]},
+                            [{"name": "repo-resumable", "status": status}])
+
+    assert out["remove"] == []
+    assert len(out["keep"]) == 1
+    assert out["keep"][0]["name"] == "repo-resumable"
+    assert status in out["keep"][0]["reason"]
+
+
+def test_gc_keeps_a_name_shared_by_a_done_and_a_paused_task():
+    """Rule 3 over the *removable* set, not the terminal one: a resumable
+    row sharing the name blocks removal just like a downloading one."""
+    from dlm.web.reconciler import select_staging_gc
+
+    out = select_staging_gc({"w1": ["shared-resumable"]}, [
+        {"name": "shared-resumable", "status": "done"},
+        {"name": "shared-resumable", "status": "paused"},
+    ])
+
+    assert out["remove"] == []
+    assert len(out["keep"]) == 1
+
+
+def test_gc_removable_statuses_is_not_the_terminal_status_set():
+    """"this task is stopped" and "this task's staging may be deleted" are
+    different questions; conflating them is the C1 data-loss defect."""
+    from dlm.web.fleet import GC_REMOVABLE_STATUSES, TERMINAL_STATUSES
+
+    assert set(GC_REMOVABLE_STATUSES) == {"done", "failed", "revoked", "skipped"}
+    assert set(GC_REMOVABLE_STATUSES) < set(TERMINAL_STATUSES)
+    assert "paused" not in GC_REMOVABLE_STATUSES
+    assert "preempted" not in GC_REMOVABLE_STATUSES
+
+
+class _StopSchedulerLoop(BaseException):
+    """Deliberately not an Exception — background_scheduler's own
+    `except Exception` would swallow it and keep looping."""
+
+
+class _NoSleepAsyncio:
+    """`asyncio`, with sleep() collapsed to a yield.
+
+    Only the scheduler's interval bookkeeping is under test; its real
+    cadence (2s startup + 10s per pass) would make the test a 12s one.
+    """
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+
+def test_staging_gc_does_not_sweep_on_a_fresh_web_start(db, monkeypatch):
+    """`last_staging_gc = 0` made the sweep fire on the FIRST loop pass,
+    ~2s after `systemctl restart dlm-web` — before any human could read
+    /api/doctor/staging-gc's dry-run preview, which exists for exactly that
+    purpose. The first sweep must be deferred by one full interval."""
+    from dlm.web import health_verifier, reconciler, scheduler
+
+    gc_calls: list = []
+    passes: list = []
+
+    async def fake_async(*a, **kw):
+        return {}
+
+    monkeypatch.setattr(scheduler, "_build_dashboard", lambda: {})
+    monkeypatch.setattr(scheduler, "_poll_transfers", lambda: 0)
+    monkeypatch.setattr(reconciler, "zero_stale_speeds", lambda: None)
+    monkeypatch.setattr(reconciler, "auto_dispatch_pending", fake_async)
+    monkeypatch.setattr(reconciler, "reconcile", fake_async)
+    monkeypatch.setattr(reconciler, "detect_idle_workers", fake_async)
+    monkeypatch.setattr(health_verifier, "verify_all_workers", fake_async)
+    monkeypatch.setattr(
+        reconciler, "staging_gc",
+        lambda dry_run=False: gc_calls.append(dry_run) or {"removed": [], "errors": []},
+    )
+
+    fake_asyncio = _NoSleepAsyncio()
+
+    async def fake_sleep(delay, *a, **kw):
+        if delay == scheduler.DASHBOARD_INTERVAL:  # bottom of the while True
+            passes.append(1)
+            if len(passes) >= 2:
+                raise _StopSchedulerLoop()
+        await asyncio.sleep(0)
+
+    fake_asyncio.sleep = fake_sleep
+    monkeypatch.setattr(scheduler, "asyncio", fake_asyncio)
+
+    with pytest.raises(_StopSchedulerLoop):
+        asyncio.run(scheduler.background_scheduler())
+
+    assert len(passes) == 2  # the loop really did run twice
+    assert gc_calls == []  # ... and swept on neither pass
+
+
 def test_doctor_staging_gc_preview_never_removes(db, monkeypatch):
     """The dry-run endpoint calls staging_gc(dry_run=True) — verified here
     by monkeypatching reconciler.staging_gc and asserting the flag it's

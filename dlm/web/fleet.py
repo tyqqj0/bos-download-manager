@@ -69,7 +69,23 @@ def pool_task_weight(priority: int) -> float:
 # Terminal/operator states. A progress report must never move a task out of
 # one of these — a dying workflow's late report used to resurrect tasks an
 # operator had explicitly stopped (2026-07-31 incident).
+#
+# NOT the set whose staging may be deleted: `paused` and `preempted` are
+# stopped but *resumable* (pipeline.py preserves staging for exactly that),
+# so use GC_REMOVABLE_STATUSES below for any destructive decision. The two
+# sets answer different questions and conflating them once already produced
+# a data-loss defect.
 TERMINAL_STATUSES = ("paused", "preempted", "revoked", "skipped", "failed", "done")
+
+# The only states whose local staging directory may be removed. Deliberately
+# a strict subset of TERMINAL_STATUSES — "this task is stopped" and "this
+# task's data is expendable" are different questions, and `paused` /
+# `preempted` are this project's resumable states: their
+# partially-downloaded files and md5-guarded .progress.json batch markers are
+# what a resume rests on. Mirrors CLAUDE.md's hard constraint, "staging
+# cleanup only for done/skipped/failed tasks". Never gate a removal on
+# absence from TERMINAL_STATUSES.
+GC_REMOVABLE_STATUSES = ("done", "failed", "revoked", "skipped")
 
 
 def has_live_workflow(task_id: str, running_ids) -> bool:

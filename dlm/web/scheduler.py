@@ -204,7 +204,12 @@ async def background_scheduler():
     last_reconcile = 0
     last_dispatch = 0
     last_health_verify = 0
-    last_staging_gc = 0
+    # Seeded to "now", unlike the stages above, so the first sweep is deferred
+    # by a full STAGING_GC_INTERVAL. At 0 the GC fired on the very first pass,
+    # ~2s after `systemctl restart dlm-web` — i.e. a restart could delete
+    # staging before a human had any chance to read GET /api/doctor/staging-gc,
+    # the dry-run preview that exists precisely to be read first.
+    last_staging_gc = time.time()
 
     await asyncio.sleep(2)
 

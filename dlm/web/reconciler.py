@@ -23,12 +23,12 @@ RECENT_CLOSED_LIMIT = 500  # cap on the unfiltered closed-workflow scan
 # reconciler acts on, and they must not drift apart.
 from .fleet import (  # noqa: E402
     DEAD_THRESHOLD,
+    GC_REMOVABLE_STATUSES,
     MIN_SHARD_DISK_GB as MIN_DISPATCH_DISK_GB,
     POOL_MAX_CONCURRENT_TASKS,
     POOL_STARVED_ATTEMPT,
     POOL_STARVED_SCHEDULED_S,
     STALE_THRESHOLD,
-    TERMINAL_STATUSES,
     has_live_workflow,
 )
 
@@ -693,11 +693,12 @@ def select_staging_gc(dirs_by_server: dict, tasks: list[dict]) -> dict:
     impure fan-out in `staging_gc()` below is what produces this via `ls`).
     `tasks` is every task row (`get_all_tasks()`), matched by `name` — task
     `name` is not unique in this schema, so a directory is only removable
-    when *every* task row sharing that name is terminal (rule 3).
+    when *every* task row sharing that name is in `GC_REMOVABLE_STATUSES`
+    (rule 3).
 
     Returns `{"remove": [...], "keep": [...], "unknown": [...], "skipped": [...]}`.
-    Each entry carries `server`/`name` plus, for `remove`, the terminal
-    `status`(es) that authorised it (rule 5 wants that in the removal log).
+    Each entry carries `server`/`name` plus, for `remove`, the
+    removal-authorising `status`(es) (rule 5 wants that in the removal log).
     """
     by_name: dict[str, list[dict]] = {}
     for t in tasks:
@@ -721,14 +722,20 @@ def select_staging_gc(dirs_by_server: dict, tasks: list[dict]) -> dict:
                 unknown.append({"server": server, "name": name})
                 continue
 
-            non_terminal = [r for r in rows if r.get("status") not in TERMINAL_STATUSES]
-            if non_terminal:
-                # Any non-terminal task with this name blocks it (rule 3) —
-                # names collide, so this is the full row set, not the first hit.
+            non_removable = [r for r in rows
+                             if r.get("status") not in GC_REMOVABLE_STATUSES]
+            if non_removable:
+                # Any row with this name that is not in the *removable* set
+                # blocks it (rule 3) — names collide, so this is the full row
+                # set, not the first hit. Membership in GC_REMOVABLE_STATUSES,
+                # never absence from TERMINAL_STATUSES: `paused`/`preempted`
+                # are terminal-for-scheduling but resumable-for-data, and
+                # deleting their staging destroys the partial files and
+                # .progress.json markers a resume needs.
                 keep.append({
                     "server": server, "name": name,
-                    "reason": f"non-terminal status(es): "
-                              f"{sorted({r.get('status') for r in non_terminal})}",
+                    "reason": f"not removable, status(es): "
+                              f"{sorted({r.get('status') for r in non_removable})}",
                 })
                 continue
 
@@ -741,7 +748,9 @@ def select_staging_gc(dirs_by_server: dict, tasks: list[dict]) -> dict:
 
 
 def staging_gc(dry_run: bool = False) -> dict:
-    """Periodic staging GC (decision G) — local disk only, terminal tasks only.
+    """Periodic staging GC (decision G) — local disk only, and only for tasks
+    in `fleet.GC_REMOVABLE_STATUSES` (done/failed/revoked/skipped; a paused or
+    preempted task's staging is what its resume rests on).
 
     Lists every enabled remote server's STAGING_PATH over ssh, runs the pure
     `select_staging_gc` above to decide what is safe, and — unless
