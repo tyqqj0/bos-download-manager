@@ -71,6 +71,14 @@ def _ensure_hf_temp_path_patch():
     """Monkeypatch huggingface_hub's low-level writers once per process so a
     download's real temp path is observable from outside the call that
     creates it. Idempotent and thread-safe to call from every attempt.
+
+    Best-effort by design. `http_get`/`xet_get` are library internals, and the
+    fleet does not run a uniform huggingface_hub (1.15.0 and 1.16.1 both in
+    production as of 2026-08-06), so a future upgrade may rename or remove
+    them. Observing progress is a monitoring nicety; downloading is the job.
+    A failure here therefore degrades to "temp path not observable", which
+    `_wait_with_growth_check` already treats as inconclusive rather than as a
+    stall — it must never propagate and fail the download itself.
     """
     global _hf_patched
     if _hf_patched:
@@ -78,28 +86,40 @@ def _ensure_hf_temp_path_patch():
     with _hf_patch_lock:
         if _hf_patched:
             return
-        from huggingface_hub import file_download as _fd
-
-        _orig_http_get = _fd.http_get
-        _orig_xet_get = _fd.xet_get
-
-        def _patched_http_get(url, temp_file, **kwargs):
-            holder = getattr(_HF_TEMP_PATH_LOCAL, "holder", None)
-            if holder is not None:
-                name = getattr(temp_file, "name", None)
-                if name:
-                    holder.path = Path(name)
-            return _orig_http_get(url, temp_file, **kwargs)
-
-        def _patched_xet_get(*, incomplete_path, **kwargs):
-            holder = getattr(_HF_TEMP_PATH_LOCAL, "holder", None)
-            if holder is not None:
-                holder.path = incomplete_path
-            return _orig_xet_get(incomplete_path=incomplete_path, **kwargs)
-
-        _fd.http_get = _patched_http_get
-        _fd.xet_get = _patched_xet_get
+        # Set before attempting: on failure this must not be retried for every
+        # attempt of every file in the batch (log spam, no new outcome).
         _hf_patched = True
+        try:
+            from huggingface_hub import file_download as _fd
+
+            # Resolve both originals before installing either, so a missing
+            # second symbol cannot leave the library half-patched.
+            _orig_http_get = _fd.http_get
+            _orig_xet_get = _fd.xet_get
+
+            def _patched_http_get(url, temp_file, **kwargs):
+                holder = getattr(_HF_TEMP_PATH_LOCAL, "holder", None)
+                if holder is not None:
+                    name = getattr(temp_file, "name", None)
+                    if name:
+                        holder.path = Path(name)
+                return _orig_http_get(url, temp_file, **kwargs)
+
+            def _patched_xet_get(*, incomplete_path, **kwargs):
+                holder = getattr(_HF_TEMP_PATH_LOCAL, "holder", None)
+                if holder is not None:
+                    holder.path = incomplete_path
+                return _orig_xet_get(incomplete_path=incomplete_path, **kwargs)
+
+            _fd.http_get = _patched_http_get
+            _fd.xet_get = _patched_xet_get
+        except Exception as exc:
+            logger.warning(
+                "Could not instrument huggingface_hub for temp-path observation "
+                f"({type(exc).__name__}: {exc}); stall detection will treat HF "
+                "downloads as unobservable rather than stalled. Downloads are "
+                "unaffected."
+            )
 
 
 # Download concurrency adapts to file size. Big files saturate the link on

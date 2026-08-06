@@ -179,6 +179,32 @@ def test_hf_temp_path_patch_reports_the_real_path(monkeypatch, tmp_path):
     assert holder_b.path == real_tmp_xet
 
 
+def test_hf_temp_path_patch_degrades_instead_of_failing_the_download(monkeypatch):
+    """The patch targets huggingface_hub internals (`http_get`/`xet_get`) and
+    the fleet is not on a uniform version (1.15.0 and 1.16.1 both in
+    production). If an upgrade renames or removes one of them, instrumenting
+    must degrade to "temp path not observable" — which the stall monitor
+    treats as inconclusive — and must NOT raise out of the download path.
+    Raising here would fail every HF download on that host at once."""
+    import huggingface_hub
+
+    fake_fd = types.ModuleType("huggingface_hub.file_download")
+    fake_fd.http_get = lambda url, temp_file, **kwargs: None
+    # xet_get deliberately absent: simulates a version that renamed/removed it.
+
+    monkeypatch.setattr(huggingface_hub, "file_download", fake_fd, raising=False)
+    monkeypatch.setattr(pipeline, "_hf_patched", False)
+
+    pipeline._ensure_hf_temp_path_patch()  # must not raise
+
+    # Half-patching is worse than not patching: the surviving symbol must be
+    # left exactly as it was, not wrapped by a partially-installed patch.
+    assert fake_fd.http_get.__name__ == "<lambda>"
+    # And it must not retry (and re-log) on every subsequent file.
+    assert pipeline._hf_patched is True
+    pipeline._ensure_hf_temp_path_patch()  # still must not raise
+
+
 def test_residue_candidates_includes_the_reported_temp_path(tmp_path, monkeypatch):
     """Narrow, whitebox companion to the molmobot regression test below: the
     reported `temp_path_holder.path` must actually be one of the paths
