@@ -333,12 +333,17 @@ async def preempt_for_task(body: dict):
     # 2) Claim the urgent task. server=NULL: the sharded coordinator assigns
     #    servers per shard; a task-level claim would wrongly mark one worker
     #    busy in the idle query. target_server only influences victim choice.
+    #    A pool task's coordinator_phase is reset here for the same reason
+    #    auto_dispatch resets it: this claim hands the task to a coordinator
+    #    that begins by listing, and a 'dispatching' left over from a previous
+    #    run (resume/reshard delete the batch rows but not the phase) would
+    #    exempt this source from the listing guard.
     def do_claim():
         now_ts = time.time()
         conn = snapshot._conn()
         conn.execute(
             "UPDATE tasks SET status = 'downloading', server = NULL, priority = 0, "
-            "updated_at = ?, claimed_at = ? "
+            f"updated_at = ?, claimed_at = ?, {snapshot.CLAIM_RESET_PHASE_SQL} "
             "WHERE id = ?",
             (now_ts, now_ts, urgent_id),
         )

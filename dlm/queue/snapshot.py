@@ -123,6 +123,25 @@ def init_db():
             pass
 
 
+# Assignment fragment every route that (re)starts a coordinator must include
+# in its claim UPDATE, so the listing guard reads a phase belonging to the
+# CURRENT coordinator run.
+#
+# Nothing clears coordinator_phase: resume and reshard put a task back to
+# `pending` and delete its batch rows while leaving the column at
+# 'dispatching'. A later claim that only refreshed status/claimed_at would
+# then present a listing coordinator as "past listing" and the guard would
+# let a second coordinator onto the same source — the exact double dispatch
+# it exists to prevent. Written as one CASE rather than a per-mode branch
+# because there are three claim sites (auto_dispatch, reconcile()'s orphan
+# re-dispatch, /queue/preempt) and a fourth is a matter of time; sharded
+# rows write their own value back, so their behaviour is unchanged.
+CLAIM_RESET_PHASE_SQL = (
+    "coordinator_phase = CASE WHEN dispatch_mode = 'pool' "
+    "THEN 'listing' ELSE coordinator_phase END"
+)
+
+
 def upsert_task(task: dict):
     """Insert or update a task record."""
     conn = _conn()

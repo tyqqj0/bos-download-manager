@@ -35,6 +35,7 @@ async def reconcile() -> dict:
     Returns a report of actions taken.
     """
     from ..queue.snapshot import (
+        CLAIM_RESET_PHASE_SQL,
         get_tasks_by_status, update_task_progress, get_shards_by_task,
         complete_task, init_db, _conn,
     )
@@ -118,11 +119,15 @@ async def reconcile() -> dict:
                     # The legacy DownloadDatasetWorkflow has no BOS resume
                     # filter and must not be reachable here.
                     # Refresh claimed_at so the listing-phase source guard
-                    # covers this coordinator too.
+                    # covers this coordinator too, and reset a pool task's
+                    # phase: the new coordinator starts by listing again, so
+                    # a 'dispatching' left by the previous run would tell the
+                    # guard this source needs no protection.
                     mode = task.get("dispatch_mode") or "sharded"
                     conn2 = _conn()
                     conn2.execute(
-                        "UPDATE tasks SET claimed_at = ? WHERE id = ?",
+                        f"UPDATE tasks SET claimed_at = ?, {CLAIM_RESET_PHASE_SQL} "
+                        "WHERE id = ?",
                         (time.time(), task_id),
                     )
                     conn2.commit()
@@ -172,6 +177,7 @@ async def auto_dispatch_pending() -> dict:
     to prevent TOCTOU race with concurrent dispatches.
     """
     from ..queue.snapshot import (
+        CLAIM_RESET_PHASE_SQL,
         get_tasks_by_status, get_workers, get_running_shards, _conn, init_db,
     )
     from .temporal_client import start_task_download
@@ -238,12 +244,18 @@ async def auto_dispatch_pending() -> dict:
         #    'dispatching' once create_pool_batches lands its rows
         #    (routes/queue.py). Using coordinator_phase alone for pool tasks
         #    keeps the two criteria independently meaningful and testable.
-        #    NULL counts as listing: those are the only two writers, so every
-        #    OTHER route to `downloading` (preempt's claim at queue.py:341,
-        #    doctor's orphan repair, reconcile()'s 1800s re-dispatch — which
-        #    refreshes claimed_at but not the phase) leaves the column NULL,
-        #    and reading NULL as "not listing" left those sources completely
-        #    unguarded during exactly the window the guard exists for.
+        #    NULL counts as listing: a pool task that has never reached
+        #    create_pool_batches has no phase yet, and reading NULL as "not
+        #    listing" left its source completely unguarded during exactly the
+        #    window the guard exists for. The three claim routes that put a
+        #    task into `downloading` (this function, reconcile()'s orphan
+        #    re-dispatch, /queue/preempt) all reset a pool task's phase to
+        #    'listing' via snapshot.CLAIM_RESET_PHASE_SQL, so 'dispatching'
+        #    here always belongs to the coordinator currently running.
+        #    Exception, pre-existing and unchanged by this task: the doctor's
+        #    orphan repair (routes/doctor.py) re-dispatches without touching
+        #    claimed_at at all, so its coordinator is outside this guard for
+        #    both modes.
         conn = _conn()
         listing_cutoff = time.time() - 900
         rows = conn.execute(
@@ -300,24 +312,18 @@ async def auto_dispatch_pending() -> dict:
             # would count this worker as busy in its own idle query.
             #
             # A pool task also gets coordinator_phase='listing' in the same
-            # claim — the write side of decision A (nothing else in the repo
-            # sets this column). A sharded claim's SQL is untouched.
+            # claim — the write side of decision A. The reset is shared with
+            # the other two claim sites (see snapshot.CLAIM_RESET_PHASE_SQL);
+            # for a sharded row the CASE writes the existing value back, so
+            # the sharded claim's effect is unchanged.
             now_ts = time.time()
             task_mode = task.get("dispatch_mode") or "sharded"
-            if task_mode == "pool":
-                cursor = conn.execute(
-                    "UPDATE tasks SET status = 'downloading', server = NULL, "
-                    "coordinator_phase = 'listing', updated_at = ?, claimed_at = ? "
-                    "WHERE id = ? AND status = 'pending'",
-                    (now_ts, now_ts, task["id"]),
-                )
-            else:
-                cursor = conn.execute(
-                    "UPDATE tasks SET status = 'downloading', server = NULL, "
-                    "updated_at = ?, claimed_at = ? "
-                    "WHERE id = ? AND status = 'pending'",
-                    (now_ts, now_ts, task["id"]),
-                )
+            cursor = conn.execute(
+                "UPDATE tasks SET status = 'downloading', server = NULL, "
+                f"updated_at = ?, claimed_at = ?, {CLAIM_RESET_PHASE_SQL} "
+                "WHERE id = ? AND status = 'pending'",
+                (now_ts, now_ts, task["id"]),
+            )
             conn.commit()
 
             if cursor.rowcount == 0:

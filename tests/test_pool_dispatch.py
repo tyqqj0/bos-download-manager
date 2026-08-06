@@ -417,18 +417,18 @@ def test_pool_task_in_dispatching_phase_does_not_block(db, monkeypatch):
 
 
 def test_pool_task_with_null_coordinator_phase_still_blocks_its_source(db, monkeypatch):
-    """The hole the T7 review reproduced. coordinator_phase has exactly two
-    writers (auto_dispatch's claim and create_pool_batches), so EVERY other
-    route to `downloading` leaves it NULL — preempt's claim (queue.py:341),
-    doctor's orphan repair, and reconcile()'s 1800s re-dispatch (which
-    refreshes claimed_at but not the phase). Reading NULL as "not listing"
-    left those sources entirely unguarded during exactly the window the
-    guard exists for: a second coordinator races the listing one for workers
-    that are idle only because they are about to be claimed.
+    """The hole the T7 review reproduced. Only create_pool_batches writes
+    'dispatching', so a pool task that has not reached it yet carries no
+    phase at all, and reading NULL as "not listing" left its source entirely
+    unguarded during exactly the window the guard exists for: a second
+    coordinator races the listing one for workers that are idle only because
+    they are about to be claimed. Every claim route now also resets a pool
+    phase to 'listing' (snapshot.CLAIM_RESET_PHASE_SQL, section 7 below), so
+    NULL is the never-dispatched case — this test keeps it guarded even if a
+    future claim route forgets the reset.
 
-    The row below is shaped exactly as preempt's claim leaves it: status
-    downloading, priority 0, server NULL, fresh claimed_at, phase NULL, no
-    batch rows yet.
+    The row below is shaped as a claim leaves it: status downloading,
+    priority 0, server NULL, fresh claimed_at, no batch rows yet.
     """
     from dlm.web import reconciler
     import dlm.web.temporal_client as tc
@@ -602,3 +602,130 @@ def test_dispatch_mode_vocabulary_has_one_definition():
         if literal.search(p.read_text())
     ]
     assert definers == ["web/fleet.py"], definers
+
+
+# ── 7. every claim route resets a pool task's coordinator_phase ─────────
+#
+# The T7 re-review found the sibling of the NULL hole above: nothing ever
+# CLEARS coordinator_phase, and resume/reshard put a task back to `pending`
+# and delete its batch rows while leaving it at 'dispatching'. A later claim
+# that refreshed only status/claimed_at therefore presented a coordinator
+# that is still listing as "past listing", and the guard let a second
+# coordinator onto the same source — with batch rows gone, "no rows" could
+# not catch it either. Reproduced with a real preempt claim before the fix.
+#
+# The fix is one shared assignment (snapshot.CLAIM_RESET_PHASE_SQL) in all
+# three claim sites; these tests pin the write side of each. Sharded rows
+# write their own value back, which is the G1 case each test also asserts.
+
+
+def test_preempt_claim_resets_stale_pool_phase_to_listing(db, monkeypatch):
+    from dlm.web.routes import queue as queue_routes
+    import dlm.web.temporal_client as tc
+
+    async def fake_start(task):
+        return None
+
+    async def fake_cancel(task_id, dispatch_mode=None):
+        return None
+
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+    monkeypatch.setattr(tc, "cancel_workflow", fake_cancel)
+
+    # Shaped by resume-after-reshard: the phase survived, the batch rows did not.
+    _task(db, "t-urgent", status="pending", mode="pool", source="hf")
+    _set_phase(db, "t-urgent", "dispatching")
+    _task(db, "t-victim", status="downloading", mode="sharded", source="hf")
+
+    result = asyncio.run(queue_routes.preempt_for_task({
+        "urgent_task_id": "t-urgent",
+        "victim_task_id": "t-victim",
+        "target_server": "w1",
+    }))
+
+    assert result.get("ok") is True, result
+    row = db.get_task("t-urgent")
+    assert row["status"] == "downloading"
+    assert row["coordinator_phase"] == "listing"
+
+
+def test_preempt_claim_leaves_a_sharded_phase_untouched(db, monkeypatch):
+    """G1: the CASE writes a sharded row's own value back."""
+    from dlm.web.routes import queue as queue_routes
+    import dlm.web.temporal_client as tc
+
+    async def fake_start(task):
+        return None
+
+    async def fake_cancel(task_id, dispatch_mode=None):
+        return None
+
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+    monkeypatch.setattr(tc, "cancel_workflow", fake_cancel)
+
+    _task(db, "t-urgent-s", status="pending", mode="sharded", source="hf")
+    _task(db, "t-victim-s", status="downloading", mode="sharded", source="hf")
+
+    result = asyncio.run(queue_routes.preempt_for_task({
+        "urgent_task_id": "t-urgent-s",
+        "victim_task_id": "t-victim-s",
+        "target_server": "w1",
+    }))
+
+    assert result.get("ok") is True, result
+    assert db.get_task("t-urgent-s")["coordinator_phase"] is None
+
+
+def test_auto_dispatch_claim_resets_stale_pool_phase_to_listing(db, monkeypatch):
+    """auto_dispatch claims `pending` tasks, and resume leaves exactly this
+    row: pending, phase 'dispatching', batch rows deleted."""
+    from dlm.web import reconciler
+    import dlm.web.temporal_client as tc
+
+    async def fake_start(task):
+        return None
+
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+
+    _task(db, "t-resumed", status="pending", mode="pool", source="hf")
+    _set_phase(db, "t-resumed", "dispatching")
+    _worker(db, "w1")
+
+    asyncio.run(reconciler.auto_dispatch_pending())
+
+    row = db.get_task("t-resumed")
+    assert row["status"] == "downloading"
+    assert row["coordinator_phase"] == "listing"
+
+
+def test_reconcile_redispatch_resets_stale_pool_phase_to_listing(db, monkeypatch):
+    """reconcile()'s orphan re-dispatch refreshes claimed_at *so the guard
+    covers the new coordinator* — which only works if the phase it reads
+    belongs to that coordinator and not to the dead one."""
+    from dlm.web import reconciler
+    import dlm.web.temporal_client as tc
+
+    async def fake_running(client=None):
+        return {}
+
+    async def fake_start(task):
+        return None
+
+    monkeypatch.setattr(tc, "running_workflows", fake_running)
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+
+    _task(db, "t-orphan", status="downloading", mode="pool", source="hf")
+    _set_phase(db, "t-orphan", "dispatching")
+    conn = db._conn()
+    with conn:  # stale past DEAD_THRESHOLD (1800s), no batch rows
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?",
+            (time.time() - 3600, "t-orphan"),
+        )
+
+    report = asyncio.run(reconciler.reconcile())
+
+    assert "t-orphan" in report["redispatched"], report
+    row = db.get_task("t-orphan")
+    assert row["coordinator_phase"] == "listing"
+    assert row["claimed_at"] > time.time() - 60
