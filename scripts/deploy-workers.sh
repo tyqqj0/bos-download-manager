@@ -167,7 +167,7 @@ done
 # Version manifest: md5 of the files that matter, per worker vs S1
 echo ""
 echo "[$(date)] Version manifest (md5 of key files):"
-MANIFEST_FILES="dlm/temporal/activities.py dlm/temporal/workflows.py dlm/web/reconciler.py dlm/web/routes/queue.py"
+MANIFEST_FILES="dlm/temporal/activities.py dlm/temporal/workflows.py dlm/temporal/pipeline.py dlm/web/reconciler.py dlm/web/routes/queue.py"
 local_md5=$(cd "$REPO_DIR" && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1)
 echo "  S1 (reference): $local_md5"
 for key in $TARGETS; do
