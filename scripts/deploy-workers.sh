@@ -297,9 +297,22 @@ fi
 # this task added six activities + a workflow + a helper to exactly that
 # file, and a manifest that can't see it would report every host "OK" while
 # actually running the old registration.
+#
+# LC_ALL=C on the sort is NOT cosmetic, and this is measured, not assumed:
+# the fleet is mixed-locale (S1 and w3 are C.UTF-8 with no en_US installed;
+# bj3 and bj9 are en_US.UTF-8 with the locale actually present), and ssh
+# carries each host's own LANG into this command. glibc's en_US collation
+# ignores leading punctuation where C compares bytes, so the underscore
+# files reorder — measured on bj9, 2026-08-07, same tree, same command:
+#   LC_ALL=C     -> c7fddd0c38b4310a3c5275f8b47e7999
+#   LC_ALL=en_US -> 48e16ee85f1392c388a730ddf57ce4f1
+# (divergence starts at dlm/__init__.py, dlm/__main__.py, dlm/commands/_api.py)
+# Without this, the gate reports MISMATCH on bj3 and bj9 on EVERY deploy even
+# when their code is byte-identical — and a gate that cries wolf on two hosts
+# is a gate nobody believes on the day the versions genuinely diverge.
 echo ""
 echo "[$(date)] Version manifest (md5-of-md5s over all dlm/*.py, sorted):"
-MANIFEST_CMD="find dlm -name '*.py' -not -path '*/__pycache__/*' | sort | xargs md5sum | md5sum"
+MANIFEST_CMD="find dlm -name '*.py' -not -path '*/__pycache__/*' | LC_ALL=C sort | xargs md5sum | md5sum"
 local_md5=$(cd "$REPO_DIR" && eval "$MANIFEST_CMD" | cut -d' ' -f1)
 echo "  S1 (reference): $local_md5"
 for key in $TARGETS; do
