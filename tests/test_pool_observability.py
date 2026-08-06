@@ -632,6 +632,123 @@ def test_sharded_task_stuck_is_unaffected_by_the_exemption_g1_regression(db):
     assert any(a["type"] == "task_stuck" for a in alerts)
 
 
+# ── 3b. The same exemption on /api/doctor's surface (review finding I3) ──
+#
+# A10 grades doctor/alerts at ZERO false positives, and `stuck` feeds
+# total_issues -> healthy. A pool task admitted but waiting behind the window
+# writes nothing to its task row by design, so it crossed STALE_THRESHOLD
+# (600s) and drove /api/doctor unhealthy for as long as it waited.
+
+
+def _stub_doctor_temporal(monkeypatch, running: dict):
+    import dlm.web.temporal_client as tc
+
+    async def fake_running(client=None):
+        return running
+
+    monkeypatch.setattr(tc, "running_workflows", fake_running)
+
+
+def test_doctor_exempts_a_window_queued_pool_task_from_stuck(db, monkeypatch):
+    from dlm.web.fleet import STALE_THRESHOLD
+    from dlm.web.routes import doctor
+
+    _stub_doctor_temporal(monkeypatch, {"pool-t-doc-wait": "pool-hf"})
+
+    _task(db, "t-doc-wait", status="downloading", mode="pool",
+          updated_at=time.time() - STALE_THRESHOLD - 60)
+    db.upsert_shard({"id": "s-dw-0", "task_id": "t-doc-wait", "shard_index": 0,
+                      "status": "pending"})
+
+    out = asyncio.run(doctor.diagnose())
+
+    assert out["stuck_tasks"] == []
+    assert out["total_issues"] == 0
+    assert out["healthy"] is True
+
+
+def test_the_exemption_predicate_gates_on_dispatch_mode():
+    """Unit-level, because neither surface can pin this: alerts short-circuits
+    on mode before calling, and the doctor only collects batch rows for pool
+    tasks — so a sharded task reaches the predicate with no rows either way.
+    The gate inside the predicate is what keeps it safe to call from a future
+    third caller that doesn't pre-filter."""
+    from dlm.web.fleet import pool_task_holds_no_work
+
+    queued = [{"status": "pending"}]
+    assert pool_task_holds_no_work({"dispatch_mode": "pool"}, queued) is True
+    assert pool_task_holds_no_work({"dispatch_mode": "sharded"}, queued) is False
+    assert pool_task_holds_no_work({}, queued) is False  # default is sharded
+
+
+def test_doctor_still_reports_a_pool_task_with_a_running_batch_as_stuck(db, monkeypatch):
+    """Running AND pending rows together — the shape a live pool task
+    actually has, and the one that tells "waiting behind the window" apart
+    from "downloading but not progressing". Only the absence of running work
+    may exempt a task."""
+    from dlm.web.fleet import STALE_THRESHOLD
+    from dlm.web.routes import doctor
+
+    _stub_doctor_temporal(monkeypatch, {"pool-t-doc-stall": "pool-hf"})
+
+    _task(db, "t-doc-stall", status="downloading", mode="pool",
+          updated_at=time.time() - STALE_THRESHOLD - 60)
+    db.upsert_shard({"id": "s-dst-0", "task_id": "t-doc-stall", "shard_index": 0,
+                      "status": "running", "server": "w1"})
+    db.upsert_shard({"id": "s-dst-1", "task_id": "t-doc-stall", "shard_index": 1,
+                      "status": "pending"})
+
+    out = asyncio.run(doctor.diagnose())
+
+    assert [s["task_id"] for s in out["stuck_tasks"]] == ["t-doc-stall"]
+    assert out["healthy"] is False
+
+
+def test_doctor_still_reports_a_stale_sharded_task_as_stuck_g1_regression(db, monkeypatch):
+    """Same row shape as the pool exemption (zero running, one pending) —
+    fails if the doctor's exemption is ever widened past pool."""
+    from dlm.web.fleet import STALE_THRESHOLD
+    from dlm.web.routes import doctor
+
+    _stub_doctor_temporal(monkeypatch, {"sharded-t-doc-sh": "download-workers"})
+
+    _task(db, "t-doc-sh", status="downloading", mode="sharded",
+          updated_at=time.time() - STALE_THRESHOLD - 60)
+    db.upsert_shard({"id": "s-dsh-0", "task_id": "t-doc-sh", "shard_index": 0,
+                      "status": "pending"})
+
+    out = asyncio.run(doctor.diagnose())
+
+    assert [s["task_id"] for s in out["stuck_tasks"]] == ["t-doc-sh"]
+
+
+def test_alerts_and_doctor_read_one_exemption_predicate(db, monkeypatch):
+    """The exemption is one function both surfaces call. If either inlines
+    its own copy, /api/doctor and the alert log can disagree about the same
+    task — so patching the shared predicate must silence BOTH.
+
+    The task here holds a *running* batch row, i.e. it is normally NOT
+    exempt on either surface; only the shared predicate says otherwise."""
+    from dlm.web import fleet
+    from dlm.web.alerts import check_alerts
+    from dlm.web.fleet import STALE_THRESHOLD
+    from dlm.web.routes import doctor
+
+    _stub_doctor_temporal(monkeypatch, {"pool-t-shared-pred": "pool-hf"})
+    monkeypatch.setattr(fleet, "pool_task_holds_no_work", lambda task, rows: True)
+
+    _task(db, "t-shared-pred", status="downloading", mode="pool",
+          updated_at=time.time() - max(STALE_THRESHOLD, 3600) - 60)
+    db.upsert_shard({"id": "s-sp-0", "task_id": "t-shared-pred", "shard_index": 0,
+                      "status": "running", "server": "w1"})
+
+    alerts = check_alerts(tasks=[db.get_task("t-shared-pred")], workers=[])
+    out = asyncio.run(doctor.diagnose())
+
+    assert not any(a["type"] == "task_stuck" for a in alerts)
+    assert out["stuck_tasks"] == []
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 4. Dashboard aggregation (decision F, backend only — no build step for JS)
 # ═══════════════════════════════════════════════════════════════════════

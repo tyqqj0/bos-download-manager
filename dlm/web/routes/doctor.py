@@ -20,26 +20,41 @@ from ..fleet import DEAD_THRESHOLD, STALE_THRESHOLD, WORKER_TIMEOUT, has_live_wo
 router = APIRouter(tags=["doctor"])
 
 
-def _read_state() -> tuple[list, list, list]:
+def _read_state() -> tuple[list, list, list, dict]:
     """Every SQLite read this route needs, in one executor hop.
 
     `init_db()` is not a read — it runs executescript + commit and takes the
     write lock — so calling it (and the queries) straight from `async def`
     put a lock wait on the event loop on every /api/doctor request.
+
+    That includes the batch rows for downloading POOL tasks, which the stuck
+    check below needs for decision E's exemption. Fetching them lazily from
+    the handler would be a SQLite call on the event loop that
+    tests/test_event_loop_safety.py cannot see (its AST scan only inspects a
+    handler's own body, so a helper doing the read would pass and still be
+    wrong). Bounded by POOL_MAX_CONCURRENT_TASKS, not by the task table.
     """
     from ...queue.snapshot import (
-        get_all_tasks, get_running_shards, get_workers, init_db,
+        get_all_tasks, get_running_shards, get_shards_by_task, get_workers, init_db,
     )
     from ..fleet import dedupe_workers
 
     init_db()
-    return get_all_tasks(), dedupe_workers(get_workers()), get_running_shards()
+    tasks = get_all_tasks()
+    pool_batches = {
+        t["id"]: get_shards_by_task(t["id"])
+        for t in tasks
+        if t.get("status") == "downloading"
+        and (t.get("dispatch_mode") or "sharded") == "pool"
+    }
+    return (tasks, dedupe_workers(get_workers()), get_running_shards(),
+            pool_batches)
 
 
 @router.get("/doctor")
 async def diagnose():
     """Run health diagnostics including Temporal workflow check."""
-    tasks, workers, running_shards = await run_blocking(_read_state)
+    tasks, workers, running_shards, pool_batches = await run_blocking(_read_state)
     now = time.time()
 
     # 1. Offline workers
@@ -52,12 +67,20 @@ async def diagnose():
                 "last_seen_ago_s": int(now - (w.get("last_seen") or 0)),
             })
 
-    # 2. Stuck/orphaned downloads
+    # 2. Stuck/orphaned downloads. A pool task waiting behind the window
+    #    updates nothing by design (decision E) — counting it here made
+    #    /api/doctor report unhealthy for as long as it waited, and
+    #    `healthy` is what T10's deploy gate reads. Same predicate as the
+    #    alert engine's task_stuck, by import, so the two cannot drift.
+    from ..fleet import pool_task_holds_no_work
+
     stuck = []
     for t in tasks:
         if t.get("status") == "downloading":
             age = now - (t.get("updated_at") or 0)
             if age > STALE_THRESHOLD:
+                if pool_task_holds_no_work(t, pool_batches.get(t["id"], [])):
+                    continue
                 stuck.append({
                     "task_id": t["id"],
                     "name": t.get("name", ""),
@@ -203,7 +226,7 @@ async def fix(req: FixRequest):
     """
     from ..temporal_client import start_task_download
 
-    tasks, _, _ = await run_blocking(_read_state)
+    tasks, _, _, _ = await run_blocking(_read_state)
     now = time.time()
     results = {}
     actions = req.actions or ["redispatch_orphaned"]

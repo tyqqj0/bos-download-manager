@@ -66,6 +66,37 @@ def pool_task_weight(priority: int) -> float:
     """Window weight for one pool task's priority."""
     return POOL_WEIGHT_P0 if (priority or 0) <= POOL_P0_MAX_PRIORITY else POOL_WEIGHT_DEFAULT
 
+
+def pool_task_holds_no_work(task: dict, batch_rows: list[dict]) -> bool:
+    """Decision E's staleness exemption: a POOL task that is admitted but
+    waiting behind the window — zero `running` batch rows and >=1 `pending`
+    one. A task shaped like this writes nothing to its task row by design,
+    so every "no progress in N seconds" rule sees it as stalled while it is
+    in fact healthy and queued. `pool_starved` (reconcile()'s patrol) is the
+    alert for a genuinely dead one.
+
+    Deliberately narrow. Not exempt: a task holding a `running` batch row
+    (a real stall), a task with no batch rows at all (a coordinator that
+    never registered any), and any sharded task (the mode gate here is what
+    keeps the sharded surfaces byte-identical, G1).
+
+    Lives here, in one place, because two surfaces apply it — the alert
+    engine's `task_stuck` and /api/doctor's `stuck_tasks`. A task exempt on
+    one and stuck on the other tells an operator two different things about
+    the same row, and /api/doctor's `healthy` flag is what T10's deploy gate
+    reads. Pure on purpose: the caller supplies the rows, so the doctor
+    route can fetch them inside its existing executor hop instead of
+    touching SQLite on the event loop.
+    """
+    if (task.get("dispatch_mode") or "sharded") != "pool":
+        return False
+    if not batch_rows:
+        return False
+    running = any(r.get("status") == "running" for r in batch_rows)
+    pending = any(r.get("status") == "pending" for r in batch_rows)
+    return (not running) and pending
+
+
 # Terminal/operator states. A progress report must never move a task out of
 # one of these — a dying workflow's late report used to resurrect tasks an
 # operator had explicitly stopped (2026-07-31 incident).

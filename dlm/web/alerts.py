@@ -67,16 +67,14 @@ def s1_self_check() -> bool:
     return False
 
 
-def _pool_task_holds_no_work(task_id: str) -> bool:
-    """Decision E's exemption test: zero `running` batch rows and >=1
-    `pending` one. A pool task shaped like this is admitted but waiting
-    behind the window by design — pool_starved (from reconcile()'s patrol)
-    is the alert for a genuinely dead one, so task_stuck firing here on
-    every waiting task on a busy pool would be a guaranteed false positive.
+def _pool_task_holds_no_work(task: dict) -> bool:
+    """The DB-reading half of decision E's exemption.
 
-    Deliberately narrow: a task with a running batch row is a real stall
-    (not exempt), and a task with no batch rows at all is a coordinator
-    that never registered any (not exempt either) — both must still alert.
+    The predicate itself is `fleet.pool_task_holds_no_work` — one definition
+    shared with /api/doctor's `stuck_tasks`, so the two surfaces cannot
+    disagree about the same task. This wrapper only supplies the batch rows
+    (check_alerts runs in a worker thread, so a plain SQLite read is fine
+    here) and decides what to do when it cannot get them.
 
     Any read failure returns True (apply the exemption) rather than firing
     task_stuck off data we could not confirm — the same "stay silent rather
@@ -84,14 +82,11 @@ def _pool_task_holds_no_work(task_id: str) -> bool:
     """
     try:
         from ..queue.snapshot import get_shards_by_task
-        rows = get_shards_by_task(task_id)
+        rows = get_shards_by_task(task.get("id", ""))
     except Exception:
         return True
-    if not rows:
-        return False
-    running = any(r.get("status") == "running" for r in rows)
-    pending = any(r.get("status") == "pending" for r in rows)
-    return (not running) and pending
+    from .fleet import pool_task_holds_no_work
+    return pool_task_holds_no_work(task, rows)
 
 
 def check_alerts(tasks: list, workers: list) -> list[dict]:
@@ -176,7 +171,7 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
             stale = now - (t.get("updated_at") or 0)
             if stale > 3600:
                 if ((t.get("dispatch_mode") or "sharded") == "pool"
-                        and _pool_task_holds_no_work(t.get("id", ""))):
+                        and _pool_task_holds_no_work(t)):
                     continue
                 key = f"task_stuck:{t.get('id', '')}"
                 new_alerts[key] = {
