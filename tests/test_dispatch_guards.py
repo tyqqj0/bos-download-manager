@@ -152,9 +152,21 @@ def test_retry_leaves_state_untouched_when_workflows_will_not_close(
     assert snapshot.get_task(task_id)["status"] == "paused"
 
 
-def test_retry_of_a_failed_task_with_no_live_shards_skips_termination(
+def test_retry_terminates_even_when_no_shard_row_looks_live(
         dlm_db, monkeypatch):
-    """The common case must not pay a 120s terminate timeout."""
+    """Terminal shard rows are not evidence the coordinator is closed.
+
+    The reconciler's reclaim fails `shard-*` rows without touching
+    `sharded-{id}`, and a forced revoke leaves rows terminal behind a
+    coordinator that is still RUNNING. Skipping the terminate here — which is
+    what this test used to assert, as a timeout optimisation — deleted the rows
+    and set the task `pending` while `sharded-{id}` was still taken;
+    auto_dispatch then hit WorkflowAlreadyStartedError, swallowed it, and left a
+    `downloading` task with no shard rows that reconcile() would not re-dispatch
+    because has_live_workflow() was true. The optimisation was also buying
+    little: terminate_workflow_and_wait returns as soon as nothing is open, so
+    the 120s only elapses when something really is refusing to close.
+    """
     from dlm.web.routes import queue as queue_routes
 
     task_id = "t-retry-3"
@@ -172,8 +184,29 @@ def test_retry_of_a_failed_task_with_no_live_shards_skips_termination(
     result = asyncio.run(queue_routes.retry_task({"task_id": task_id}))
 
     assert result.get("ok") is True
-    assert called == []
+    assert called == [task_id]
     assert snapshot.get_shards_by_task(task_id) == []
+
+
+def test_retry_leaves_state_untouched_when_temporal_is_unreachable(
+        dlm_db, monkeypatch):
+    """An unreachable Temporal means "unknown", and unknown reads as not
+    closed — the same refusal as a timeout, not a traceback and not a retry
+    that proceeds on the assumption nothing was open."""
+    from dlm.web.routes import queue as queue_routes
+
+    task_id = _make_task_with_running_shard("t-retry-4")
+
+    async def fake_terminate(tid, timeout_s=120):
+        raise RuntimeError("Failed client connect: connection refused")
+
+    monkeypatch.setattr(
+        "dlm.web.temporal_client.terminate_workflow_and_wait", fake_terminate)
+    result = asyncio.run(queue_routes.retry_task({"task_id": task_id}))
+
+    assert "could not reach Temporal" in result.get("error", "")
+    assert len(snapshot.get_shards_by_task(task_id)) == 2
+    assert snapshot.get_task(task_id)["status"] == "paused"
 
 
 # --- --only must filter the manifest actually in use ------------------------

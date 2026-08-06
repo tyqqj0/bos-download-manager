@@ -200,3 +200,57 @@ def test_a_genuinely_failed_shard_still_fails_its_task(dlm_db, monkeypatch):
     assert report["reclaimed_shards"] == []
     assert dlm_db.get_task("t-bad")["status"] == "failed"
     assert report["auto_failed"] == ["bad"]
+
+
+def test_one_reclaimed_shard_does_not_shield_a_genuine_failure(dlm_db, monkeypatch):
+    """The mixed case, and the reason the guard tests every failed shard rather
+    than `any`. One orphaned shard alongside a real download failure used to
+    send the whole task down the re-dispatch path: it hit the same error, failed
+    the same way, was reclaimed again, and re-dispatched again — the genuine
+    failure never surfaced. A real failure recurs, so burying the task is the
+    honest outcome; it stays retryable by hand and the BOS filter means nothing
+    already uploaded is lost."""
+    dlm_db.upsert_task({"id": "t-mix", "name": "mix", "repo_id": "org/x",
+                        "status": "downloading", "source": "modelscope",
+                        "priority": 0})
+    _age_task(dlm_db, "t-mix", DEAD)
+    # index 0 is quiet with no workflow -> this cycle reclaims it.
+    _shard(dlm_db, "s-t-mix-0", "bj3", OLD, task_id="t-mix", index=0)
+    # index 1 already failed on its own -> a real error, not an orphan.
+    _shard(dlm_db, "s-t-mix-1", "bj4", OLD, task_id="t-mix", index=1,
+           status="failed")
+
+    dispatched = []
+
+    async def fake_start(task, task_queue=None):
+        dispatched.append(task["id"])
+
+    monkeypatch.setattr("dlm.web.temporal_client.start_sharded_download",
+                        fake_start)
+    report = _reconcile(monkeypatch)
+
+    assert [r["shard_id"] for r in report["reclaimed_shards"]] == ["s-t-mix-0"]
+    assert dlm_db.get_task("t-mix")["status"] == "failed"
+    assert report["auto_failed"] == ["mix"]
+    assert dispatched == [], "re-dispatched a task with a real download failure"
+
+
+def test_re_dispatch_is_visible_to_the_churn_guards(dlm_db, monkeypatch):
+    """`retry_count` is what every churn detector reads — alerts.py's
+    repeated-failure alert and doctor's zombie check at retry_count >= 8. A
+    re-dispatch IS a retry, and leaving the counter untouched let this path
+    restart a task indefinitely with all of them reading zero."""
+    dlm_db.upsert_task({"id": "t-churn", "name": "churn", "repo_id": "org/x",
+                        "status": "downloading", "source": "modelscope",
+                        "priority": 0})
+    _age_task(dlm_db, "t-churn", DEAD)
+    _shard(dlm_db, "s-t-churn-0", "bj3", OLD, task_id="t-churn")
+
+    async def fake_start(task, task_queue=None):
+        pass
+
+    monkeypatch.setattr("dlm.web.temporal_client.start_sharded_download",
+                        fake_start)
+
+    _reconcile(monkeypatch)
+    assert dlm_db.get_task("t-churn")["retry_count"] == 1

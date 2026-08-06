@@ -111,10 +111,23 @@ async def reconcile() -> dict:
                     # resumable (the BOS filter makes a restart lossless). Let
                     # it fall through to re-dispatch instead of burying a live
                     # task as failed because its worker was restarted.
-                    if any(s.get("id") in reclaimed_ids for s in shards):
+                    #
+                    # Only when EVERY failed shard is one of this cycle's
+                    # reclaims, though. `any()` let a single reclaimed shard
+                    # shield a task whose other seven failed on real download
+                    # errors: the task got re-dispatched, hit the same error,
+                    # and the genuine failure never surfaced. A real failure
+                    # recurs, so burying the task is the honest outcome — it
+                    # stays retryable by hand, and the BOS filter means nothing
+                    # already uploaded is lost.
+                    reclaimed_failures = [
+                        s for s in failed_shards if s.get("id") in reclaimed_ids
+                    ]
+                    if len(reclaimed_failures) == len(failed_shards):
                         logger.info(
                             f"Reconciler: {task.get('name', task_id)} has "
-                            f"reclaimed shards — re-dispatching rather than "
+                            f"{len(reclaimed_failures)} reclaimed shard(s) and no "
+                            f"genuine failure — re-dispatching rather than "
                             f"marking failed"
                         )
                     else:
@@ -122,7 +135,8 @@ async def reconcile() -> dict:
                         report.setdefault("auto_failed", []).append(task.get("name", task_id))
                         logger.warning(
                             f"Reconciler: marked {task.get('name', task_id)} failed "
-                            f"— {len(failed_shards)}/{len(shards)} shards failed, parent dead"
+                            f"— {len(failed_shards)}/{len(shards)} shards failed "
+                            f"({len(reclaimed_failures)} reclaimed), parent dead"
                         )
                         continue
 
@@ -142,8 +156,15 @@ async def reconcile() -> dict:
                     # Refresh claimed_at so the listing-phase source guard
                     # covers this coordinator too.
                     conn2 = _conn()
+                    # retry_count too, not just claimed_at: a re-dispatch IS a
+                    # retry, and the churn guards read that counter
+                    # (alerts.py's repeated-failure alert, doctor's zombie
+                    # check at retry_count >= 8). Leaving it untouched let a
+                    # task be re-dispatched by this path indefinitely with
+                    # every churn detector reading zero.
                     conn2.execute(
-                        "UPDATE tasks SET claimed_at = ? WHERE id = ?",
+                        "UPDATE tasks SET claimed_at = ?, "
+                        "retry_count = COALESCE(retry_count, 0) + 1 WHERE id = ?",
                         (time.time(), task_id),
                     )
                     conn2.commit()

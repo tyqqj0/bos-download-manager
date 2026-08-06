@@ -209,7 +209,7 @@ async def retry_task(body: dict):
 
     if not task:
         return {"error": f"Task {task_id} not found"}
-    if task["status"] not in ("failed", "revoked", "paused", "done"):
+    if task["status"] not in ("failed", "revoked", "paused", "done", "pending"):
         return {"error": f"Cannot retry task in status={task['status']}"}
     contradicting = [s for s in shards if (s.get("status") or "") != "done"]
     if task["status"] == "done" and not contradicting:
@@ -218,24 +218,47 @@ async def retry_task(body: dict):
             "refusing to re-download. Add a new task if that is really wanted."
         )}
 
-    # Terminate before touching the rows, in the order /queue/reshard uses.
-    # `paused` only cancels cooperatively, so shard rows can still read
-    # "running" for minutes while a batch drains; deleting those rows without
-    # closing their workflows makes the shards invisible to
+    # Terminate before touching the rows, and unconditionally — the way
+    # /queue/reshard does it. Two separate reasons.
+    #
+    # Before the DELETE: `paused` only cancels cooperatively, so shard rows can
+    # still read "running" for minutes while a batch drains. Deleting those rows
+    # without closing their workflows makes the shards invisible to
     # get_running_shards() — busy_servers then frees hosts that are still
     # writing to /data/staging, auto_dispatch stacks a second pipeline on them,
     # and the re-dispatched coordinator collides with the old children on their
-    # deterministic IDs. terminate_workflow_and_wait also needs the shard rows
-    # to find those children, which is the second reason this cannot run after
-    # the DELETE.
-    live = [s for s in shards if (s.get("status") or "") in ("running", "pending")]
-    if live:
-        from ..temporal_client import terminate_workflow_and_wait
-        if not await terminate_workflow_and_wait(task_id):
-            return {"error": (
-                f"{len(live)} shard workflow(s) did not close within timeout — "
-                "task state unchanged, retry later"
-            )}
+    # deterministic IDs. The rows are also how the children's handles are
+    # enumerated, which they cannot be after the DELETE.
+    #
+    # Unconditionally: terminal rows are NOT evidence the coordinator is
+    # closed. The reconciler's shard reclaim fails rows without touching
+    # `sharded-{id}` (it only matches `shard-*`), and a forced revoke leaves
+    # rows terminal behind a coordinator that is still RUNNING. Gating the
+    # terminate on row status skipped it in exactly those cases: the rows were
+    # deleted, the task set `pending`, and auto_dispatch then hit
+    # WorkflowAlreadyStartedError on the still-taken id — swallowed, leaving a
+    # `downloading` task with zero shard rows and no coordinator, which
+    # reconcile() will not re-dispatch because has_live_workflow() is true.
+    # terminate_workflow_and_wait seeds `sharded-{id}` itself and sweeps for
+    # children by task-id substring, so it does not depend on the rows to find
+    # the coordinator, and it returns True when nothing is open.
+    from ..temporal_client import terminate_workflow_and_wait
+    try:
+        closed = await terminate_workflow_and_wait(task_id)
+    except Exception as exc:
+        # Reaching Temporal is part of the check, not incidental to it: an
+        # unreachable server means "unknown", and unknown has to read as not
+        # closed. Returned rather than raised so the caller gets the reason
+        # instead of a 500 — the state is untouched either way.
+        return {"error": (
+            f"could not reach Temporal to close workflows for {task_id} "
+            f"({type(exc).__name__}: {exc}) — task state unchanged"
+        )}
+    if not closed:
+        return {"error": (
+            f"workflows for {task_id} did not close within timeout — "
+            "task state unchanged, retry later"
+        )}
 
     def do_update():
         retry_count = (task.get("retry_count") or 0) + 1

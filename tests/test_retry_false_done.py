@@ -36,6 +36,20 @@ def db(dlm_db):
     return dlm_db
 
 
+@pytest.fixture(autouse=True)
+def _no_temporal(monkeypatch):
+    """retry now closes the task's workflows unconditionally before touching
+    the rows (see test_dispatch_guards), so every accepted path here would try
+    to reach a real Temporal server. These tests are about the status gate, not
+    the terminate — that it happens at all is pinned in test_dispatch_guards
+    (`test_retry_terminates_even_when_no_shard_row_looks_live`)."""
+    async def fake_terminate(task_id, timeout_s=120):
+        return True
+
+    monkeypatch.setattr(
+        "dlm.web.temporal_client.terminate_workflow_and_wait", fake_terminate)
+
+
 def _task(task_id, status, **over):
     row = {
         "id": task_id, "name": over.pop("name", "some-dataset"),
