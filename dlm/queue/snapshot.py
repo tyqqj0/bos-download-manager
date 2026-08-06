@@ -460,6 +460,25 @@ def get_running_shards() -> list:
     return [dict(r) for r in rows]
 
 
+def get_task_servers(task_id: str) -> list:
+    """Machines currently running work for a task, in both dispatch modes.
+
+    Pool batch rows and sharded shard rows share this table; the parent
+    task's dispatch_mode is the only discriminator, and neither mode needs
+    a different question asked here. `tasks.server` cannot answer it: a
+    claim deliberately writes NULL there because the coordinator assigns
+    servers per shard/batch.
+    """
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT DISTINCT server FROM shards WHERE task_id = ? "
+        "AND status = 'running' AND server IS NOT NULL "
+        "ORDER BY server",
+        (task_id,),
+    ).fetchall()
+    return [r["server"] for r in rows]
+
+
 def update_shard_progress(shard_id: str, **fields):
     conn = _conn()
     fields["updated_at"] = time.time()

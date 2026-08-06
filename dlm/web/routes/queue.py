@@ -269,13 +269,28 @@ async def jump_queue(body: dict):
 
 @router.post("/queue/preempt")
 async def preempt_for_task(body: dict):
-    """Preempt: pause a running task on a worker, then dispatch the urgent task there.
+    """Preempt: pause a downloading task to free machines — and, for a pool
+    victim caught with none in flight, an admission slot — for an urgent
+    pending/paused/failed task.
 
     Body:
-        urgent_task_id: str — the pending task to promote
+        urgent_task_id: str — the pending/paused/failed task to promote
         victim_task_id: str (optional) — which downloading task to pause;
-            if omitted, auto-picks the lowest-priority downloading task
-        target_server: str (optional) — force dispatch to this worker
+            if omitted, auto-picks the lowest-priority downloading task that
+            currently holds at least one machine (a shard/batch row with
+            status='running' — see snapshot.get_task_servers, which reads
+            the shards table because both sharded shard rows and pool batch
+            rows live there; tasks.server is always NULL for either mode,
+            since the coordinator assigns servers per shard/batch, not this
+            route). Auto-pick never chooses a task holding no machine —
+            preempting one frees nothing; that case (freeing a pool
+            admission slot instead) is only reachable by naming the victim
+            explicitly.
+        target_server: str (optional) — restrict *victim* choice (auto-pick
+            only) to a downloading task that currently holds this machine.
+            It has no effect on where the urgent task lands: the claim below
+            always leaves tasks.server = NULL, by design — the coordinator
+            places the work, not this route.
     """
     urgent_id = body.get("urgent_task_id", "")
     victim_id = body.get("victim_task_id", "")
@@ -290,45 +305,91 @@ async def preempt_for_task(body: dict):
         snapshot.init_db()
         urgent = snapshot.get_task(urgent_id)
         if not urgent:
-            return None, None, "Urgent task not found"
+            return None, None, None, "Urgent task not found"
         if urgent["status"] not in ("pending", "paused", "failed"):
-            return None, None, f"Urgent task status={urgent['status']}, expected pending/paused/failed"
+            return None, None, None, f"Urgent task status={urgent['status']}, expected pending/paused/failed"
 
         if victim_id:
+            # An explicit victim skips the "must hold a machine" gate below
+            # on purpose (rule 4): a pool task with zero running batch rows
+            # is still a legitimate target when the point is to free its
+            # admission slot (fleet.POOL_MAX_CONCURRENT_TASKS), not a
+            # machine. target_server plays no role here either — it only
+            # ever narrows *auto-pick*.
             victim = snapshot.get_task(victim_id)
             if not victim:
-                return urgent, None, "Victim task not found"
+                return urgent, None, None, "Victim task not found"
             if victim["status"] != "downloading":
-                return urgent, None, f"Victim task status={victim['status']}, expected downloading"
-            return urgent, victim, None
+                return urgent, None, None, f"Victim task status={victim['status']}, expected downloading"
+            return urgent, victim, snapshot.get_task_servers(victim_id), None
 
         downloading = snapshot.get_tasks_by_status("downloading")
         if not downloading:
-            return urgent, None, "No downloading tasks to preempt — all workers are idle"
+            return urgent, None, None, "No downloading tasks to preempt — all workers are idle"
 
-        downloading.sort(key=lambda t: (-t.get("priority", 5), t.get("created_at", "")))
-        return urgent, downloading[0], None
+        # Auto-pick may only choose a candidate that actually frees a
+        # machine — a task still in its listing phase (no running
+        # shard/batch rows yet) pins no worker, so preempting it would
+        # destroy real listing work for no gain.
+        holders = [(t, snapshot.get_task_servers(t["id"])) for t in downloading]
+        holders = [(t, servers) for t, servers in holders if servers]
+        if not holders:
+            return urgent, None, None, (
+                "No downloading task currently holds a machine — "
+                "all candidates are still in their listing phase"
+            )
 
-    urgent, victim, error = await _run_blocking(do_read)
+        if target_server:
+            on_target = [(t, s) for t, s in holders if target_server in s]
+            if not on_target:
+                return urgent, None, None, (
+                    f"No downloading task holds a machine on target_server={target_server!r}"
+                )
+            holders = on_target
+
+        holders.sort(key=lambda pair: (-pair[0].get("priority", 5), pair[0].get("created_at", "")))
+        victim, servers = holders[0]
+        return urgent, victim, servers, None
+
+    urgent, victim, victim_servers, error = await _run_blocking(do_read)
     if error:
         return {"error": error}
 
-    server = target_server or (victim["server"] if victim else "")
-    if not server:
-        return {"error": "Cannot determine target server"}
+    # 1) Pause the victim, cancel its workflow, and — for a pool victim —
+    #    release its in-flight batch rows exactly as pause_task does (reused,
+    #    not reimplemented: see release_pool_batches' own docstring for why
+    #    the reset is gated on dispatch_mode == 'pool').
+    def do_pause_victim():
+        snapshot.update_task_progress(
+            victim["id"], status="preempted", phase=None, speed_mbps=0
+        )
+    await _run_blocking(do_pause_victim)
 
-    # 1) Pause the victim
-    if victim:
-        def do_pause_victim():
-            snapshot.update_task_progress(
-                victim["id"], status="preempted", phase=None, speed_mbps=0
-            )
-        await _run_blocking(do_pause_victim)
+    try:
+        await cancel_workflow(victim["id"], dispatch_mode=victim.get("dispatch_mode"))
+    except Exception as e:
+        # The victim's workflow may still be running while its row now says
+        # preempted — restore it to downloading (truthful in this branch
+        # precisely because the workflow *is* still alive) before the urgent
+        # task, which is not yet claimed, gets dispatched onto machines the
+        # victim never released. Contrast the failed-start path below, where
+        # the cancel already succeeded and the victim correctly stays
+        # preempted.
+        def do_restore_victim():
+            snapshot.update_task_progress(victim["id"], status="downloading")
+        await _run_blocking(do_restore_victim)
+        return {"error": f"Failed to cancel victim workflow for {victim['id']}: {e}"}
 
-        try:
-            await cancel_workflow(victim["id"])
-        except Exception:
-            pass
+    if victim.get("dispatch_mode") == "pool":
+        await release_pool_batches({"task_id": victim["id"]})
+
+    # Snapshot everything the claim below is about to overwrite, so a
+    # failed start can restore it exactly (rule 6). Read from `urgent` —
+    # nothing has touched that row yet, only the victim's.
+    orig_status = urgent.get("status")
+    orig_priority = urgent.get("priority")
+    orig_claimed_at = urgent.get("claimed_at")
+    orig_phase = urgent.get("coordinator_phase")
 
     # 2) Claim the urgent task. server=NULL: the sharded coordinator assigns
     #    servers per shard; a task-level claim would wrongly mark one worker
@@ -357,18 +418,49 @@ async def preempt_for_task(body: dict):
         await start_task_download(task)
     except Exception as e:
         if "already started" not in str(e).lower():
-            def do_revert():
-                snapshot.update_task_progress(urgent_id, status="pending", server=None)
-            await _run_blocking(do_revert)
-            return {"error": f"Failed to start workflow: {e}"}
+            def do_revert_urgent():
+                conn = snapshot._conn()
+                # update_task_progress takes no coordinator_phase parameter,
+                # and upsert_task's COALESCE would keep whatever is
+                # *currently* stored rather than the pre-claim value this
+                # capture holds — neither can restore it, so this writes the
+                # UPDATE directly, the same way do_claim above does.
+                conn.execute(
+                    "UPDATE tasks SET status = ?, priority = ?, claimed_at = ?, "
+                    "coordinator_phase = ?, updated_at = ? WHERE id = ?",
+                    (orig_status, orig_priority, orig_claimed_at, orig_phase,
+                     time.time(), urgent_id),
+                )
+                conn.commit()
+            await _run_blocking(do_revert_urgent)
+            # The victim's cancel already succeeded (the abort-on-failure
+            # branch above would have returned otherwise) — its workflow
+            # really is gone, so leaving it `downloading` here would be the
+            # lie. `preempted` is truthful and resumable
+            # (fleet.GC_REMOVABLE_STATUSES excludes it, so no GC touches its
+            # staging); name the recovery action instead of pretending this
+            # route can undo it.
+            return {
+                "error": f"Failed to start workflow: {e}",
+                "victim_task_id": victim["id"],
+                "recovery": f'POST /api/queue/resume {{"task_id": "{victim["id"]}"}}',
+            }
 
-    victim_name = victim["name"] if victim else "(none)"
+    freed = victim_servers
+    victim_name = victim["name"]
+    if freed:
+        message = f"已抢占: 暂停 {victim_name}({','.join(freed)})，释放机器供 {task['name']} 使用"
+    elif victim.get("dispatch_mode") == "pool":
+        message = f"已抢占: 暂停 {victim_name}，释放pool准入名额供 {task['name']} 使用"
+    else:
+        message = f"已抢占: 暂停 {victim_name}（未占用任何机器）供 {task['name']} 使用"
+
     return {
         "ok": True,
-        "message": f"已抢占: 暂停 {victim_name}@{server}，启动 {task['name']}@{server}",
+        "message": message,
         "urgent_task_id": urgent_id,
-        "victim_task_id": victim["id"] if victim else None,
-        "server": server,
+        "victim_task_id": victim["id"],
+        "freed_servers": freed,
     }
 
 
