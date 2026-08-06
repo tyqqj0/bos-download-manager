@@ -607,6 +607,93 @@ def test_stale_orphaned_sharded_task_is_still_redispatched_g1_regression(db, mon
     )
 
 
+def test_fresh_pool_orphan_produces_no_pool_orphaned_entry_or_alert(db, monkeypatch):
+    """Review finding R1: appending to report["pool_orphaned"] used to be
+    unconditional, gated only by the sharded branch's later
+    `continue`. auto_dispatch_pending commits status='downloading' BEFORE
+    start_workflow, and running_workflows() reads Temporal's
+    eventually-consistent visibility index — so a pool task dispatched
+    seconds ago legitimately shows no live workflow here, and the old code
+    turned that race into a CRITICAL telling the operator to start a SECOND
+    coordinator (the exact hazard decision C exists to prevent)."""
+    from dlm.web import reconciler
+    from dlm.web.alerts import check_alerts
+    from dlm.web.cache import cache
+    import dlm.web.temporal_client as tc
+
+    async def fake_running(client=None):
+        return {}
+
+    async def fake_start(task):
+        raise AssertionError("a pool orphan must never be re-dispatched here")
+
+    monkeypatch.setattr(tc, "running_workflows", fake_running)
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=3))
+    _stub_pending_activities(monkeypatch, {})
+
+    _task(db, "t-pool-fresh", status="downloading", mode="pool", source="hf",
+          updated_at=time.time())
+    db.upsert_shard({"id": "s-pf2-0", "task_id": "t-pool-fresh", "shard_index": 0,
+                      "status": "running", "server": "w1"})
+
+    report = asyncio.run(reconciler.reconcile())
+
+    assert report.get("pool_orphaned", []) == []
+    # It is still generically "orphaned" (no live workflow) — R1 only gates
+    # the pool-specific alert, not the pre-existing `orphaned` bookkeeping,
+    # which the finding says is "not yours to change here".
+    assert any(o["task_id"] == "t-pool-fresh" for o in report["orphaned"])
+
+    cache.set("reconciler_report", report)
+    try:
+        alerts = check_alerts(tasks=[db.get_task("t-pool-fresh")], workers=[])
+    finally:
+        cache.set("reconciler_report", None)
+    assert not any(a["type"] == "pool_orphaned" for a in alerts)
+
+
+def test_stale_pool_orphan_still_produces_pool_orphaned_entry_and_alert(db, monkeypatch):
+    """The other half of R1's gate: raising the bar to DEAD_THRESHOLD must
+    not silence a genuine orphan, and the entry must still reach the
+    CRITICAL alert surface (not just report["pool_orphaned"])."""
+    from dlm.web import reconciler
+    from dlm.web.alerts import CRITICAL, check_alerts
+    from dlm.web.cache import cache
+    from dlm.web.fleet import DEAD_THRESHOLD
+    import dlm.web.temporal_client as tc
+
+    async def fake_running(client=None):
+        return {}
+
+    async def fake_start(task):
+        raise AssertionError("a pool orphan must never be re-dispatched here")
+
+    monkeypatch.setattr(tc, "running_workflows", fake_running)
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=3))
+    _stub_pending_activities(monkeypatch, {})
+
+    _task(db, "t-pool-stale2", status="downloading", mode="pool", source="hf",
+          updated_at=time.time() - DEAD_THRESHOLD - 5)
+    db.upsert_shard({"id": "s-ps2-0", "task_id": "t-pool-stale2", "shard_index": 0,
+                      "status": "running", "server": "w1"})
+
+    report = asyncio.run(reconciler.reconcile())
+    assert any(o["task_id"] == "t-pool-stale2" for o in report.get("pool_orphaned", []))
+
+    cache.set("reconciler_report", report)
+    try:
+        alerts = check_alerts(tasks=[db.get_task("t-pool-stale2")], workers=[])
+    finally:
+        cache.set("reconciler_report", None)
+
+    hits = [a for a in alerts
+            if a["type"] == "pool_orphaned" and a["task_id"] == "t-pool-stale2"]
+    assert len(hits) == 1, alerts
+    assert hits[0]["severity"] == CRITICAL
+
+
 def test_pool_task_with_all_done_batches_still_auto_completes(db, monkeypatch):
     from dlm.web import reconciler
     import dlm.web.temporal_client as tc

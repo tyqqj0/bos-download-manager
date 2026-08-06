@@ -141,11 +141,17 @@ async def reconcile() -> dict:
             # requires it stay byte-identical, and it is what
             # Egocentric-100K's self-healing rests on.
             if (task.get("dispatch_mode") or "sharded") == "pool":
-                report.setdefault("pool_orphaned", []).append({
-                    "task_id": task_id,
-                    "name": task.get("name", ""),
-                    "stale_seconds": int(stale_seconds),
-                })
+                # DEAD_THRESHOLD, not zero: auto_dispatch commits status='downloading'
+                # before start_workflow, and running_workflows() reads Temporal's
+                # eventually-consistent visibility index, so a pool task dispatched
+                # seconds ago legitimately has no live workflow here. Same gate the
+                # sharded re-dispatch below uses — "orphan" means one thing in both modes.
+                if stale_seconds > DEAD_THRESHOLD:
+                    report.setdefault("pool_orphaned", []).append({
+                        "task_id": task_id,
+                        "name": task.get("name", ""),
+                        "stale_seconds": int(stale_seconds),
+                    })
                 continue
 
             # Only re-dispatch if stale for > DEAD_THRESHOLD
