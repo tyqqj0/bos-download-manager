@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
+import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -317,8 +318,11 @@ def test_no_temp_path_locatable_is_inconclusive_not_stalled(tmp_path, monkeypatc
     """A file for which no candidate temp path exists anywhere (no exact
     target/.incomplete/.part/._____temp path, and no reported
     `temp_path_holder`) must not be declared stalled on that basis alone —
-    "cannot observe" is not evidence of "stalled". The activity's own
-    heartbeat/start_to_close timeout is the backstop for a genuine hang."""
+    "cannot observe" is not evidence of "stalled". It stays inconclusive up
+    to the separate `UNOBSERVABLE_TIMEOUT` (see I2 tests below for the
+    ceiling itself) — not forever, and not backstopped by the activity's own
+    timeout, which cannot serve that role (heartbeats fire unconditionally
+    every 15s regardless of progress; start_to_close_timeout is 7 days)."""
     monkeypatch.setattr(pipeline, "STALL_CHECK_INTERVAL", 0.02)
     monkeypatch.setattr(pipeline, "STALL_TIMEOUT", 0.05)
 
@@ -396,6 +400,185 @@ def test_stall_still_detected_despite_unrelated_incomplete_growing(tmp_path, mon
             future.cancel()
 
     asyncio.run(run_it())
+
+
+# ---------------------------------------------------------------------------
+# I2 — "cannot observe" needs its own ceiling, separate from STALL_TIMEOUT.
+# ---------------------------------------------------------------------------
+
+def test_never_observable_stalls_after_unobservable_timeout_not_before(tmp_path, monkeypatch):
+    """A file whose temp path never appears at all (e.g. blocked in HTTP
+    etag resolution before huggingface_hub creates any temp file) must
+    eventually be declared stalled — the pre-I2 code reset an unbounded
+    clock on every unobservable check, so this could hang for the
+    activity's full 7-day start_to_close_timeout with no recovery
+    (_speed_reporter heartbeats unconditionally every 15s regardless of
+    progress, so the 10-minute heartbeat_timeout can never fire either).
+    UNOBSERVABLE_TIMEOUT is the only backstop, and it must not fire early
+    either — STALL_TIMEOUT is set high here so only the unobservable clock
+    can be the one that trips."""
+    monkeypatch.setattr(pipeline, "STALL_CHECK_INTERVAL", 0.02)
+    monkeypatch.setattr(pipeline, "STALL_TIMEOUT", 600)
+    monkeypatch.setattr(pipeline, "UNOBSERVABLE_TIMEOUT", 0.08)
+
+    engine = _engine(tmp_path, monkeypatch)
+    file_info = FileInfo(path="a/nope.bin", size=123)
+    holder = pipeline._TempPathHolder()  # .path stays None: nothing ever observed
+    cancel_event = threading.Event()
+
+    async def run_it():
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()  # never resolves on its own
+        start = time.monotonic()
+        try:
+            with pytest.raises(pipeline._StallDetected) as exc_info:
+                await asyncio.wait_for(
+                    engine._wait_with_growth_check(future, file_info, cancel_event, holder),
+                    timeout=2.0,
+                )
+        finally:
+            future.cancel()
+        elapsed = time.monotonic() - start
+        return exc_info.value, elapsed
+
+    exc, elapsed = asyncio.run(run_it())
+    assert elapsed >= pipeline.UNOBSERVABLE_TIMEOUT, (
+        "must not fire before UNOBSERVABLE_TIMEOUT has actually elapsed"
+    )
+    assert "no temp path" in str(exc).lower(), (
+        "the unobservable case must say no temp path was ever locatable, "
+        "not 'no growth for Ns' — the two must be distinguishable in logs"
+    )
+
+
+def test_late_appearing_temp_path_moves_off_unobservable_clock(tmp_path, monkeypatch):
+    """Once a candidate path appears, the file must move onto the growth
+    clock and off the unobservable one — and if it later goes unobservable
+    again, that must start a *fresh* unobservable clock, not resume the one
+    from before it was ever seen. A buggy implementation that resets
+    `unobservable_since` to a new timestamp only the first time (or never
+    clears it back to None while observable) would carry the original,
+    stale start time into the second unobservable phase and see it as
+    already past `UNOBSERVABLE_TIMEOUT` the instant the path disappears
+    again — even though barely any time has passed since it actually went
+    unobservable. This test's three phases (unobservable, then observed and
+    growing, then unobservable again) only pass under a correct reset."""
+    monkeypatch.setattr(pipeline, "STALL_CHECK_INTERVAL", 0.02)
+    monkeypatch.setattr(pipeline, "STALL_TIMEOUT", 600)
+    monkeypatch.setattr(pipeline, "UNOBSERVABLE_TIMEOUT", 0.3)
+
+    engine = _engine(tmp_path, monkeypatch)
+    file_info = FileInfo(path="a/late.bin", size=1000)
+    holder = pipeline._TempPathHolder()
+    cancel_event = threading.Event()
+
+    temp_path = tmp_path / "a" / "late.bin.incomplete"
+
+    async def run_it():
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        async def appear_grow_then_vanish():
+            # Phase 1: unobservable, well under UNOBSERVABLE_TIMEOUT (0.3s).
+            await asyncio.sleep(0.05)
+            # Phase 2: observed and growing — must reset the unobservable
+            # clock to None.
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_bytes(b"x" * 50)
+            for _ in range(5):
+                await asyncio.sleep(0.02)
+                with open(temp_path, "ab") as f:
+                    f.write(b"x" * 50)
+            # Phase 3: unobservable again. A fresh clock tolerates this
+            # (0.2s < UNOBSERVABLE_TIMEOUT); a stale clock counted from
+            # phase 1's start (~0s) would already read ~0.25s elapsed here
+            # and keep accumulating past 0.3s well before this phase ends.
+            temp_path.unlink()
+            await asyncio.sleep(0.2)
+            if not future.done():
+                future.set_result(Path("done"))
+
+        grow_task = asyncio.create_task(appear_grow_then_vanish())
+        result = await asyncio.wait_for(
+            engine._wait_with_growth_check(future, file_info, cancel_event, holder),
+            timeout=5.0,
+        )
+        await grow_task
+        return result
+
+    result = asyncio.run(run_it())
+    assert result == Path("done")
+
+
+# ---------------------------------------------------------------------------
+# M2 — one candidate's OSError must not mask growth on another candidate.
+# ---------------------------------------------------------------------------
+
+def test_growth_on_healthy_candidate_survives_error_on_another(tmp_path, monkeypatch):
+    """The old code wrapped a single `except OSError` around the whole
+    candidate scan, so an error reading one candidate (e.g. a TOCTOU race —
+    `exists()` true at check time, gone or unreadable by the time `stat()`
+    runs) skipped every candidate after it in the list, including a
+    healthy, growing one. With I2's ceiling in place, that masked growth
+    would push a healthy download onto the unobservable clock. `.incomplete`
+    is checked before the reported temp-path holder in
+    `_residue_candidates`, so breaking `.incomplete` while the real growth
+    lives at the holder path reproduces the exact ordering that let this
+    bug hide real progress. `UNOBSERVABLE_TIMEOUT` is set short here so a
+    masking regression would show up as a false stall within the test's
+    bounded runtime."""
+    monkeypatch.setattr(pipeline, "STALL_CHECK_INTERVAL", 0.02)
+    monkeypatch.setattr(pipeline, "STALL_TIMEOUT", 600)
+    monkeypatch.setattr(pipeline, "UNOBSERVABLE_TIMEOUT", 0.05)
+
+    engine = _engine(tmp_path, monkeypatch)
+    file_info = FileInfo(path="dir_a/broken.hdf5", size=1000)
+
+    broken_incomplete = tmp_path / "dir_a" / "broken.hdf5.incomplete"
+    broken_incomplete.parent.mkdir(parents=True)
+    broken_incomplete.write_bytes(b"x")
+
+    real_stat = Path.stat
+
+    def flaky_stat(self, *a, **k):
+        if self == broken_incomplete:
+            raise OSError("simulated stat failure (TOCTOU)")
+        return real_stat(self, *a, **k)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    holder = pipeline._TempPathHolder()
+    holder.path = tmp_path / ".cache" / "huggingface" / "download" / "HASH.incomplete"
+    holder.path.parent.mkdir(parents=True)
+    holder.path.write_bytes(b"x" * 100)  # the real, healthy growth
+
+    cancel_event = threading.Event()
+
+    async def run_it():
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        async def grower():
+            # Outlasts UNOBSERVABLE_TIMEOUT (0.05s) by a wide margin — a
+            # masking regression must show up as a stall well before this
+            # completes.
+            for _ in range(8):
+                await asyncio.sleep(0.02)
+                with open(holder.path, "ab") as f:
+                    f.write(b"x" * 100)
+            if not future.done():
+                future.set_result(Path("done"))
+
+        grow_task = asyncio.create_task(grower())
+        result = await engine._wait_with_growth_check(future, file_info, cancel_event, holder)
+        await grow_task
+        return result
+
+    result = asyncio.run(run_it())
+    assert result == Path("done"), (
+        "growth on the healthy holder-path candidate must be observed "
+        "despite the broken .incomplete candidate earlier in the list"
+    )
 
 
 # ---------------------------------------------------------------------------

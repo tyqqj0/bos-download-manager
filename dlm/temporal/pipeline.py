@@ -135,6 +135,9 @@ DISK_FREE_MIN_PCT = 0.30      # keep 30% disk free (dynamic threshold)
 DISK_FREE_ABSOLUTE_MIN_GB = 20  # absolute minimum free space
 STALL_CHECK_INTERVAL = 15    # check file growth every 15s (was 30)
 STALL_TIMEOUT = 600           # 10 min no file growth → stall (was 1800s/30min)
+UNOBSERVABLE_TIMEOUT = 3 * STALL_TIMEOUT  # ceiling for "no candidate path exists
+                              # yet" — see _wait_with_growth_check for why this
+                              # must exist and why it is longer than STALL_TIMEOUT
 HTTP_TIMEOUT = 300            # HF_HUB_DOWNLOAD_TIMEOUT: per-read HTTP timeout
 MAX_FILE_RETRIES = 3          # per-file retry limit
 MIRROR_PRIMARY = "https://huggingface.co"
@@ -570,9 +573,38 @@ class PipelineEngine:
         `_ensure_hf_temp_path_patch`) — and (b) credit a *different* file's
         growth to this one whenever basenames collided across directories,
         which is common in sharded datasets.
+
+        Two independent clocks, not one:
+
+        - Observed and not growing: `_StallDetected` at `STALL_TIMEOUT`,
+          exactly as always.
+        - Nothing observable at all (no candidate path exists on disk and
+          `temp_path_holder` has never reported one): `_StallDetected` at
+          the separate, longer `UNOBSERVABLE_TIMEOUT`. The moment any
+          candidate path appears, the unobservable clock resets and the
+          file moves onto the growth clock; if it later becomes
+          unobservable again, it goes back onto a *fresh* unobservable
+          clock, not the growth clock it left.
+
+        `UNOBSERVABLE_TIMEOUT` is generous — three times `STALL_TIMEOUT` —
+        because a legitimate pre-download phase (etag resolution, repo
+        metadata calls) produces no temp file yet, and because killing a
+        healthy download is what caused the 35-hour molmobot outage. But it
+        must have a ceiling, because nothing else will ever time this out:
+        `_speed_reporter` heartbeats unconditionally every 15s regardless of
+        progress, so the activity's 10-minute `heartbeat_timeout` can never
+        fire on its own, and `start_to_close_timeout` is 7 days — without
+        this clock, a genuine hang before any candidate path exists (e.g.
+        blocked in HTTP metadata/etag resolution) would wedge a shard at 0
+        Mbps for up to 7 days with no automatic recovery.
         """
         last_size = 0
         last_growth_time = time.time()
+        # None means "currently observable" (on the growth clock above).
+        # A timestamp means "unobservable since this moment" (on the
+        # UNOBSERVABLE_TIMEOUT clock below). Starts unobservable: nothing
+        # has been seen yet at the top of a fresh attempt.
+        unobservable_since: Optional[float] = time.time()
 
         while not download_future.done():
             await asyncio.sleep(STALL_CHECK_INTERVAL)
@@ -590,30 +622,39 @@ class PipelineEngine:
                 raise _StallDetected(f"Disk full abort: {file_info.path}")
 
             # Check file size growth across every path this file's partial
-            # data could live at right now.
+            # data could live at right now. Each candidate is checked on
+            # its own: one unreadable/vanished candidate (e.g. renamed out
+            # from under us mid-stat) must not mask growth on another
+            # candidate that is healthy (M2) — a single `except` around the
+            # whole loop used to let an early failure skip the rest.
             current_size = None
-            try:
-                for candidate in self._residue_candidates(file_info, temp_path_holder):
+            for candidate in self._residue_candidates(file_info, temp_path_holder):
+                try:
                     if candidate.exists():
                         current_size = max(current_size or 0, candidate.stat().st_size)
-            except OSError:
-                pass
+                except OSError:
+                    continue
 
             if current_size is None:
-                # No candidate exists yet for this file — inconclusive, not
-                # evidence of a stall. This is expected early in an attempt
-                # (before any temp file exists) and can persist for the
-                # whole attempt if huggingface_hub never reports a temp
-                # path (e.g. served from its own cache with no incomplete
-                # file at all). Reset the clock rather than accumulate
-                # silent "no growth" time against a file we cannot observe:
-                # a false stall here bricked every large HF download for
-                # 35 hours straight (molmobot-data, 2026-08). The activity's
-                # own heartbeat/start_to_close timeout is the backstop for
-                # an actual hang.
-                last_growth_time = time.time()
+                # No candidate exists yet for this file, and none has been
+                # reported — inconclusive, not evidence of a stall. Expected
+                # early in an attempt (before any temp file exists) and can
+                # persist for a while if huggingface_hub never reports a
+                # temp path (e.g. served from its own cache with no
+                # incomplete file at all). Bounded by UNOBSERVABLE_TIMEOUT,
+                # not unbounded — see the docstring above for why.
+                if unobservable_since is None:
+                    unobservable_since = time.time()
+                elif time.time() - unobservable_since > UNOBSERVABLE_TIMEOUT:
+                    raise _StallDetected(
+                        f"{file_info.path}: no temp path ever locatable for "
+                        f"{UNOBSERVABLE_TIMEOUT}s"
+                    )
                 continue
 
+            # Observable now: leave the unobservable clock (a later gap
+            # starts a fresh one, not this one) and evaluate growth.
+            unobservable_since = None
             if current_size > last_size:
                 last_size = current_size
                 last_growth_time = time.time()
