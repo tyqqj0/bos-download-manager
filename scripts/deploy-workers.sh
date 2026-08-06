@@ -168,7 +168,11 @@ done
 echo ""
 echo "[$(date)] Version manifest (md5 of key files):"
 MANIFEST_FILES="dlm/temporal/activities.py dlm/temporal/workflows.py dlm/web/reconciler.py dlm/web/routes/queue.py"
-local_md5=$(cd "$REPO_DIR" && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1)
+# LC_ALL=C: force a locale-independent, byte-order collation for anything
+# that could feed this digest, so a host whose locale differs from S1
+# (e.g. C.UTF-8 vs en_US.UTF-8) can never produce a different digest for
+# byte-identical content.
+local_md5=$(cd "$REPO_DIR" && LC_ALL=C cat $MANIFEST_FILES | LC_ALL=C md5sum | cut -d' ' -f1)
 echo "  S1 (reference): $local_md5"
 for key in $TARGETS; do
     ip="${WORKERS[$key]:-$CUSTOM_IP}"
@@ -177,7 +181,7 @@ for key in $TARGETS; do
     # as MISMATCH when the deploy itself succeeded (bj1, 2026-08-03).
     remote_md5="UNREACHABLE"
     for attempt in 1 2 3; do
-        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1" 2>/dev/null); then
+        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && LC_ALL=C cat $MANIFEST_FILES | LC_ALL=C md5sum | cut -d' ' -f1" 2>/dev/null); then
             remote_md5="$m"
             break
         fi
