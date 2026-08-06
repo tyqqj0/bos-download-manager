@@ -440,14 +440,26 @@ class PipelineEngine:
                         return
                     except _StallDetected:
                         cancel_event.set()
-                        # Clean up THIS file's residue only, using the exact
-                        # same paths growth was checked against (defect 3 +
-                        # 4 share one source of truth for "where is this
-                        # file's partial data" — never a basename/rglob
+                        # Clean up THIS file's *partial* residue only, using
+                        # _unlink_candidates — never _residue_candidates,
+                        # which additionally includes target_path (the
+                        # file's finished destination). cancel_event.set()
+                        # cannot interrupt the executor thread
+                        # (run_in_executor has no cancellation and nothing
+                        # inside hf_hub_download polls the event), so an
+                        # orphaned thread from a prior attempt can finish and
+                        # move a *correct, complete* file to target_path
+                        # while this attempt's monitor is still running.
+                        # Unlinking target_path here would delete that file
+                        # (I1). _unlink_candidates shares the same partial-
+                        # path list _residue_candidates measures growth from
+                        # (defect 3 + 4: one source of truth for "where is
+                        # this file's partial data" — never a basename/rglob
                         # search across the whole staging tree, which used
                         # to delete a *different* file's in-progress bytes
-                        # whenever basenames collided across directories).
-                        for p in self._residue_candidates(file_info, temp_path_holder):
+                        # whenever basenames collided across directories) —
+                        # it just excludes the one entry that is not partial.
+                        for p in self._unlink_candidates(file_info, temp_path_holder):
                             try:
                                 p.unlink(missing_ok=True)
                             except OSError:
@@ -484,19 +496,32 @@ class PipelineEngine:
                 logger.error(f"Unhandled download error: {r}")
         await queue.put(None)  # signal consumer to stop
 
-    def _residue_candidates(
+    def _unlink_candidates(
         self, file_info: FileInfo, temp_path_holder: "_TempPathHolder | None"
     ) -> list[Path]:
-        """Every path this file's partial data could currently live at.
+        """Every path this file's *partial* (not-yet-final) data could
+        currently live at. Safe for stall cleanup to unlink.
 
-        Shared by the stall monitor (reads sizes) and the stall cleanup
-        (unlinks) so there is exactly one answer to "where is this file's
-        partial data" — see `_wait_with_growth_check` for why a basename
-        search across the whole staging tree is not on this list.
+        Deliberately excludes `target_path` — the file's finished
+        destination — which `_residue_candidates` (the growth-measurement
+        superset) includes. `cancel_event.set()` cannot interrupt the
+        executor thread (`run_in_executor` has no cancellation, and nothing
+        inside `hf_hub_download`/the ModelScope SDK polls that event), so an
+        orphaned thread from a previous attempt can finish and move a
+        complete, correct file to `target_path` while a later attempt's
+        monitor is still running against it. If `target_path` were on this
+        list, the next stall on that later attempt would unlink the correct
+        file that a different thread already finished (I1) — no BOS data
+        lost (the retry is lossless), but it manufactures the exact false
+        stall this branch exists to remove.
+
+        Shared with `_residue_candidates` so there is exactly one answer to
+        "where is this file's partial data" for both purposes — see
+        `_wait_with_growth_check` for why a basename search across the whole
+        staging tree is not on either list.
         """
         target_path = self.staging_dir / file_info.path
         candidates = [
-            target_path,
             Path(str(target_path) + ".incomplete"),
             Path(str(target_path) + ".part"),
             self.staging_dir / "._____temp" / file_info.path,
@@ -504,6 +529,22 @@ class PipelineEngine:
         if temp_path_holder is not None and temp_path_holder.path is not None:
             candidates.append(temp_path_holder.path)
         return candidates
+
+    def _residue_candidates(
+        self, file_info: FileInfo, temp_path_holder: "_TempPathHolder | None"
+    ) -> list[Path]:
+        """Every path this file's data could live at right now, complete or
+        partial — used ONLY for growth measurement, never for cleanup.
+
+        This is `_unlink_candidates` plus `target_path`, the file's finished
+        destination: a completed download (this attempt's or an orphaned
+        earlier one still racing against `cancel_event`) is real, valid
+        growth and must count as such. Cleanup must use
+        `_unlink_candidates` instead — see its docstring for why
+        `target_path` must never be unlinked by stall cleanup (I1).
+        """
+        target_path = self.staging_dir / file_info.path
+        return [target_path] + self._unlink_candidates(file_info, temp_path_holder)
 
     async def _wait_with_growth_check(
         self,

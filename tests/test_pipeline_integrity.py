@@ -131,6 +131,49 @@ def test_stall_cleanup_does_not_touch_sibling_with_same_basename(tmp_path, monke
 
 
 # ---------------------------------------------------------------------------
+# I1 — the unlink list must exclude the file's own finished destination.
+# ---------------------------------------------------------------------------
+
+def test_stall_cleanup_does_not_unlink_completed_target_path(tmp_path, monkeypatch):
+    """`cancel_event.set()` cannot interrupt the executor thread —
+    `run_in_executor` has no cancellation and nothing inside `hf_hub_download`
+    polls that event — so an orphaned thread from attempt N can finish and
+    move a complete, correct file to `target_path` while attempt N+1's
+    monitor is still running and then stalls. That monitor's cleanup must
+    not delete the finished file: `target_path` belongs in the growth list
+    (`_residue_candidates`) but not the unlink list (`_unlink_candidates`)."""
+    monkeypatch.setattr(pipeline, "MAX_FILE_RETRIES", 1)
+
+    engine = _engine(tmp_path, monkeypatch)
+    engine._executor = ThreadPoolExecutor(max_workers=2)
+    engine._concurrency = 2
+
+    file_info = FileInfo(path="dirA/episode_0000001.hdf5", size=1000)
+
+    # An orphaned earlier attempt already moved the completed file here.
+    target_path = tmp_path / "dirA" / "episode_0000001.hdf5"
+    target_path.parent.mkdir(parents=True)
+    target_path.write_bytes(b"x" * 1000)
+
+    monkeypatch.setattr(engine, "_download_one_file", lambda *a, **k: None)
+
+    async def always_stall(*args, **kwargs):
+        raise pipeline._StallDetected("forced stall for test")
+
+    monkeypatch.setattr(engine, "_wait_with_growth_check", always_stall)
+
+    queue = asyncio.Queue()
+    asyncio.run(engine._producer([file_info], queue))
+
+    assert engine.stats.failed_files == 1
+    assert target_path.exists(), (
+        "the file's finished destination must survive stall cleanup for "
+        "that same file"
+    )
+    assert target_path.read_bytes() == b"x" * 1000, "the completed data must be untouched"
+
+
+# ---------------------------------------------------------------------------
 # Defect 4 (mechanism) — the actual monkeypatch that reports huggingface_hub's
 # real, uuid-suffixed temp path back to the monitor.
 # ---------------------------------------------------------------------------
