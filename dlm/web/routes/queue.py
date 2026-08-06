@@ -381,7 +381,14 @@ async def list_shards(task_id: str):
         if not task:
             return {"error": f"Task {task_id} not found"}
         shards = snapshot.get_shards_by_task(task_id)
-        return {"task_id": task_id, "shards": shards}
+        # dispatch_mode tells the shard-detail popup whether to render a
+        # per-batch table (sharded) or a per-server aggregation (pool) —
+        # T9 decision F. Additive only; nothing else here changes.
+        return {
+            "task_id": task_id,
+            "shards": shards,
+            "dispatch_mode": task.get("dispatch_mode") or "sharded",
+        }
     return await _run_blocking(do_list)
 
 

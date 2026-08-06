@@ -16,6 +16,7 @@ WORKFLOW_SYNC_INTERVAL = 30
 TRANSFER_INTERVAL = 60
 RECONCILE_INTERVAL = 300  # 5 minutes
 DISPATCH_INTERVAL = 30  # pending-task dispatch cadence (one sharded task per source per cycle)
+STAGING_GC_INTERVAL = 3600  # decision G — local-disk-only, terminal-tasks-only sweep
 
 # Every stage below must finish or give up. A `try/except` catches a failure
 # but not a hang: one await that never returns stops this `while True` for
@@ -32,6 +33,14 @@ def _build_dashboard() -> dict:
     from ..queue.snapshot import get_dashboard_summary, get_all_tasks, get_workers, get_shards_by_task
     summary = get_dashboard_summary()
     workers = get_workers()
+
+    # dispatch_mode isn't in the active_downloads projection (get_dashboard_
+    # summary's query is an explicit column list, not SELECT *) — read it
+    # from the same get_all_tasks() this function needs a few lines further
+    # down anyway, just fetched earlier so the shard-aggregation loop below
+    # can branch on it.
+    all_tasks = get_all_tasks()
+    dispatch_mode_by_id = {t["id"]: t.get("dispatch_mode") for t in all_tasks}
 
     # Fix sharded task aggregation: override task-level speed/progress with
     # shard aggregates so per-shard progress_fn writes don't confuse the dashboard.
@@ -50,15 +59,57 @@ def _build_dashboard() -> dict:
             dl["size_gb"] = round(total_bytes / (1024 ** 3), 2)
             dl["total_shards"] = len(shards)
             dl["done_shards"] = sum(1 for s in shards if s.get("status") == "done")
-            dl["shard_servers"] = [
-                {"server": s.get("server", "?"), "speed_mbps": round(s.get("speed_mbps", 0), 1),
-                 "done_pct": round(s.get("done_bytes", 0) / s.get("total_bytes", 1) * 100, 1) if s.get("total_bytes") else 0}
-                for s in shards
-            ]
-            if not dl.get("server"):
-                dl["server"] = ",".join(
-                    s.get("server") for s in shards if s.get("server")
-                ) or None
+
+            if (dispatch_mode_by_id.get(dl["id"]) or "sharded") == "pool":
+                # Decision F: a pool task can carry up to POOL_MAX_BATCHES
+                # (1500) batch rows in this same `shards` table. Emitting one
+                # shard_servers entry per row, like the sharded branch below,
+                # would put a 1500-element array and a multi-kilobyte
+                # dl["server"] string on a payload the browser polls every
+                # 10s. Aggregate per distinct server instead. The sharded
+                # branch (the `else` below) is untouched, character for
+                # character — G1 requires that shape stay byte-identical.
+                per_server: dict[str, dict] = {}
+                for s in shards:
+                    server = s.get("server")
+                    if not server:
+                        continue
+                    row = per_server.setdefault(server, {
+                        "running": 0, "done": 0, "speed_mbps": 0.0,
+                        "done_bytes": 0, "total_bytes": 0,
+                    })
+                    status = s.get("status")
+                    if status == "running":
+                        row["running"] += 1
+                    elif status == "done":
+                        row["done"] += 1
+                    row["speed_mbps"] += s.get("speed_mbps", 0) or 0
+                    row["done_bytes"] += s.get("done_bytes", 0) or 0
+                    row["total_bytes"] += s.get("total_bytes", 0) or 0
+
+                dl["server_batches"] = [
+                    {
+                        "server": server,
+                        "running": row["running"],
+                        "done": row["done"],
+                        "speed_mbps": round(row["speed_mbps"], 1),
+                        "done_pct": round(row["done_bytes"] / row["total_bytes"] * 100, 1)
+                        if row["total_bytes"] else 0,
+                    }
+                    for server, row in sorted(per_server.items())
+                ]
+                if not dl.get("server"):
+                    dl["server"] = ",".join(sorted(per_server)) or None
+            else:
+                dl["shard_servers"] = [
+                    {"server": s.get("server", "?"), "speed_mbps": round(s.get("speed_mbps", 0), 1),
+                     "done_pct": round(s.get("done_bytes", 0) / s.get("total_bytes", 1) * 100, 1) if s.get("total_bytes") else 0}
+                    for s in shards
+                ]
+                if not dl.get("server"):
+                    dl["server"] = ",".join(
+                        s.get("server") for s in shards if s.get("server")
+                    ) or None
     # Recalc aggregate speed from corrected values
     summary["aggregate_speed_mbps"] = round(
         sum(dl.get("speed_mbps", 0) for dl in summary.get("active_downloads", [])), 1)
@@ -70,7 +121,6 @@ def _build_dashboard() -> dict:
     summary["workers"] = workers
     summary["active_worker_count"] = len(active_workers)
 
-    all_tasks = get_all_tasks()
     recent = sorted(
         [t for t in all_tasks if t.get("status") in ("done", "failed") and t.get("completed_at")],
         key=lambda t: t.get("completed_at", ""),
@@ -154,6 +204,7 @@ async def background_scheduler():
     last_reconcile = 0
     last_dispatch = 0
     last_health_verify = 0
+    last_staging_gc = 0
 
     await asyncio.sleep(2)
 
@@ -233,6 +284,28 @@ async def background_scheduler():
                 except Exception as e:
                     logger.error(f"Health verify error: {e}")
                 last_health_verify = now
+
+            # Staging GC (decision G): local-disk-only, terminal-tasks-only
+            # sweep of /data/staging/{task_name} across the fleet. Hourly —
+            # slower than every other stage, since it walks every server
+            # over ssh, which the wait_for below still bounds at
+            # STAGE_TIMEOUT like every other blocking stage here.
+            if now - last_staging_gc > STAGING_GC_INTERVAL:
+                try:
+                    from .reconciler import staging_gc
+                    gc_report = await asyncio.wait_for(
+                        loop.run_in_executor(_executor, staging_gc), timeout=STAGE_TIMEOUT)
+                    cache.set("staging_gc_report", gc_report)
+                    if gc_report.get("removed"):
+                        logger.info(
+                            f"Staging GC removed: "
+                            f"{[r['name'] for r in gc_report['removed']]}"
+                        )
+                    if gc_report.get("errors"):
+                        logger.error(f"Staging GC errors: {gc_report['errors']}")
+                except Exception as e:
+                    logger.error(f"Staging GC error: {e}")
+                last_staging_gc = now
 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")

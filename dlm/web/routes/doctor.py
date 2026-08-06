@@ -158,6 +158,21 @@ async def diagnose():
     }
 
 
+@router.get("/doctor/staging-gc")
+async def staging_gc_preview():
+    """Dry-run preview of the periodic staging GC (decision G) — exactly
+    what it would remove and what it is skipping, without removing
+    anything. This is the interface a human uses to sanity-check the sweep
+    before it runs for real, and before T10 turns it loose on the cluster.
+    """
+    from ..reconciler import staging_gc
+
+    def _do():
+        return staging_gc(dry_run=True)
+
+    return await run_blocking(_do)
+
+
 class FixRequest(BaseModel):
     actions: list[str] = []
 
