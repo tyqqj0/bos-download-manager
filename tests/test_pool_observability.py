@@ -58,6 +58,32 @@ def _worker(db, key, *, disk_free_gb=500):
 
 
 @pytest.fixture(autouse=True)
+def _never_touch_the_production_alert_log(monkeypatch, tmp_path):
+    """Two independent guards, because one monkeypatch is "unlikely", not
+    "impossible" (see the section-0 note below for what this cost):
+
+    1. the module's cached logger is replaced with a NullHandler-only one, so
+       _get_alert_logger() short-circuits and never builds a FileHandler;
+    2. ALERT_LOG_PATH points at this test's tmp_path, so anything that DOES
+       rebuild the logger — including a test that deliberately resets the
+       cache — lands in the test's own directory.
+
+    _active_alerts is reset too: it is module-global de-dupe state, and a leak
+    across tests turns one test's alerts into another's RESOLVED lines.
+    """
+    import logging as _logging
+    from dlm.web import alerts as alerts_mod
+
+    monkeypatch.setattr(alerts_mod, "ALERT_LOG_PATH", tmp_path / "dlm-alerts.log")
+
+    null = _logging.getLogger("dlm.alerts.pytest-null")
+    null.handlers = [_logging.NullHandler()]
+    null.propagate = False
+    monkeypatch.setattr(alerts_mod, "_alert_logger", null)
+    monkeypatch.setattr(alerts_mod, "_active_alerts", {})
+
+
+@pytest.fixture(autouse=True)
 def _isolate_patrol_state():
     """Trigger 1's zero-poller confirmation streak is module state that spans
     patrol cycles by design (review finding I8). Reset it around every test so
@@ -67,6 +93,72 @@ def _isolate_patrol_state():
     reconciler._POOL_ZERO_POLLER_SAMPLES.clear()
     yield
     reconciler._POOL_ZERO_POLLER_SAMPLES.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 0. Test-harness safety: this file must never write the real alert log
+# ═══════════════════════════════════════════════════════════════════════
+#
+# check_alerts unconditionally calls _get_alert_logger(), which opens
+# logging.FileHandler(alerts.ALERT_LOG_PATH) in append mode and swallows only
+# OSError/PermissionError. This file is the suite's only caller. On a dev box
+# /data is absent so nothing happens — but on S1 /data exists and
+# scripts/deploy-workers.sh runs `pytest tests/ -q` as its deploy gate, so
+# every deploy appended fabricated CRITICALs ("pool-hf has 0 activity
+# pollers") and RESOLVED churn to the live incident log a human greps.
+
+
+def test_no_test_in_this_file_can_touch_the_production_alert_log(db, monkeypatch, tmp_path):
+    """Pins the autouse guard below, and does it in a way that fails on a dev
+    box too: without the guard, /data is unwritable here and the real
+    FileHandler's OSError is swallowed, so merely inspecting the logger's
+    handlers would find nothing wrong and pass. Spy on the FileHandler
+    construction instead — that happens regardless of whether /data exists."""
+    import logging as _logging
+    from dlm.web.alerts import check_alerts
+    from dlm.web import alerts as alerts_mod
+
+    opened: list[str] = []
+
+    class _SpyHandler(_logging.NullHandler):
+        def __init__(self, filename, *args, **kwargs):
+            super().__init__()
+            opened.append(str(filename))
+
+    monkeypatch.setattr(_logging, "FileHandler", _SpyHandler)
+    monkeypatch.setattr(alerts_mod, "_alert_logger", None)  # force a rebuild
+
+    _stale_downloading(db, "t-alertlog", "sharded")
+    out = check_alerts(tasks=[db.get_task("t-alertlog")], workers=[])
+
+    assert any(a["type"] == "task_stuck" for a in out)  # the logging path really ran
+    assert opened, "expected the alert logger to open a file at all"
+    assert all(not p.startswith("/data") for p in opened), opened
+    assert str(tmp_path) in opened[0], opened
+
+
+def test_the_alert_logger_opens_no_file_at_all_in_this_suite(db, monkeypatch):
+    """Guard 1, pinned separately: with the cached NullHandler logger in
+    place, check_alerts opens no file at all — not even in tmp_path. The test
+    above deliberately clears that cache to exercise guard 2, so without this
+    one the first guard could be deleted with the suite still green."""
+    import logging as _logging
+    from dlm.web.alerts import check_alerts
+
+    opened: list[str] = []
+
+    class _SpyHandler(_logging.NullHandler):
+        def __init__(self, filename, *args, **kwargs):
+            super().__init__()
+            opened.append(str(filename))
+
+    monkeypatch.setattr(_logging, "FileHandler", _SpyHandler)
+
+    _stale_downloading(db, "t-alertlog2", "sharded")
+    out = check_alerts(tasks=[db.get_task("t-alertlog2")], workers=[])
+
+    assert any(a["type"] == "task_stuck" for a in out)
+    assert opened == []
 
 
 # ═══════════════════════════════════════════════════════════════════════
