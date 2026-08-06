@@ -7,3 +7,4 @@ build/
 .venv/
 docs/*-feishu.md
 CLAUDE.md
+venv/

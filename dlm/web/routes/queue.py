@@ -182,20 +182,41 @@ async def resume_task(body: dict):
 
 @router.post("/queue/retry")
 async def retry_task(body: dict):
-    """Retry a failed task."""
+    """Retry a failed task.
+
+    Also accepts a task marked `done` whose OWN shard rows contradict that
+    claim — a shard row that is not `done` means the coordinator concluded
+    success over a shard that did not succeed. t-20260805-460d45
+    (molmobot-data) was reported done at 0 of 9611 GB on 2026-08-06 with its
+    single shard row reading `failed`; the workflow bug behind it is fixed,
+    but there was no supported way to correct the row it left behind, and
+    hand-editing SQLite is not one.
+
+    The gate is evidence from the task's own shard rows, not an operator
+    override: a genuinely complete task (every shard `done`) is still refused,
+    so this cannot be used to re-download a finished dataset by accident.
+    """
     task_id = body.get("task_id", "")
     if not task_id:
         return {"error": "task_id is required"}
 
     def do_get():
         snapshot.init_db()
-        return snapshot.get_task(task_id)
-    task = await _run_blocking(do_get)
+        task = snapshot.get_task(task_id)
+        shards = snapshot.get_shards_by_task(task_id) if task else []
+        return task, shards
+    task, shards = await _run_blocking(do_get)
 
     if not task:
         return {"error": f"Task {task_id} not found"}
-    if task["status"] not in ("failed", "revoked", "paused"):
+    if task["status"] not in ("failed", "revoked", "paused", "done"):
         return {"error": f"Cannot retry task in status={task['status']}"}
+    contradicting = [s for s in shards if (s.get("status") or "") != "done"]
+    if task["status"] == "done" and not contradicting:
+        return {"error": (
+            f"Task {task_id} is done and all {len(shards)} shard rows agree — "
+            "refusing to re-download. Add a new task if that is really wanted."
+        )}
 
     def do_update():
         retry_count = (task.get("retry_count") or 0) + 1
@@ -204,12 +225,28 @@ async def retry_task(body: dict):
             speed_mbps=0, error=None,
         )
         conn = snapshot._conn()
-        conn.execute("UPDATE tasks SET retry_count = ? WHERE id = ?", (retry_count, task_id))
+        # server released and completed_at cleared for the same reason
+        # /queue/reshard does it: a stale claim or completion timestamp on a
+        # row auto_dispatch is about to pick up describes the previous run.
+        conn.execute(
+            "UPDATE tasks SET retry_count = ?, server = NULL, completed_at = NULL "
+            "WHERE id = ?", (retry_count, task_id))
+        # The re-dispatched coordinator calls create_shards_in_db and gets a
+        # fresh set of rows. Leaving the old ones behind inflates total_shards
+        # so the task can never read 100%, and keeps a `failed` row that the
+        # aggregate would count against a run that is going fine. /queue/
+        # reshard deletes them for exactly this reason; retry did not.
+        conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
         conn.commit()
     await _run_blocking(do_update)
 
     # auto_dispatch will pick this up and assign to an idle worker
-    return {"ok": True, "task_id": task_id, "status": "pending"}
+    return {
+        "ok": True, "task_id": task_id, "status": "pending",
+        "cleared_shard_rows": len(shards),
+        "note": "auto_dispatch restarts it; the BOS resume filter skips files "
+                "already uploaded under this task's prefix",
+    }
 
 
 @router.post("/queue/reorder")
