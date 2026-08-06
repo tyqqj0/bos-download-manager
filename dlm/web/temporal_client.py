@@ -144,12 +144,46 @@ async def start_split_download(task_dict: dict, worker_count: int = 2):
     return handle
 
 
+async def queue_poller_count(client, queue: str) -> int | None:
+    """How many workers currently poll `queue` for workflow tasks.
+
+    None means Temporal could not be asked (RPC error, old server) — callers
+    must treat that as "unknown", never as zero.
+    """
+    from temporalio.api.enums.v1 import TaskQueueType
+    from temporalio.api.taskqueue.v1 import TaskQueue
+    from temporalio.api.workflowservice.v1 import DescribeTaskQueueRequest
+
+    try:
+        resp = await client.workflow_service.describe_task_queue(
+            DescribeTaskQueueRequest(
+                namespace=client.namespace,
+                task_queue=TaskQueue(name=queue),
+                task_queue_type=TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW,
+            )
+        )
+        return len(resp.pollers)
+    except Exception as e:  # pragma: no cover - depends on live server
+        logger.warning(f"describe_task_queue({queue}) failed: {e}")
+        return None
+
+
 async def start_sharded_download(task_dict: dict, task_queue: str | None = None):
     """Start a ShardedDownloadWorkflow — auto-sharding coordinator.
 
     `task_queue` must be one the source's own workers poll; see
     fleet.coordinator_queue. Defaults to the shared HK queue, which is correct
     for every source except ModelScope.
+
+    Refuses to start when the target queue has no pollers. Temporal accepts
+    such a start happily and the execution sits RUNNING forever: nothing
+    reconciles it (has_live_workflow stays true, so reconcile only records it
+    as "stale" and redispatch_orphaned skips it), the task stays `downloading`
+    with zero shards, and auto_dispatch's listing guard blocks every other task
+    of that source for 15 minutes. The reachable trigger is deploy order —
+    restarting dlm-web before deploy-workers.sh has restarted any node of the
+    source, so the new coordinator queue exists in code but nobody polls it
+    yet. Failing here instead leaves the task `pending` for the next 30s cycle.
     """
     from ..temporal.models import TaskInput
     from ..temporal.workflows import ShardedDownloadWorkflow
@@ -169,6 +203,14 @@ async def start_sharded_download(task_dict: dict, task_queue: str | None = None)
     )
 
     queue = task_queue or SHARED_COORDINATOR_QUEUE
+    pollers = await queue_poller_count(client, queue)
+    if pollers == 0:
+        raise RuntimeError(
+            f"no worker polls coordinator queue {queue!r} — refusing to start "
+            f"{task_dict['id']}, which would hang RUNNING with nothing to "
+            f"reconcile it. Deploy the workers for this source first "
+            f"(bash scripts/deploy-workers.sh), then dlm-web."
+        )
     workflow_id = f"sharded-{task_dict['id']}"
     handle = await client.start_workflow(
         ShardedDownloadWorkflow.run,
@@ -176,7 +218,9 @@ async def start_sharded_download(task_dict: dict, task_queue: str | None = None)
         id=workflow_id,
         task_queue=queue,
     )
-    logger.info(f"Started sharded workflow {workflow_id} on queue {queue}")
+    logger.info(
+        f"Started sharded workflow {workflow_id} on queue {queue} "
+        f"(pollers={pollers if pollers is not None else 'unknown'})")
     return handle
 
 

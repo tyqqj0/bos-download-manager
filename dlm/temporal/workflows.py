@@ -702,8 +702,17 @@ class ShardedDownloadWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
 
-        # Step 6: Start child workflows on worker queues
-        workers_to_use = idle_workers[:num_shards] if idle_workers else ["download-workers"]
+        # Step 6: Start child workflows on worker queues.
+        # Empty idle pool falls back to the listing worker, not the literal
+        # string "download-workers": that key f-string'd into
+        # `download-download-workers` below, a queue no process polls, so every
+        # child sat RUNNING forever — has_live_workflow stays true, so nothing
+        # reconciles or re-dispatches it. The listing worker is the right host
+        # anyway (it holds the filtered filelist on local disk) and it serves
+        # this task's source by construction, since the coordinator ran on that
+        # source's queue.
+        fallback_key = listing_queue.removeprefix("download-")
+        workers_to_use = idle_workers[:num_shards] if idle_workers else [fallback_key]
         child_handles = []
 
         for i, (shard_id, partition) in enumerate(zip(shard_ids, partitions)):

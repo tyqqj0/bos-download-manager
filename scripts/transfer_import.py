@@ -237,6 +237,24 @@ def poll_until_done(dcloud, task_id, item):
     return False, f"timeout_polling after {ITEM_TIMEOUT_S}s"
 
 
+def select_manifest(builtin, custom, only):
+    """The transfer list a run operates on.
+
+    `--only` filters whatever manifest is in play. Filtering the built-in list
+    instead meant `--manifest x.json --only NAME` imported the built-in entry's
+    prefix (same name, different src) or exited "matches nothing" for a name
+    only the custom file has.
+    """
+    manifest = builtin if custom is None else custom
+    if not only:
+        return manifest
+    source = "--manifest file" if custom is not None else "built-in manifest"
+    picked = [m for m in manifest if m["name"] == only]
+    if not picked:
+        raise ValueError(f"--only {only!r} matches nothing in the {source}")
+    return picked
+
+
 def main():
     global STATE_PATH
     parser = argparse.ArgumentParser()
@@ -261,16 +279,16 @@ def main():
 
     STATE_PATH = args.state
 
-    manifest = MANIFEST
+    custom = None
     if args.manifest:
         with open(args.manifest) as f:
-            manifest = json.load(f)
-        for m in manifest:
+            custom = json.load(f)
+        for m in custom:
             assert m.get("name") and m.get("src") and m.get("category"), m
-    if args.only:
-        manifest = [m for m in MANIFEST if m["name"] == args.only]
-        if not manifest:
-            sys.exit(f"--only {args.only!r} matches nothing in the manifest")
+    try:
+        manifest = select_manifest(MANIFEST, custom, args.only)
+    except ValueError as e:
+        sys.exit(str(e))
 
     cfg = load_config()
     user, pw = os.environ.get("DCLOUD_USER"), os.environ.get("DCLOUD_PASS")

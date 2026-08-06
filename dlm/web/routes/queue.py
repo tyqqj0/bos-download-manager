@@ -218,6 +218,25 @@ async def retry_task(body: dict):
             "refusing to re-download. Add a new task if that is really wanted."
         )}
 
+    # Terminate before touching the rows, in the order /queue/reshard uses.
+    # `paused` only cancels cooperatively, so shard rows can still read
+    # "running" for minutes while a batch drains; deleting those rows without
+    # closing their workflows makes the shards invisible to
+    # get_running_shards() — busy_servers then frees hosts that are still
+    # writing to /data/staging, auto_dispatch stacks a second pipeline on them,
+    # and the re-dispatched coordinator collides with the old children on their
+    # deterministic IDs. terminate_workflow_and_wait also needs the shard rows
+    # to find those children, which is the second reason this cannot run after
+    # the DELETE.
+    live = [s for s in shards if (s.get("status") or "") in ("running", "pending")]
+    if live:
+        from ..temporal_client import terminate_workflow_and_wait
+        if not await terminate_workflow_and_wait(task_id):
+            return {"error": (
+                f"{len(live)} shard workflow(s) did not close within timeout — "
+                "task state unchanged, retry later"
+            )}
+
     def do_update():
         retry_count = (task.get("retry_count") or 0) + 1
         snapshot.update_task_progress(

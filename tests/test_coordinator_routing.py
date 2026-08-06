@@ -29,6 +29,7 @@ from dlm.web.fleet import (
     MS_COORDINATOR_QUEUE,
     SHARED_COORDINATOR_QUEUE,
     coordinator_queue,
+    polled_queues,
     source_for_worker,
     worker_coordinator_queue,
     worker_serves,
@@ -36,16 +37,29 @@ from dlm.web.fleet import (
 
 ALL_WORKERS = [f"w{i}" for i in range(1, 8)] + [f"bj{i}" for i in range(1, 10)]
 
+# How dlm/temporal/__main__.py is invoked per host, from scripts/deploy-workers.sh:
+# HK nodes get no --task-queue (so the shared HK queue), bj nodes get their own.
+def launch_task_queue(server_key: str) -> str | None:
+    return f"download-{server_key}" if server_key.startswith("bj") else None
 
-def polled_queues(server_key: str) -> list[str]:
-    """The queues a worker registers, mirroring dlm/temporal/__main__.py:
-    its --task-queue (personal for bj*, the shared HK queue for w*), its
-    personal queue, and the shared coordinator queue for its source."""
-    task_queue = (f"download-{server_key}" if server_key.startswith("bj")
-                  else SHARED_COORDINATOR_QUEUE)
-    personal = f"download-{server_key}"
-    return list(dict.fromkeys([task_queue, personal,
-                               worker_coordinator_queue(server_key)]))
+
+# The expectation is written out rather than derived from the routing helpers:
+# a test that computes the answer the same way production does can only restate
+# the implementation. bj nodes must end up on the ModelScope coordinator queue,
+# w nodes on the HK one, and every node on its own personal queue.
+EXPECTED_QUEUES = {
+    **{f"w{i}": ["download-workers", f"download-w{i}"] for i in range(1, 8)},
+    **{f"bj{i}": [f"download-bj{i}", "download-ms-workers"] for i in range(1, 10)},
+}
+
+
+@pytest.mark.parametrize("server_key", ALL_WORKERS)
+def test_worker_registers_exactly_the_queues_it_should(server_key):
+    """Pins the worker half of the fix against literal queue names. Dropping
+    the shared-coordinator entry from fleet.polled_queues — the regression that
+    reintroduces the ModuleNotFoundError — fails here."""
+    assert sorted(polled_queues(server_key, launch_task_queue(server_key))) == sorted(
+        EXPECTED_QUEUES[server_key])
 
 
 def test_modelscope_coordinator_does_not_go_to_the_hk_queue():
@@ -62,13 +76,14 @@ def test_every_non_modelscope_source_keeps_the_hk_queue(source):
 
 @pytest.mark.parametrize("server_key", ALL_WORKERS)
 def test_every_worker_polls_the_queue_its_own_sources_dispatch_to(server_key):
-    """The load-bearing invariant. Before the fix this failed for bj1-bj9:
-    coordinator_queue('modelscope') was 'download-workers', which no bj node
-    polls."""
+    """The load-bearing invariant, joining the two halves at their real entry
+    points. Before the fix this failed for bj1-bj9: coordinator_queue(
+    'modelscope') was 'download-workers', which no bj node polls."""
+    registered = polled_queues(server_key, launch_task_queue(server_key))
     for source in ("hf", "modelscope", "wget"):
         if not worker_serves(server_key, source):
             continue
-        assert coordinator_queue(source) in polled_queues(server_key), (
+        assert coordinator_queue(source) in registered, (
             f"{server_key} serves {source} but does not poll "
             f"{coordinator_queue(source)}"
         )
@@ -78,10 +93,11 @@ def test_every_worker_polls_the_queue_its_own_sources_dispatch_to(server_key):
 def test_no_worker_polls_a_coordinator_queue_for_a_source_it_cannot_serve(server_key):
     """The other direction: an HK node must not be handed ModelScope
     coordinators, or the SDK lottery comes back."""
+    registered = polled_queues(server_key, launch_task_queue(server_key))
     for source in ("hf", "modelscope"):
         if worker_serves(server_key, source):
             continue
-        assert coordinator_queue(source) not in polled_queues(server_key)
+        assert coordinator_queue(source) not in registered
 
 
 @pytest.mark.parametrize("server_key", ALL_WORKERS)

@@ -111,7 +111,6 @@ async def run_worker(args):
     logger.info(f"Connecting to Temporal at {args.temporal_host}...")
     client = await Client.connect(args.temporal_host)
 
-    task_queue = args.task_queue or "download-workers"
     personal_queue = f"download-{args.server_key}"
 
     # Export server key so activities can report it
@@ -156,9 +155,8 @@ async def run_worker(args):
     # on w6 and died with `No module named 'modelscope'` (t-20260806-cbf39e).
     # Each node now also polls the shared coordinator queue for the source it
     # serves; see dlm/web/fleet.coordinator_queue for the dispatch half.
-    from ..web.fleet import worker_coordinator_queue
-    shared_queue = worker_coordinator_queue(args.server_key)
-    queues = list(dict.fromkeys([task_queue, personal_queue, shared_queue]))
+    from ..web.fleet import polled_queues as _polled_queues
+    queues = _polled_queues(args.server_key, args.task_queue)
     logger.info(f"Starting worker: server_key={args.server_key}, queues={queues}")
     logger.info(f"Registered {len(workflows)} workflows, {len(activities)} activities")
 

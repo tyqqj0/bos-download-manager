@@ -167,6 +167,26 @@ def worker_coordinator_queue(server_key: str) -> str:
     return coordinator_queue(source_for_worker(server_key))
 
 
+def polled_queues(server_key: str, task_queue: str | None = None) -> list[str]:
+    """Every queue a worker process registers a poller on.
+
+    This lives here rather than inline in dlm/temporal/__main__.py so the
+    routing invariant can be tested against the code production runs: the
+    original defect was exactly a worker not polling the queue its
+    dispatcher targets, and a test that re-derived the list from
+    worker_coordinator_queue could not have caught it.
+
+    `task_queue` is the --task-queue argument (a bj node passes its own
+    personal queue, which dedupes away).
+    """
+    queues = [
+        task_queue or SHARED_COORDINATOR_QUEUE,
+        f"download-{server_key}",
+        worker_coordinator_queue(server_key),
+    ]
+    return list(dict.fromkeys(queues))
+
+
 def pending_sources(tasks: list[dict]) -> set[str]:
     """Sources that currently have queued work waiting for a worker."""
     return {(t.get("source") or "hf") for t in tasks if t.get("status") == "pending"}
