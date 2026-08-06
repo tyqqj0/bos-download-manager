@@ -753,8 +753,16 @@ class ShardedDownloadWorkflow:
         total_bytes_up = 0
         failed_shards = []
 
+        # A shard counts as successful only if it positively says so. Every
+        # other outcome — raised, cancelled, returned status="failed", or a
+        # shape this loop doesn't recognise — lands in failed_shards, because
+        # the alternative is reporting a task `done` that downloaded nothing.
         for (shard_id, _), result in zip(child_handles, results):
-            if isinstance(result, Exception):
+            # BaseException, not Exception: gather(return_exceptions=True)
+            # hands back asyncio.CancelledError for a cancelled child, and
+            # that is not an Exception — it matched neither branch here and
+            # was silently dropped, i.e. counted as a shard that succeeded.
+            if isinstance(result, BaseException):
                 failed_shards.append(shard_id)
                 try:
                     await workflow.execute_activity(
@@ -765,8 +773,22 @@ class ShardedDownloadWorkflow:
                 except Exception:
                     pass
             elif isinstance(result, ShardResult):
+                # Bytes a shard moved before giving up are real — count them
+                # either way so the aggregate stays honest.
                 total_uploaded += result.files_uploaded
                 total_bytes_up += result.bytes_uploaded
+                # ShardWorkerWorkflow reports insufficient disk and batch
+                # failure as a NORMAL RETURN carrying status="failed", not as
+                # a raise. Ignoring .status here marked t-20260805-460d45
+                # (molmobot-data) `done` at 0 of 9611 GB on 2026-08-06 while
+                # its one shard row read `failed`. ShardResult.status defaults
+                # to "done", so the type alone never says "this succeeded" —
+                # only this check does. The shard already marked its own row
+                # failed on that path, so no update_shard_status call here.
+                if result.status != "done":
+                    failed_shards.append(shard_id)
+            else:
+                failed_shards.append(shard_id)
 
         # Final aggregation
         await workflow.execute_activity(
@@ -782,7 +804,17 @@ class ShardedDownloadWorkflow:
                 args=[task_id, "failed", None, None, None, None, None, error_msg],
                 start_to_close_timeout=timedelta(seconds=30),
             )
-            return TaskResult(status="failed", error=error_msg)
+            return TaskResult(
+                status="failed",
+                # Carried, not dropped: the counters are already computed, the
+                # legacy multi-worker path returns them on failure too, and a
+                # failed task should not also lose the record of what it did
+                # move. Nothing outside the workflow layer reads these — the
+                # dashboard aggregate comes from the shard rows above.
+                files_uploaded=total_uploaded,
+                bytes_uploaded=total_bytes_up,
+                error=error_msg,
+            )
 
         total_gb = total_bytes_up / (1024 ** 3)
         await workflow.execute_activity(
