@@ -272,7 +272,7 @@
                                 <button x-show="t.total_shards > 0"
                                         @click="fetchShards(t.id)"
                                         class="ml-1 px-1 py-0.5 bg-indigo-800 text-indigo-300 rounded text-[10px] hover:bg-indigo-700"
-                                        x-text="t.done_shards + '/' + t.total_shards + ' shards'"></button>
+                                        x-text="t.done_shards + '/' + t.total_shards + (t.dispatch_mode === 'pool' ? ' batches' : ' shards')"></button>
                             </td>
                             <td class="px-3 py-2">
                                 <div class="flex items-center gap-2">
@@ -394,7 +394,7 @@
         <div x-show="shardDetail !== null" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="closeShards()">
             <div class="bg-gray-800 rounded-lg p-6 w-[650px] max-h-[80vh] overflow-auto">
                 <div class="flex justify-between mb-3">
-                    <h3 class="font-bold">Shards</h3>
+                    <h3 class="font-bold" x-text="shardDispatchMode === 'pool' ? 'Batches' : 'Shards'"></h3>
                     <button @click="closeShards()" class="text-gray-400 hover:text-white text-xl">&times;</button>
                 </div>
                 <div x-show="shardDetail && shardDetail.length === 0" class="text-gray-500 text-sm">No shards found</div>
@@ -996,7 +996,8 @@
                 <div>
                     <label class="text-xs text-gray-400">Dispatch mode</label>
                     <select x-model="addForm.dispatch_mode" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
-                        <option value="sharded" selected>Sharded (default)</option>
+                        <option value="" selected x-text="'Server default (' + (defaultDispatchMode || '…') + ')'"></option>
+                        <option value="sharded">Sharded</option>
                         <option value="pool">Pool (work-stealing)</option>
                     </select>
                 </div>

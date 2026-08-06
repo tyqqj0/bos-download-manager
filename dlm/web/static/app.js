@@ -19,7 +19,15 @@ function app() {
         doctorFixing: false,
         doctorFindings: null,
         toast: { show: false, message: '', type: 'success' },
-        addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: 'sharded', no_dispatch: false, parsed: null, error: '' },
+        // '' means "whatever fleet.DEFAULT_DISPATCH_MODE resolves to server-side"
+        // — never hardcode a literal mode here, that just moves the bug that
+        // let the UI defeat a DLM_DEFAULT_DISPATCH_MODE flip (see submitAdd
+        // and defaultDispatchMode below).
+        addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: '', no_dispatch: false, parsed: null, error: '' },
+        // Populated from /api/dashboard's default_dispatch_mode (fetchDashboard)
+        // so the add-form select can show the live server default instead of
+        // a client-side guess.
+        defaultDispatchMode: '',
         transferTasks: [],
         transferSummary: {},
         transferPaused: false,
@@ -92,6 +100,7 @@ function app() {
                 if (data.status !== 'loading') {
                     this.dashboard = data;
                     this.lastSync = data.updated_at ? `Updated ${this.timeAgo(new Date(data.updated_at * 1000).toISOString())}` : '';
+                    if (data.default_dispatch_mode) this.defaultDispatchMode = data.default_dispatch_mode;
                 }
             } catch (e) { console.error('Dashboard fetch error:', e); }
         },
@@ -250,23 +259,27 @@ function app() {
         async submitAdd() {
             this.addForm.error = '';
             try {
+                const body = {
+                    url_or_repo: this.addForm.url,
+                    category: this.addForm.category,
+                    type: this.addForm.type,
+                    priority: this.addForm.priority,
+                    no_dispatch: this.addForm.no_dispatch,
+                };
+                // '' means "server default" (see addForm init) — omit the key
+                // entirely so the backend applies fleet.DEFAULT_DISPATCH_MODE
+                // instead of receiving an explicit empty-string override.
+                if (this.addForm.dispatch_mode) body.dispatch_mode = this.addForm.dispatch_mode;
                 const res = await fetch('/api/tasks', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        url_or_repo: this.addForm.url,
-                        category: this.addForm.category,
-                        type: this.addForm.type,
-                        priority: this.addForm.priority,
-                        dispatch_mode: this.addForm.dispatch_mode,
-                        no_dispatch: this.addForm.no_dispatch,
-                    })
+                    body: JSON.stringify(body)
                 });
                 if (res.ok) {
                     const data = await res.json();
                     this.showToast(`Added: ${data.task?.name || 'task'}`, 'success');
                     this.showAddModal = false;
-                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: 'sharded', no_dispatch: false, parsed: null, error: '' };
+                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: '', no_dispatch: false, parsed: null, error: '' };
                     await this.fetchTasks();
                 } else {
                     const data = await res.json();
@@ -374,8 +387,30 @@ function app() {
                     body: JSON.stringify({ actions: actions || [] })
                 });
                 const data = await res.json();
-                const total = (data.reset_stuck?.length || 0) + (data.skip_zombie?.length || 0) + (data.restart_dead?.length || 0);
-                this.showToast(`Fixed ${total} issues`, 'success');
+                // Sum every real fix-result key doctor.py's fix() returns.
+                // `restart_dead` was never one of them ("There is deliberately
+                // no restart worker action" per that route's docstring) and
+                // redispatch_orphaned/redispatch_pool were missing entirely —
+                // so the default "Fix All" button (actions: []) always
+                // reported 0 even when it redispatched sharded orphans.
+                const total = (data.redispatch_orphaned?.length || 0)
+                    + (data.redispatch_pool?.length || 0)
+                    + (data.reset_stuck?.length || 0)
+                    + (data.skip_zombie?.length || 0);
+                let message = `Fixed ${total} issues`;
+                // M5: reset_stuck/redispatch_orphaned deliberately never act on
+                // a pool task (resetting one while its coordinator is still
+                // alive double-dispatches and wedges that source for ~15 min —
+                // see doctor.py's fix() docstring). The response explains why
+                // per skipped task in skipped_pool_tasks; surface it instead of
+                // dropping it, or "Fix All" on a pool orphan silently no-ops.
+                const skippedPool = data.skipped_pool_tasks || [];
+                if (skippedPool.length > 0) {
+                    const shown = skippedPool.slice(0, 3).join(' | ');
+                    const extra = skippedPool.length - Math.min(3, skippedPool.length);
+                    message += `. Skipped ${skippedPool.length} pool task(s): ${shown}` + (extra > 0 ? ` (+${extra} more)` : '');
+                }
+                this.showToast(message, total === 0 && skippedPool.length > 0 ? 'error' : 'success');
                 this.showDoctorModal = false;
                 await this.fetchDashboard();
                 await this.fetchTasks();

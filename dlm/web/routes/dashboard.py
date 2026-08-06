@@ -11,6 +11,12 @@ router = APIRouter(tags=["dashboard"])
 @router.get("/dashboard")
 async def get_dashboard():
     """Dashboard summary: total progress, status counts, worker overview."""
+    # Module constant (env-derived at import time), not a DB read — no
+    # executor hop needed to read it. Exposed so the add-task form can show
+    # the live server default instead of a client-side literal that would
+    # silently drift from it the moment DLM_DEFAULT_DISPATCH_MODE flips.
+    from ..fleet import DEFAULT_DISPATCH_MODE
+
     data = cache.get_dashboard()
     if not data:
         # Cold cache (first ~10s after start, or a wedged scheduler): fall back
@@ -21,5 +27,5 @@ async def get_dashboard():
             init_db()
             return get_dashboard_summary()
 
-        return await run_blocking(_live)
-    return data
+        data = await run_blocking(_live)
+    return {**data, "default_dispatch_mode": DEFAULT_DISPATCH_MODE}

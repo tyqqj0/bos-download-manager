@@ -56,6 +56,13 @@ def _task_for_frontend(t: dict) -> dict:
         "transfer_error": t.get("transfer_error"),
         "total_shards": t.get("total_shards", 0) or 0,
         "done_shards": t.get("done_shards", 0) or 0,
+        # The main table's row needs to tell a pool task's unit (batches)
+        # from a sharded task's (shards) without a second round trip — see
+        # index.html's per-task "N/M shards" button. Coalesced the same way
+        # every other dispatch_mode consumer does (queue.py, doctor.py):
+        # the column can be NULL on an old row, and NULL must read as the
+        # pre-pool default, not as a falsy "no mode".
+        "dispatch_mode": t.get("dispatch_mode") or "sharded",
     }
 
 
