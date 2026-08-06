@@ -698,10 +698,18 @@ def test_auto_dispatch_claim_resets_stale_pool_phase_to_listing(db, monkeypatch)
     assert row["coordinator_phase"] == "listing"
 
 
-def test_reconcile_redispatch_resets_stale_pool_phase_to_listing(db, monkeypatch):
+def test_reconcile_redispatch_resets_stale_sharded_phase_to_listing(db, monkeypatch):
     """reconcile()'s orphan re-dispatch refreshes claimed_at *so the guard
     covers the new coordinator* — which only works if the phase it reads
-    belongs to that coordinator and not to the dead one."""
+    belongs to that coordinator and not to the dead one.
+
+    Was a pool-mode test before T9 (decision C): T9 moves a stale pool
+    orphan onto report["pool_orphaned"] instead of this re-dispatch path
+    entirely (see tests/test_pool_observability.py), so this task's
+    coordinator_phase would never be touched here for pool anymore — this
+    is now sharded to keep covering the write side of CLAIM_RESET_PHASE_SQL
+    for the path G1 still requires to redispatch exactly as before.
+    """
     from dlm.web import reconciler
     import dlm.web.temporal_client as tc
 
@@ -714,10 +722,9 @@ def test_reconcile_redispatch_resets_stale_pool_phase_to_listing(db, monkeypatch
     monkeypatch.setattr(tc, "running_workflows", fake_running)
     monkeypatch.setattr(tc, "start_task_download", fake_start)
 
-    _task(db, "t-orphan", status="downloading", mode="pool", source="hf")
-    _set_phase(db, "t-orphan", "dispatching")
+    _task(db, "t-orphan", status="downloading", mode="sharded", source="hf")
     conn = db._conn()
-    with conn:  # stale past DEAD_THRESHOLD (1800s), no batch rows
+    with conn:  # stale past DEAD_THRESHOLD (1800s), no shard rows
         conn.execute(
             "UPDATE tasks SET updated_at = ? WHERE id = ?",
             (time.time() - 3600, "t-orphan"),
@@ -727,5 +734,5 @@ def test_reconcile_redispatch_resets_stale_pool_phase_to_listing(db, monkeypatch
 
     assert "t-orphan" in report["redispatched"], report
     row = db.get_task("t-orphan")
-    assert row["coordinator_phase"] == "listing"
+    assert row["coordinator_phase"] is None  # sharded: CASE writes its own value back
     assert row["claimed_at"] > time.time() - 60
