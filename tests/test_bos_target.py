@@ -13,7 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from dlm.constants import DATA_BUCKET, MODEL_BUCKET
-from dlm.core.bos import bos_target
+import pytest
+
+from dlm.core.bos import MULTIPART_THRESHOLD, bos_target, upload_file
 
 
 @dataclass
@@ -46,3 +48,57 @@ def test_prefix_always_ends_in_a_slash():
     # would shift every relative key by one character.
     for task in (T("a", "b"), T("a"), T("a", type="model")):
         assert bos_target(task)[1].endswith("/")
+
+
+# ---------------------------------------------------------------------------
+# The multipart upload's silent failure.
+# ---------------------------------------------------------------------------
+
+class _FakeBos:
+    """Stands in for BosClient. `multipart_ok=False` reproduces the driver's
+    abort-and-return-False path."""
+
+    def __init__(self, multipart_ok=True):
+        self.multipart_ok = multipart_ok
+        self.super_calls = []
+        self.plain_calls = []
+
+    def put_super_object_from_file(self, bucket, key, local_path, **kw):
+        self.super_calls.append(key)
+        return True if self.multipart_ok else False
+
+    def put_object_from_file(self, bucket, key, local_path, **kw):
+        self.plain_calls.append(key)
+        return object()
+
+
+def _big(tmp_path):
+    p = tmp_path / "big.bin"
+    p.write_bytes(b"x" * (MULTIPART_THRESHOLD + 1))
+    return p
+
+
+def test_upload_file_raises_when_multipart_returns_false(tmp_path):
+    """`put_super_object_from_file` aborts the upload and returns False on a
+    failed part — no exception. Callers delete their local copy once
+    upload_file returns, so this must raise or the bytes are lost while the
+    task reports success."""
+    client = _FakeBos(multipart_ok=False)
+    with pytest.raises(RuntimeError, match="multipart upload failed"):
+        upload_file(client, "auwomo-data", "manipulation/X/big.bin", str(_big(tmp_path)))
+    assert client.super_calls == ["manipulation/X/big.bin"]
+
+
+def test_upload_file_returns_normally_when_multipart_succeeds(tmp_path):
+    client = _FakeBos(multipart_ok=True)
+    upload_file(client, "auwomo-data", "manipulation/X/big.bin", str(_big(tmp_path)))
+    assert client.plain_calls == []
+
+
+def test_small_files_still_take_the_single_put_path(tmp_path):
+    p = tmp_path / "small.bin"
+    p.write_bytes(b"y" * 1024)
+    client = _FakeBos(multipart_ok=False)  # would fail if routed to multipart
+    upload_file(client, "auwomo-data", "manipulation/X/small.bin", str(p))
+    assert client.plain_calls == ["manipulation/X/small.bin"]
+    assert client.super_calls == []

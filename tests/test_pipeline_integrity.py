@@ -50,11 +50,15 @@ def _engine(tmp_path, monkeypatch, source="hf") -> pipeline.PipelineEngine:
 # ---------------------------------------------------------------------------
 
 def test_robodojo_regression_modelscope_short_file_never_uploaded(tmp_path, monkeypatch):
-    """RoboDojo regression: a truncated/empty ModelScope SDK download must be
+    """RoboDojo regression: a truncated ModelScope SDK download must be
     treated as a failed attempt (retried, then counted), never handed to the
     uploader as if it succeeded. This was the root cause of the incident —
     the SDK path was the only one of three download paths with no
-    post-download size check, so a 0-byte file sailed through as "done"."""
+    post-download size check, so a short file sailed through as "done".
+
+    Short-but-non-zero is the retryable half: some bytes arrived, so the
+    endpoint is alive and the next attempt may complete. Zero bytes is the
+    other half, and is terminal — see the test below."""
     monkeypatch.setattr(pipeline, "MAX_FILE_RETRIES", 2)
     monkeypatch.setattr(pipeline, "STALL_CHECK_INTERVAL", 0.01)
 
@@ -69,7 +73,7 @@ def test_robodojo_regression_modelscope_short_file_never_uploaded(tmp_path, monk
     def fake_dataset_file_download(dataset_id, file_path, local_dir, token=None):
         dest = Path(local_dir) / file_path
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"")  # 0 bytes, like the incident — SDK call "succeeds"
+        dest.write_bytes(b"x" * 1024)  # truncated, like the incident
         calls.append(file_path)
         return str(dest)
 
@@ -88,6 +92,53 @@ def test_robodojo_regression_modelscope_short_file_never_uploaded(tmp_path, monk
     while not queue.empty():
         queued.append(queue.get_nowait())
     assert queued == [None], "a failed download must never reach the uploader"
+
+
+def test_modelscope_zero_byte_response_is_terminal_not_retried(tmp_path, monkeypatch):
+    """ModelScope serves `HTTP 200` + `Content-Length: 0` for files it still
+    lists at hundreds of MB (14 paths under `data/RoboDojo_depth/`, verified
+    2026-08-07 — the blob is gone on their side, both via the SDK and the
+    raw-file endpoint). Retrying re-asks a dead endpoint every ~15s for the
+    life of the shard, so the file must be counted failed once and skipped."""
+    monkeypatch.setattr(pipeline, "MAX_FILE_RETRIES", 3)
+    monkeypatch.setattr(pipeline, "STALL_CHECK_INTERVAL", 0.01)
+
+    engine = _engine(tmp_path, monkeypatch, source="modelscope")
+    engine._executor = ThreadPoolExecutor(max_workers=2)
+    engine._concurrency = 2
+
+    file_info = FileInfo(
+        path="data/RoboDojo_depth/fold_clothes/arx_x5/data/episode_0000094.hdf5",
+        size=688_008_469,
+    )
+
+    calls = []
+
+    def fake_dataset_file_download(dataset_id, file_path, local_dir, token=None):
+        dest = Path(local_dir) / file_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"")  # upstream's empty body
+        calls.append(file_path)
+        return str(dest)
+
+    fake_module = types.ModuleType("modelscope")
+    fake_module.dataset_file_download = fake_dataset_file_download
+    monkeypatch.setitem(sys.modules, "modelscope", fake_module)
+
+    queue = asyncio.Queue()
+    asyncio.run(engine._producer([file_info], queue))
+
+    assert len(calls) == 1, "an empty upstream must be asked once, not MAX_FILE_RETRIES times"
+    assert engine.stats.failed_files == 1
+    assert engine.stats.downloaded_files == 0
+
+    # And the 0 bytes must not exist on disk for the uploader to find.
+    assert not (engine.staging_dir / file_info.path).exists()
+
+    queued = []
+    while not queue.empty():
+        queued.append(queue.get_nowait())
+    assert queued == [None]
 
 
 # ---------------------------------------------------------------------------

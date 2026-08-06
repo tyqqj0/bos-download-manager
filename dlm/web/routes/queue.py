@@ -612,7 +612,50 @@ async def query_idle_workers_api(source: str = "hf", exclude_task: str = ""):
                 continue
             idle.append(key)
         return {"workers": idle}
-    return await _run_blocking(do_query)
+
+    result = await _run_blocking(do_query)
+    return {"workers": await _drop_unpolled(result["workers"])}
+
+
+async def _drop_unpolled(keys: list[str]) -> list[str]:
+    """Remove workers whose personal queue nothing polls.
+
+    Heartbeat liveness is not the same question as "will Temporal hand this
+    node work". A worker reports under two hostnames — `{key}@temporal` and
+    `{key}@sidecar` — and `merge_workers` keeps the node alive as long as
+    *either* is fresh, so a Temporal process that died (the observed
+    `No module named 'modelscope'` and OOM cases) leaves a node looking
+    perfectly idle while `download-{key}` has zero pollers. A child shard
+    started there sits RUNNING forever, which makes `has_live_workflow` true,
+    so reconcile only records the task stale and `redispatch_orphaned` skips
+    it: one permanently wedged shard per dispatch, and the coordinator's
+    gather over its children never returns.
+
+    `start_sharded_download` already refuses the coordinator queue for this
+    reason; this is the same gate for the child queues. Failure to *ask*
+    Temporal (None) leaves the worker in the pool — unknown is not zero, or
+    one RPC hiccup empties the fleet.
+    """
+    if not keys:
+        return keys
+    try:
+        from ..temporal_client import connected_client, queue_poller_count
+        client = await connected_client()
+    except Exception as e:  # pragma: no cover - needs a live server
+        logger.warning(f"idle-workers: cannot reach Temporal to check pollers: {e}")
+        return keys
+
+    kept = []
+    for key in keys:
+        pollers = await queue_poller_count(client, f"download-{key}")
+        if pollers == 0:
+            logger.warning(
+                f"idle-workers: dropping {key} — nothing polls download-{key} "
+                f"(heartbeat alive, Temporal worker not running)"
+            )
+            continue
+        kept.append(key)
+    return kept
 
 
 @router.post("/queue/reshard")

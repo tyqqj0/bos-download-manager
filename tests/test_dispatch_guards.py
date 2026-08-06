@@ -218,3 +218,66 @@ def test_no_only_returns_the_whole_manifest_in_play():
     mod = _transfer_import_module()
     assert mod.select_manifest(BUILTIN, CUSTOM, "") == CUSTOM
     assert mod.select_manifest(BUILTIN, None, "") == BUILTIN
+
+
+# --- the shard pool must exclude queues nothing polls -----------------------
+
+def _patch_pollers(monkeypatch, per_queue, connect_error=False):
+    async def fake_connected():
+        if connect_error:
+            raise RuntimeError("temporal unreachable")
+        return _FakeClient()
+
+    async def fake_count(_client, queue):
+        return per_queue.get(queue, 0)
+
+    monkeypatch.setattr(temporal_client, "connected_client", fake_connected)
+    monkeypatch.setattr(temporal_client, "queue_poller_count", fake_count)
+
+
+def test_idle_pool_drops_a_worker_whose_queue_has_no_pollers(monkeypatch):
+    """The `{key}@sidecar` heartbeat keeps a node looking alive after its
+    Temporal process dies. A child shard started on that node's queue sits
+    RUNNING forever and no reconciler can reclaim it."""
+    from dlm.web.routes import queue as queue_routes
+
+    _patch_pollers(monkeypatch, {"download-bj1": 2, "download-bj3": 2})
+    kept = asyncio.run(queue_routes._drop_unpolled(["bj1", "bj2", "bj3"]))
+    assert kept == ["bj1", "bj3"]
+
+
+def test_idle_pool_keeps_a_worker_whose_poller_count_is_unknown(monkeypatch):
+    """None means Temporal could not be asked. Treating that as zero would
+    empty the whole fleet on one RPC hiccup."""
+    from dlm.web.routes import queue as queue_routes
+
+    async def fake_connected():
+        return _FakeClient()
+
+    async def fake_count(_client, _queue):
+        return None
+
+    monkeypatch.setattr(temporal_client, "connected_client", fake_connected)
+    monkeypatch.setattr(temporal_client, "queue_poller_count", fake_count)
+    assert asyncio.run(queue_routes._drop_unpolled(["bj1", "bj2"])) == ["bj1", "bj2"]
+
+
+def test_idle_pool_survives_temporal_being_unreachable(monkeypatch):
+    from dlm.web.routes import queue as queue_routes
+
+    _patch_pollers(monkeypatch, {}, connect_error=True)
+    assert asyncio.run(queue_routes._drop_unpolled(["w1", "w2"])) == ["w1", "w2"]
+
+
+def test_idle_pool_does_not_call_temporal_for_an_empty_pool(monkeypatch):
+    from dlm.web.routes import queue as queue_routes
+
+    calls = []
+
+    async def fake_connected():
+        calls.append(1)
+        return _FakeClient()
+
+    monkeypatch.setattr(temporal_client, "connected_client", fake_connected)
+    assert asyncio.run(queue_routes._drop_unpolled([])) == []
+    assert calls == []
