@@ -29,3 +29,35 @@ def db(tmp_path, monkeypatch):
     snapshot.init_db()
     yield snapshot
     snapshot._local = threading.local()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _never_touch_the_production_db(tmp_path_factory):
+    """Redirect snapshot.DB_PATH away from production for the WHOLE session.
+
+    `snapshot.DB_PATH` defaults to `/data/dlm.db` (snapshot.py:17) — the live
+    state source — and is only overridden by the `DLM_DB_PATH` env var.
+    `scripts/deploy-workers.sh:99` runs `python3 -m pytest tests/ -q` on S1 as
+    the deploy gate and does NOT set that variable, so on S1 any test that
+    reaches `snapshot.init_db()` without requesting the `db` fixture opens the
+    production database. Today that is prevented only by validation ordering
+    inside the endpoints under test — one reordered guard turns the deploy gate
+    into a writer against live state.
+
+    This is session-scoped and autouse so the redirect is in force before the
+    first test runs, whether or not that test asks for `db`. The per-test `db`
+    fixture still overrides it with its own isolated file; this is the floor,
+    not a replacement.
+    """
+    from dlm.queue import snapshot
+
+    fallback = tmp_path_factory.mktemp("dlm-session-db") / "fallback.db"
+    real_default = snapshot.DB_PATH
+    snapshot.DB_PATH = fallback
+    snapshot._local = threading.local()
+    assert "/data/dlm.db" not in str(snapshot.DB_PATH), (
+        f"refusing to run the suite against {real_default}"
+    )
+    yield
+    snapshot.DB_PATH = real_default
+    snapshot._local = threading.local()

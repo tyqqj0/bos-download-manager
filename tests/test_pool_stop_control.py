@@ -223,11 +223,34 @@ def test_reshard_pure_mode_flip_and_its_rejections(db, monkeypatch):
     assert db.get_task("t-flip2")["status"] == "downloading"      # unchanged
 
 
-def test_reshard_still_requires_task_id():
+def test_reshard_still_requires_task_id(db):
     from dlm.web.routes.queue import reshard_task
 
     out = _call(reshard_task({"dispatch_mode": "pool"}))
     assert "error" in out
+
+
+def test_reshard_rejects_a_negative_shard_count_instead_of_ignoring_it(db, monkeypatch):
+    """A negative shard_count is a typo, never "not supplied". Read as the
+    latter it takes the shard_count<1 branch, so the call terminates the
+    workflows and answers ok with the OLD count — the operator is told the
+    reshard happened and it did not."""
+    from dlm.web.routes.queue import reshard_task
+
+    calls: list = []
+    _stub_terminate(monkeypatch, calls)
+    _task(db, "t-neg", status="downloading", mode="sharded")
+    conn = db._conn()
+    with conn:
+        conn.execute("UPDATE tasks SET max_workers = 12 WHERE id = ?", ("t-neg",))
+
+    out = _call(reshard_task({"task_id": "t-neg", "shard_count": -1,
+                              "dispatch_mode": "sharded"}))
+
+    assert "error" in out
+    # rejected before anything irreversible: no terminate, count untouched
+    assert calls == []
+    assert db.get_task("t-neg")["max_workers"] == 12
 
 
 # ── supplementary: cancel_workflow / terminate_workflow_and_wait's own

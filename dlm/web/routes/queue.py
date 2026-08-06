@@ -911,6 +911,13 @@ async def reshard_task(body: dict):
     if requested_mode is not None and requested_mode not in VALID_DISPATCH_MODES:
         return {"error": f"invalid dispatch_mode={requested_mode!r}, "
                           f"expected one of {sorted(VALID_DISPATCH_MODES)}"}
+    # A negative shard_count is a typo, never "not supplied". Without this it
+    # takes the shard_count<1 branch below, so `{"shard_count": -1,
+    # "dispatch_mode": "sharded"}` would terminate the workflows and silently
+    # answer with the OLD count — an operator who asked for a reshard would be
+    # told ok and get no reshard.
+    if shard_count < 0:
+        return {"error": f"invalid shard_count={shard_count}, expected >= 1 (or omit it)"}
     if not task_id or (shard_count < 1 and requested_mode is None):
         return {"error": "task_id and (shard_count >= 1 or a valid dispatch_mode) are required"}
 
