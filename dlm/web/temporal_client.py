@@ -202,6 +202,138 @@ async def start_sharded_download(task_dict: dict):
     return handle
 
 
+class PoolPollerGateError(RuntimeError):
+    """Raised when a pool task's activity queue is under-polled.
+
+    Pool workers register activities on the shared pool-hf/pool-ms queue but
+    no workflow, so a start that lands with fewer live activity pollers than
+    the fleet's alive-worker count for that source would sit batches on a
+    queue nothing is draining — indistinguishable from "dispatched fine"
+    until the schedule_to_close timeout fires, hours later. Refusing here,
+    loudly, is the only way this gate has teeth: a silent fallback to
+    sharded would defeat it outright.
+    """
+
+
+async def _pool_poller_count(client: Client, queue_name: str) -> int:
+    """Live ACTIVITY-type pollers on a pool queue, via raw gRPC.
+
+    Pool workers register activities but no workflow — DescribeTaskQueue on
+    the WORKFLOW type (the type `Client` has no convenience method for
+    anyway) reads zero pollers even on a healthy fleet. There is no
+    `Client` method for this at all, so this goes straight at
+    `client.service_client.workflow_service.describe_task_queue` with the
+    ACTIVITY task_queue_type.
+    """
+    from temporalio.api.enums.v1 import TaskQueueType
+    from temporalio.api.taskqueue.v1 import TaskQueue
+    from temporalio.api.workflowservice.v1 import DescribeTaskQueueRequest
+
+    request = DescribeTaskQueueRequest(
+        namespace=client.namespace,
+        task_queue=TaskQueue(name=queue_name),
+        task_queue_type=TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY,
+    )
+    response = await client.service_client.workflow_service.describe_task_queue(
+        request, timeout=QUERY_TIMEOUT
+    )
+    return len(response.pollers)
+
+
+def _expected_pool_pollers(source: str) -> int:
+    """Alive workers that would serve this source's pool queue.
+
+    '池预期' per the plan: the number of currently-alive workers routed to
+    this source (`fleet.alive_workers` + `fleet.worker_serves`) — the same
+    fleet-state primitives auto_dispatch_pending uses to pick idle workers,
+    not a re-derivation.
+    """
+    from ..queue.snapshot import get_workers, init_db
+    from .fleet import alive_workers, worker_serves
+
+    init_db()
+    workers = alive_workers(get_workers())
+    return sum(1 for w in workers if worker_serves(w.get("server_key") or "", source))
+
+
+async def start_pool_download(task_dict: dict):
+    """Start a PoolDownloadWorkflow — work-stealing coordinator.
+
+    task_queue="download-workers" **explicitly**, matching
+    start_sharded_download: the coordinator itself (list/filter/chunk, then
+    the window loop) runs there, same as ShardedDownloadWorkflow — bj*
+    workers never poll that queue, so an MS pool task's coordinator still
+    lands on w* exactly like the sharded one does. Only the batches run on
+    the shared pool-hf/pool-ms queue (`dlm.temporal.workflows.
+    pool_task_queue`), which this function reads but never rebuilds.
+
+    Mode gate (plan change #2): refuses to start — raising
+    PoolPollerGateError rather than falling back to sharded — if that pool
+    queue's live ACTIVITY pollers are fewer than the fleet's alive-worker
+    count for this task's source.
+    """
+    from ..temporal.models import TaskInput
+    from ..temporal.workflows import PoolDownloadWorkflow, pool_task_queue
+
+    source = task_dict.get("source", "hf")
+    client = await connected_client()
+
+    queue_name = pool_task_queue(source)
+    expected = _expected_pool_pollers(source)
+    actual = await _pool_poller_count(client, queue_name)
+    if actual < expected:
+        msg = (
+            f"pool gate rejected task {task_dict.get('id')}: {queue_name} has "
+            f"{actual} activity poller(s), expected >= {expected} alive "
+            f"{source} worker(s)"
+        )
+        logger.critical(msg)
+        raise PoolPollerGateError(msg)
+
+    task_input = TaskInput(
+        id=task_dict["id"],
+        name=task_dict.get("name", ""),
+        repo_id=task_dict.get("repo_id", ""),
+        source=source,
+        type=task_dict.get("type", "dataset"),
+        category=task_dict.get("category", ""),
+        priority=task_dict.get("priority", 5),
+        size_gb=task_dict.get("size_gb", 0),
+    )
+
+    workflow_id = f"{WORKFLOW_ID_PREFIXES['PoolDownloadWorkflow']}{task_dict['id']}"
+    handle = await client.start_workflow(
+        PoolDownloadWorkflow.run,
+        task_input,
+        id=workflow_id,
+        task_queue="download-workers",
+    )
+    logger.info(
+        f"Started pool workflow {workflow_id} on queue download-workers "
+        f"({actual} activity pollers on {queue_name})"
+    )
+    return handle
+
+
+async def start_task_download(task: dict):
+    """Dispatch entry point: routes a task to its coordinator by dispatch_mode.
+
+    `start_download` (:121 above) is a legacy name already occupied — it's
+    still called by dlm/temporal/dispatch.py and scripts/migrate-tasks.py —
+    so this is a new function, not an overload. A missing/NULL dispatch_mode
+    means 'sharded' (every task row created before this task existed, and
+    every caller that still doesn't know about the column). An unrecognised
+    mode string is an error: silently falling back to sharded would hide a
+    caller bug instead of surfacing it.
+    """
+    mode = task.get("dispatch_mode") or "sharded"
+    if mode == "sharded":
+        return await start_sharded_download(task)
+    if mode == "pool":
+        return await start_pool_download(task)
+    raise ValueError(f"unknown dispatch_mode={mode!r} for task {task.get('id')}")
+
+
 async def _find_running_workflow_ids(client, task_id: str) -> list:
     """All RUNNING workflow IDs containing task_id — catches suffixed legacy
     IDs (e.g. dl-{task_id}-bjN-v3) that fixed patterns miss."""

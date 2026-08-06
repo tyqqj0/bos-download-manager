@@ -23,6 +23,7 @@ RECENT_CLOSED_LIMIT = 500  # cap on the unfiltered closed-workflow scan
 from .fleet import (  # noqa: E402
     DEAD_THRESHOLD,
     MIN_SHARD_DISK_GB as MIN_DISPATCH_DISK_GB,
+    POOL_MAX_CONCURRENT_TASKS,
     STALE_THRESHOLD,
     has_live_workflow,
 )
@@ -37,7 +38,7 @@ async def reconcile() -> dict:
         get_tasks_by_status, update_task_progress, get_shards_by_task,
         complete_task, init_db, _conn,
     )
-    from .temporal_client import running_workflows, start_sharded_download
+    from .temporal_client import running_workflows, start_task_download
 
     init_db()
     report = {
@@ -113,21 +114,23 @@ async def reconcile() -> dict:
             # (gives time for workflows that just started to appear)
             if stale_seconds > DEAD_THRESHOLD:
                 try:
-                    # Unified sharded path — the legacy DownloadDatasetWorkflow
-                    # has no BOS resume filter and must not be reachable here.
+                    # Unified dispatch entry — branches on dispatch_mode.
+                    # The legacy DownloadDatasetWorkflow has no BOS resume
+                    # filter and must not be reachable here.
                     # Refresh claimed_at so the listing-phase source guard
                     # covers this coordinator too.
+                    mode = task.get("dispatch_mode") or "sharded"
                     conn2 = _conn()
                     conn2.execute(
                         "UPDATE tasks SET claimed_at = ? WHERE id = ?",
                         (time.time(), task_id),
                     )
                     conn2.commit()
-                    await start_sharded_download(task)
+                    await start_task_download(task)
                     report["redispatched"].append(task.get("name", task_id))
                     logger.info(
                         f"Reconciler: re-dispatched {task.get('name', task_id)} "
-                        f"as sharded (orphaned {stale_seconds:.0f}s)"
+                        f"as {mode} (orphaned {stale_seconds:.0f}s)"
                     )
                 except Exception as e:
                     err_msg = str(e)
@@ -171,7 +174,7 @@ async def auto_dispatch_pending() -> dict:
     from ..queue.snapshot import (
         get_tasks_by_status, get_workers, get_running_shards, _conn, init_db,
     )
-    from .temporal_client import start_sharded_download
+    from .temporal_client import start_task_download
 
     init_db()
     report = {"dispatched": [], "errors": []}
@@ -202,6 +205,18 @@ async def auto_dispatch_pending() -> dict:
             return report
         pending.sort(key=lambda t: (t.get("priority", 5), t.get("created_at", "")))
 
+        # 3b. Pool admission cap (plan change #3): count *downloading* pool
+        # tasks per source. sources_in_listing (below) answers "is a
+        # coordinator still partitioning"; this answers the separate
+        # question "does this source already have as many pool tasks
+        # running as POOL_MAX_CONCURRENT_TASKS allows" — a pool source keeps
+        # admitting once its first task leaves listing, up to this cap.
+        pool_downloading_counts: dict = {}
+        for t in downloading:
+            if (t.get("dispatch_mode") or "sharded") == "pool":
+                src = t.get("source", "hf")
+                pool_downloading_counts[src] = pool_downloading_counts.get(src, 0) + 1
+
         # 4. Coordinator-race guard: a downloading task with no shard rows means
         #    its sharded coordinator is still listing/filtering — its workers
         #    look idle but will be claimed shortly. Don't dispatch that source
@@ -209,18 +224,37 @@ async def auto_dispatch_pending() -> dict:
         #    never refreshed by progress reports) so a legacy non-sharded task
         #    can't pin its source forever; a dead coordinator stops blocking
         #    after 15 min (reconcile() cleans it up).
+        #
+        #    The sharded criterion (NOT EXISTS shards) is scoped to
+        #    non-pool tasks and otherwise untouched — G1 requires it stay
+        #    byte-identical, and since no task's dispatch_mode was ever
+        #    'pool' before this task existed, that scoping changes nothing
+        #    for any row producible before now. A pool coordinator gets its
+        #    own criterion instead of sharing that one: it registers batch
+        #    rows into the same `shards` table once dispatch starts
+        #    (create_pool_batches), so "no rows yet" would either be
+        #    redundant with, or in a future world diverge from,
+        #    coordinator_phase — set to 'listing' at claim time (below) and
+        #    'dispatching' once create_pool_batches lands its rows
+        #    (routes/queue.py). Using coordinator_phase alone for pool tasks
+        #    keeps the two criteria independently meaningful and testable.
         conn = _conn()
         listing_cutoff = time.time() - 900
         rows = conn.execute(
             "SELECT DISTINCT t.source FROM tasks t "
             "WHERE t.status = 'downloading' "
             "AND t.claimed_at > ? "
-            "AND NOT EXISTS (SELECT 1 FROM shards s WHERE s.task_id = t.id)",
+            "AND ("
+            "  (COALESCE(t.dispatch_mode, 'sharded') != 'pool'"
+            "   AND NOT EXISTS (SELECT 1 FROM shards s WHERE s.task_id = t.id))"
+            "  OR (t.dispatch_mode = 'pool' AND t.coordinator_phase = 'listing')"
+            ")",
             (listing_cutoff,),
         ).fetchall()
         sources_in_listing = {r[0] for r in rows}
 
-        # 5. Dispatch: unified sharded path for all sources.
+        # 5. Dispatch: unified entry point (start_task_download) for all
+        #    sources and both dispatch modes.
         #    Source routing: ModelScope → bj* workers, HuggingFace → w* workers
         for worker in idle_workers:
             if not pending:
@@ -242,6 +276,9 @@ async def auto_dispatch_pending() -> dict:
                 source = t.get("source", "hf")
                 if source in sources_in_listing:
                     continue  # a coordinator for this source is still partitioning
+                t_mode = t.get("dispatch_mode") or "sharded"
+                if t_mode == "pool" and pool_downloading_counts.get(source, 0) >= POOL_MAX_CONCURRENT_TASKS:
+                    continue  # this source already has its full share of pool tasks
                 if not worker_serves(server_key, source):
                     continue  # ModelScope → bj*, everything else → w*
                 task = pending.pop(i)
@@ -253,13 +290,26 @@ async def auto_dispatch_pending() -> dict:
             # Optimistic lock: claim status only. server stays NULL — the
             # coordinator assigns servers per shard, and a task-level server
             # would count this worker as busy in its own idle query.
+            #
+            # A pool task also gets coordinator_phase='listing' in the same
+            # claim — the write side of decision A (nothing else in the repo
+            # sets this column). A sharded claim's SQL is untouched.
             now_ts = time.time()
-            cursor = conn.execute(
-                "UPDATE tasks SET status = 'downloading', server = NULL, "
-                "updated_at = ?, claimed_at = ? "
-                "WHERE id = ? AND status = 'pending'",
-                (now_ts, now_ts, task["id"]),
-            )
+            task_mode = task.get("dispatch_mode") or "sharded"
+            if task_mode == "pool":
+                cursor = conn.execute(
+                    "UPDATE tasks SET status = 'downloading', server = NULL, "
+                    "coordinator_phase = 'listing', updated_at = ?, claimed_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (now_ts, now_ts, task["id"]),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE tasks SET status = 'downloading', server = NULL, "
+                    "updated_at = ?, claimed_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (now_ts, now_ts, task["id"]),
+                )
             conn.commit()
 
             if cursor.rowcount == 0:
@@ -268,15 +318,19 @@ async def auto_dispatch_pending() -> dict:
             # Guard the source immediately — even an "already started" race
             # below must not let a second coordinator spawn this cycle
             sources_in_listing.add(task.get("source", "hf"))
+            if task_mode == "pool":
+                pool_downloading_counts[task.get("source", "hf")] = (
+                    pool_downloading_counts.get(task.get("source", "hf"), 0) + 1
+                )
 
             try:
-                await start_sharded_download(task)
+                await start_task_download(task)
                 report["dispatched"].append({
                     "task": task.get("name", task["id"]),
-                    "worker": "sharded",
-                    "mode": "sharded",
+                    "worker": task_mode,
+                    "mode": task_mode,
                 })
-                logger.info(f"Auto-dispatch: {task.get('name')} → sharded coordinator")
+                logger.info(f"Auto-dispatch: {task.get('name')} → {task_mode} coordinator")
             except Exception as e:
                 err_msg = str(e).lower()
                 if "already started" in err_msg:

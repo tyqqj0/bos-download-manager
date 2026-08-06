@@ -954,12 +954,21 @@
                     </select>
                 </div>
             </div>
-            <div>
-                <label class="text-xs text-gray-400">Type</label>
-                <select x-model="addForm.type" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
-                    <option value="dataset">Dataset</option>
-                    <option value="model">Model</option>
-                </select>
+            <div class="grid grid-cols-2 gap-3">
+                <div>
+                    <label class="text-xs text-gray-400">Type</label>
+                    <select x-model="addForm.type" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
+                        <option value="dataset">Dataset</option>
+                        <option value="model">Model</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">Dispatch mode</label>
+                    <select x-model="addForm.dispatch_mode" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
+                        <option value="sharded" selected>Sharded (default)</option>
+                        <option value="pool">Pool (work-stealing)</option>
+                    </select>
+                </div>
             </div>
             <div class="flex items-center gap-2">
                 <input type="checkbox" x-model="addForm.no_dispatch" id="no-dispatch">

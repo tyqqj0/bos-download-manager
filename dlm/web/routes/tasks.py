@@ -136,14 +136,24 @@ class AddTaskRequest(BaseModel):
     name: Optional[str] = None
     size_gb: float = 0.0
     no_dispatch: bool = False
+    dispatch_mode: Optional[str] = None
 
 
 @router.post("/tasks")
 async def add_task(req: AddTaskRequest):
     """Add a new download task — saves to pending, auto_dispatch picks it up."""
+    VALID_DISPATCH_MODES = {"sharded", "pool"}
+    if req.dispatch_mode is not None and req.dispatch_mode not in VALID_DISPATCH_MODES:
+        raise HTTPException(
+            400,
+            f"invalid dispatch_mode={req.dispatch_mode!r}, "
+            f"expected one of {sorted(VALID_DISPATCH_MODES)}",
+        )
+
     def _do():
         from ...core.parser import parse_repo
         from ...queue.snapshot import get_all_tasks, upsert_task, init_db
+        from ..fleet import DEFAULT_DISPATCH_MODE
         import uuid
         from datetime import datetime, timezone
 
@@ -191,6 +201,7 @@ async def add_task(req: AddTaskRequest):
             "speed_mbps": 0,
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "celery_task_id": task_id,
+            "dispatch_mode": req.dispatch_mode or DEFAULT_DISPATCH_MODE,
         }
 
         upsert_task(task_meta)

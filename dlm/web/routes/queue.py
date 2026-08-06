@@ -72,12 +72,22 @@ async def add_to_queue(body: dict):
         priority: int — 0 (highest) to 9 (lowest)
         source: str — "hf" or "modelscope"
         shard_count: int (optional) — target shard count (0 = auto). Alias: split_workers.
+        dispatch_mode: str (optional) — "sharded" or "pool". Defaults to
+            fleet.DEFAULT_DISPATCH_MODE (grayscale period: "sharded").
     """
     from ...core.parser import parse_repo
+    from ..fleet import DEFAULT_DISPATCH_MODE
+
+    VALID_DISPATCH_MODES = {"sharded", "pool"}
 
     repo_id = body.get("repo_id", "").strip()
     if not repo_id:
         return {"error": "repo_id is required"}
+
+    dispatch_mode = body.get("dispatch_mode") or DEFAULT_DISPATCH_MODE
+    if dispatch_mode not in VALID_DISPATCH_MODES:
+        return {"error": f"invalid dispatch_mode={dispatch_mode!r}, "
+                          f"expected one of {sorted(VALID_DISPATCH_MODES)}"}
 
     parsed = parse_repo(repo_id)
     source = body.get("source", parsed.get("source", "hf"))
@@ -103,6 +113,7 @@ async def add_to_queue(body: dict):
         "progress_pct": 0,
         "speed_mbps": 0,
         "max_workers": shard_count,
+        "dispatch_mode": dispatch_mode,
         "created_at": _now(),
     }
 
@@ -275,7 +286,7 @@ async def preempt_for_task(body: dict):
     if not urgent_id:
         return {"error": "urgent_task_id is required"}
 
-    from ..temporal_client import cancel_workflow, start_sharded_download
+    from ..temporal_client import cancel_workflow, start_task_download
 
     def do_read():
         snapshot.init_db()
@@ -337,9 +348,10 @@ async def preempt_for_task(body: dict):
         return snapshot.get_task(urgent_id)
     task = await _run_blocking(do_claim)
 
-    # 3) Start the workflow (unified sharded path — BOS resume filter included)
+    # 3) Start the workflow (unified dispatch entry — branches on
+    #    dispatch_mode; BOS resume filter included on the sharded path)
     try:
-        await start_sharded_download(task)
+        await start_task_download(task)
     except Exception as e:
         if "already started" not in str(e).lower():
             def do_revert():
@@ -513,6 +525,14 @@ async def create_pool_batches(body: dict):
                     "WHERE task_id=? AND status!='done'",
                     (task_id,),
                 )
+                # coordinator_phase='dispatching': listing is over — this is
+                # the retry/idempotent path, so the phase was already flipped
+                # by the first successful call, but setting it again is
+                # harmless and keeps this branch self-sufficient.
+                conn.execute(
+                    "UPDATE tasks SET coordinator_phase='dispatching' WHERE id=?",
+                    (task_id,),
+                )
             return {
                 "ok": True, "idempotent": True,
                 "shard_ids": [r["id"] for r in sorted(existing, key=lambda r: r["shard_index"])],
@@ -558,6 +578,14 @@ async def create_pool_batches(body: dict):
                 final = snapshot.get_shards_by_task(task_id)
                 if not matches_incoming(final):
                     raise _BatchMismatch()
+                # coordinator_phase='dispatching': the natural "listing is
+                # over" signal for the guard in auto_dispatch_pending — the
+                # coordinator has finished list → filter → chunk and its
+                # batches are now on file.
+                conn.execute(
+                    "UPDATE tasks SET coordinator_phase='dispatching' WHERE id=?",
+                    (task_id,),
+                )
         except _BatchMismatch:
             return {"error": f"batch rows already exist for {task_id} and do not match the requested set"}
         return {

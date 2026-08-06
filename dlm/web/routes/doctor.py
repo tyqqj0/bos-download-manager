@@ -174,7 +174,7 @@ async def fix(req: FixRequest):
     There is deliberately no "restart worker" action — restarting a worker is a
     host-level operation and goes through scripts/deploy-workers.sh.
     """
-    from ..temporal_client import start_sharded_download
+    from ..temporal_client import start_task_download
 
     tasks, _, _ = await run_blocking(_read_state)
     now = time.time()
@@ -201,9 +201,10 @@ async def fix(req: FixRequest):
                 if has_live_workflow(task_id, running_ids):
                     continue
                 try:
-                    # Sharded path only — the legacy workflow has no BOS resume
-                    # filter and would re-download everything already uploaded.
-                    await start_sharded_download(t)
+                    # Unified dispatch entry — branches on dispatch_mode. The
+                    # legacy workflow has no BOS resume filter and would
+                    # re-download everything already uploaded.
+                    await start_task_download(t)
                     redispatched.append(t.get("name", task_id))
                 except Exception as e:
                     if "already started" not in str(e).lower():

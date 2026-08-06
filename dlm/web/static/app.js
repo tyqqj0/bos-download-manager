@@ -19,7 +19,7 @@ function app() {
         doctorFixing: false,
         doctorFindings: null,
         toast: { show: false, message: '', type: 'success' },
-        addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', no_dispatch: false, parsed: null, error: '' },
+        addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: 'sharded', no_dispatch: false, parsed: null, error: '' },
         transferTasks: [],
         transferSummary: {},
         transferPaused: false,
@@ -257,6 +257,7 @@ function app() {
                         category: this.addForm.category,
                         type: this.addForm.type,
                         priority: this.addForm.priority,
+                        dispatch_mode: this.addForm.dispatch_mode,
                         no_dispatch: this.addForm.no_dispatch,
                     })
                 });
@@ -264,7 +265,7 @@ function app() {
                     const data = await res.json();
                     this.showToast(`Added: ${data.task?.name || 'task'}`, 'success');
                     this.showAddModal = false;
-                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', no_dispatch: false, parsed: null, error: '' };
+                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: 'sharded', no_dispatch: false, parsed: null, error: '' };
                     await this.fetchTasks();
                 } else {
                     const data = await res.json();
