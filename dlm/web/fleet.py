@@ -51,6 +51,20 @@ POOL_MAX_BATCHES = 1500  # a task chunking past this many batches needs splittin
 POOL_STARVED_SCHEDULED_S = 900  # a pending activity SCHEDULED longer than this (plan's 15 min)
 POOL_STARVED_ATTEMPT = 3  # T10's pre-restart check treats attempt>=3 as "a human must look"
 
+# Trigger 1 (zero activity pollers) needs confirmation before it screams.
+# Temporal's poller list is a recency-based view: a frontend restart, a
+# matching-service failover, or a fleet that has just reconnected can return
+# an empty list while every worker is healthy — the same reason
+# temporal_client.start_pool_download wraps its own poller check in
+# try/except. Two consecutive samples cost one 300s patrol cycle to confirm,
+# which still lands inside A10's 15-minute detection bound.
+POOL_STARVED_ZERO_SAMPLES = 2
+# ...and "consecutive" means consecutive patrol cycles, not any two samples
+# ever taken: a zero recorded before an idle stretch says nothing about the
+# fleet now. Three patrol intervals of slack, so a slow or skipped cycle does
+# not discard a real confirmation.
+POOL_STARVED_SAMPLE_GAP_S = 900
+
 # Window weights per priority band. The coordinator's per-wake window is
 # `max(1, floor(P * W_i / sum(W_active)))` — P being alive workers serving the
 # source — so these decide how a busy pool is split between concurrent pool

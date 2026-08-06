@@ -27,7 +27,9 @@ from .fleet import (  # noqa: E402
     MIN_SHARD_DISK_GB as MIN_DISPATCH_DISK_GB,
     POOL_MAX_CONCURRENT_TASKS,
     POOL_STARVED_ATTEMPT,
+    POOL_STARVED_SAMPLE_GAP_S,
     POOL_STARVED_SCHEDULED_S,
+    POOL_STARVED_ZERO_SAMPLES,
     STALE_THRESHOLD,
     has_live_workflow,
 )
@@ -36,6 +38,12 @@ from .fleet import (  # noqa: E402
 # Not the task-level TERMINAL_STATUSES — a row in the shards table only ever
 # takes pending/running/done/failed.
 _ROW_TERMINAL = ("done", "failed")
+
+# Trigger 1's confirmation state: pool task queue -> (consecutive zero-poller
+# samples, unix ts of the latest one). Module level because "consecutive"
+# spans patrol cycles, and bounded by the number of pool task queues (one per
+# source). Reset by a healthy sample, aged out by POOL_STARVED_SAMPLE_GAP_S.
+_POOL_ZERO_POLLER_SAMPLES: dict[str, tuple[int, float]] = {}
 
 
 async def reconcile() -> dict:
@@ -218,12 +226,15 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
     RPC is best-effort: an inspection pass must never be able to stop the
     scheduler loop, so a failed RPC is logged and skipped, not raised.
 
-    Trigger 1 (no pollers) is what A10's drill exercises — it fires within
-    one inspection cycle of the fleet's pollers going to zero. Triggers 2/3
-    (SCHEDULED aged out / attempt climbing) catch the slower failure shapes
-    a poller-count check alone would miss (see the plan-vs-timers analysis
-    in decision A). All three emit the same alert type, keyed per task so
-    the existing `_active_alerts` de-dupe in alerts.py collapses repeats.
+    Trigger 1 (no pollers) is what A10's drill exercises. It fires on the
+    SECOND consecutive zero-poller sample, i.e. ~600s after the fleet's
+    pollers go to zero (two 300s cycles) — one zero can just be Temporal's
+    recency-based poller view, and A10 also grades false positives. Triggers
+    2/3 (SCHEDULED aged out / attempt climbing) catch the slower failure
+    shapes a poller-count check alone would miss (see the plan-vs-timers
+    analysis in decision A). All three emit the same alert type, keyed per
+    task so the existing `_active_alerts` de-dupe in alerts.py collapses
+    repeats.
     """
     from ..queue.snapshot import get_shards_by_task
     from ..temporal.workflows import pool_task_queue
@@ -268,11 +279,32 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
                 try:
                     pollers = await _pool_poller_count(client, queue_name)
                 except Exception as e:
+                    # Decision B: an RPC failure is not evidence of anything,
+                    # so it stays silent — and it is not a healthy sample
+                    # either, so the streak below is left exactly as it is. A
+                    # flapping frontend must not be able to suppress the
+                    # alert by resetting confirmation on every other cycle.
                     logger.error(
                         f"Pool patrol: poller-count RPC failed for {queue_name}: {e}"
                     )
                     continue
                 if pollers > 0:
+                    _POOL_ZERO_POLLER_SAMPLES.pop(queue_name, None)
+                    continue
+                # One zero is not fleet death: Temporal's poller list is a
+                # recency view (see POOL_STARVED_ZERO_SAMPLES). Confirm across
+                # consecutive patrol cycles before raising CRITICAL.
+                prev_zeros, prev_at = _POOL_ZERO_POLLER_SAMPLES.get(queue_name, (0, 0.0))
+                if now - prev_at > POOL_STARVED_SAMPLE_GAP_S:
+                    prev_zeros = 0  # too long ago to call this consecutive
+                zeros = prev_zeros + 1
+                _POOL_ZERO_POLLER_SAMPLES[queue_name] = (zeros, now)
+                if zeros < POOL_STARVED_ZERO_SAMPLES:
+                    logger.warning(
+                        f"Pool patrol: {queue_name} reported 0 activity pollers "
+                        f"(sample {zeros}/{POOL_STARVED_ZERO_SAMPLES}) — waiting for "
+                        f"the next cycle to confirm before alerting"
+                    )
                     continue
                 for t in tasks_for_source:
                     alerts.append({
@@ -283,9 +315,11 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
                         "source": source,
                         "trigger": "no_pollers",
                         "pollers": pollers,
+                        "zero_samples": zeros,
                         "message": (
                             f"Pool task {t.get('name', t['id'])} ({source}): "
-                            f"{queue_name} has 0 activity pollers"
+                            f"{queue_name} has 0 activity pollers "
+                            f"({zeros} consecutive samples)"
                         ),
                     })
                     alerted_task_ids.add(t["id"])

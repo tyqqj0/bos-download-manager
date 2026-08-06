@@ -57,6 +57,18 @@ def _worker(db, key, *, disk_free_gb=500):
     db.update_worker(hostname=key, server_key=key, disk_free_gb=disk_free_gb)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_patrol_state():
+    """Trigger 1's zero-poller confirmation streak is module state that spans
+    patrol cycles by design (review finding I8). Reset it around every test so
+    no test can be made to pass — or fail — by another test's samples."""
+    from dlm.web import reconciler
+
+    reconciler._POOL_ZERO_POLLER_SAMPLES.clear()
+    yield
+    reconciler._POOL_ZERO_POLLER_SAMPLES.clear()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 1. Pool patrol — three triggers, one pool_starved alert (decision A)
 # ═══════════════════════════════════════════════════════════════════════
@@ -104,8 +116,15 @@ def _stub_pending_activities(monkeypatch, rows_by_workflow_id):
     monkeypatch.setattr(tc, "pending_activities", fake_pending)
 
 
-def test_no_pollers_triggers_critical_pool_starved(db, monkeypatch):
+def test_no_pollers_triggers_critical_pool_starved_only_after_confirmation(db, monkeypatch):
+    """Temporal's poller list is a recency view — a frontend restart, a
+    matching-service failover or a fleet that just reconnected can report
+    zero while every worker is healthy. One zero sample must stay silent;
+    the second consecutive one is the CRITICAL (review finding I8)."""
     from dlm.web import reconciler
+    from dlm.web.fleet import POOL_STARVED_ZERO_SAMPLES
+
+    assert POOL_STARVED_ZERO_SAMPLES == 2  # one confirmation cycle (300s)
 
     _task(db, "t-nopoll", status="downloading", mode="pool", source="hf")
     db.upsert_shard({"id": "s-nopoll-0", "task_id": "t-nopoll", "shard_index": 0,
@@ -113,6 +132,9 @@ def test_no_pollers_triggers_critical_pool_starved(db, monkeypatch):
 
     _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
     _stub_pending_activities(monkeypatch, {})
+
+    first = asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-nopoll")]))
+    assert first == []  # one sample is not evidence of fleet death
 
     alerts = asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-nopoll")]))
 
@@ -123,6 +145,77 @@ def test_no_pollers_triggers_critical_pool_starved(db, monkeypatch):
     assert a["trigger"] == "no_pollers"
     assert a["task_id"] == "t-nopoll"
     assert a["pollers"] == 0
+    assert a["zero_samples"] == 2
+
+
+def test_a_healthy_poller_sample_clears_the_zero_streak(db, monkeypatch):
+    """The exact false positive I8 describes: one blip, pollers back, later
+    another blip. Neither may alert."""
+    from dlm.web import reconciler
+
+    _task(db, "t-blip", status="downloading", mode="pool", source="hf")
+    db.upsert_shard({"id": "s-blip-0", "task_id": "t-blip", "shard_index": 0,
+                      "status": "running", "server": "w1"})
+    _stub_pending_activities(monkeypatch, {})
+
+    def _pass(pollers):
+        _stub_connected_client(monkeypatch, _FakeClient(poller_count=pollers))
+        return asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-blip")]))
+
+    assert _pass(0) == []
+    assert _pass(4) == []
+    assert _pass(0) == []  # first zero of a NEW streak, not the second of the old
+
+
+def test_a_failed_poller_rpc_neither_alerts_nor_clears_the_streak(db, monkeypatch):
+    """Decision B keeps an RPC failure silent. It is also not a healthy
+    sample, so it must not discard a pending confirmation — otherwise a
+    flapping frontend could suppress the alert indefinitely."""
+    from dlm.web import reconciler
+
+    _task(db, "t-rpcfail", status="downloading", mode="pool", source="hf")
+    db.upsert_shard({"id": "s-rf-0", "task_id": "t-rpcfail", "shard_index": 0,
+                      "status": "running", "server": "w1"})
+    _stub_pending_activities(monkeypatch, {})
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
+
+    assert asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-rpcfail")])) == []
+
+    import dlm.web.temporal_client as tc
+    real = tc._pool_poller_count
+
+    async def boom(client, queue_name):
+        raise RuntimeError("frontend unavailable")
+
+    monkeypatch.setattr(tc, "_pool_poller_count", boom)
+    assert asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-rpcfail")])) == []
+
+    monkeypatch.setattr(tc, "_pool_poller_count", real)
+    alerts = asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-rpcfail")]))
+    assert [a["trigger"] for a in alerts] == ["no_pollers"]
+
+
+def test_a_stale_zero_sample_does_not_count_as_consecutive(db, monkeypatch):
+    """"Consecutive" means consecutive patrol cycles. A zero recorded hours
+    ago (pool idle in between, then work resumed on a fleet still
+    reconnecting) must not let a single fresh zero alert immediately."""
+    from dlm.web import reconciler
+    from dlm.web.fleet import POOL_STARVED_SAMPLE_GAP_S
+
+    _task(db, "t-stale-sample", status="downloading", mode="pool", source="hf")
+    db.upsert_shard({"id": "s-ss2-0", "task_id": "t-stale-sample", "shard_index": 0,
+                      "status": "running", "server": "w1"})
+    _stub_pending_activities(monkeypatch, {})
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
+
+    assert asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-stale-sample")])) == []
+
+    # Age the recorded sample past the gap window.
+    for queue_name, (count, at) in list(reconciler._POOL_ZERO_POLLER_SAMPLES.items()):
+        reconciler._POOL_ZERO_POLLER_SAMPLES[queue_name] = (
+            count, at - POOL_STARVED_SAMPLE_GAP_S - 1)
+
+    assert asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-stale-sample")])) == []
 
 
 def test_scheduled_stuck_triggers_warning_pool_starved(db, monkeypatch):
@@ -319,6 +412,9 @@ def test_reconcile_wires_pool_starved_into_its_report(db, monkeypatch):
     db.upsert_shard({"id": "s-wired-0", "task_id": "t-wired", "shard_index": 0,
                       "status": "running", "server": "w1"})
 
+    # Two passes: trigger 1 needs a confirming sample (review finding I8), so
+    # a single reconcile() legitimately reports nothing here.
+    assert asyncio.run(reconciler.reconcile())["pool_starved"] == []
     report = asyncio.run(reconciler.reconcile())
 
     assert any(a["task_id"] == "t-wired" and a["trigger"] == "no_pollers"
