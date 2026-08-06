@@ -28,12 +28,12 @@ from dlm.web.routes import queue as queue_routes
 
 
 @pytest.fixture()
-def db(tmp_path, monkeypatch):
+def db(dlm_db):
     """A real SQLite file — the route runs actual SQL, so a fake would test
-    nothing about the DELETE and the status gate."""
-    monkeypatch.setattr(snapshot, "DB_PATH", tmp_path / "dlm.db")
-    snapshot.init_db()
-    return snapshot
+    nothing about the DELETE and the status gate. The route reads through its
+    module-level ThreadPoolExecutor, so this only isolates because snapshot's
+    cached connection is keyed by path (see conftest)."""
+    return dlm_db
 
 
 def _task(task_id, status, **over):

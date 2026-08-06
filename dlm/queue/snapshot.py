@@ -20,12 +20,27 @@ _local = threading.local()
 
 
 def _conn() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
+    # The cached connection is keyed by the path it was opened for. Without
+    # that key, rebinding DB_PATH only affects threads that had not yet opened
+    # a connection: the web layer's route executors are module-level and
+    # long-lived, so a thread that opened the old path keeps serving it
+    # silently. This surfaced as tests reading an earlier test's database
+    # through the queue routes' ThreadPoolExecutor while believing they had
+    # isolated themselves.
+    path = str(DB_PATH)
+    if getattr(_local, "conn", None) is None or getattr(_local, "path", None) != path:
+        old = getattr(_local, "conn", None)
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                pass
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _local.conn = sqlite3.connect(str(DB_PATH), timeout=10)
+        _local.conn = sqlite3.connect(path, timeout=10)
         _local.conn.execute("PRAGMA journal_mode=WAL")
         _local.conn.execute("PRAGMA busy_timeout=5000")
         _local.conn.row_factory = sqlite3.Row
+        _local.path = path
     return _local.conn
 
 
@@ -242,8 +257,11 @@ def update_worker(hostname: str, server_key: str, status: str = "online",
     """Update worker heartbeat in snapshot (supports sidecar extra fields)."""
     conn = _conn()
 
-    # Ensure extended columns exist — only run once per thread
-    if not getattr(_local, "workers_schema_migrated", False):
+    # Ensure extended columns exist. Keyed by database path, not a bare
+    # once-per-thread flag: a thread that migrated one database would otherwise
+    # skip the ALTERs after DB_PATH is rebound and insert into a table without
+    # the columns (the same hazard as the connection cache above).
+    if getattr(_local, "workers_schema_migrated", None) != str(DB_PATH):
         for col, col_type in [
             ("download_process_alive", "INTEGER"),
             ("download_process_pid", "INTEGER"),
@@ -256,7 +274,7 @@ def update_worker(hostname: str, server_key: str, status: str = "online",
                 conn.execute(f"ALTER TABLE workers ADD COLUMN {col} {col_type}")
             except Exception:
                 pass  # column already exists
-        _local.workers_schema_migrated = True
+        _local.workers_schema_migrated = str(DB_PATH)
 
     conn.execute(
         "INSERT INTO workers (hostname, server_key, status, current_task_id, "
