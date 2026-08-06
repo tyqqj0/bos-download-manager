@@ -67,6 +67,33 @@ def s1_self_check() -> bool:
     return False
 
 
+def _pool_task_holds_no_work(task_id: str) -> bool:
+    """Decision E's exemption test: zero `running` batch rows and >=1
+    `pending` one. A pool task shaped like this is admitted but waiting
+    behind the window by design — pool_starved (from reconcile()'s patrol)
+    is the alert for a genuinely dead one, so task_stuck firing here on
+    every waiting task on a busy pool would be a guaranteed false positive.
+
+    Deliberately narrow: a task with a running batch row is a real stall
+    (not exempt), and a task with no batch rows at all is a coordinator
+    that never registered any (not exempt either) — both must still alert.
+
+    Any read failure returns True (apply the exemption) rather than firing
+    task_stuck off data we could not confirm — the same "stay silent rather
+    than cry wolf" posture the idle_worker check below already uses.
+    """
+    try:
+        from ..queue.snapshot import get_shards_by_task
+        rows = get_shards_by_task(task_id)
+    except Exception:
+        return True
+    if not rows:
+        return False
+    running = any(r.get("status") == "running" for r in rows)
+    pending = any(r.get("status") == "pending" for r in rows)
+    return (not running) and pending
+
+
 def check_alerts(tasks: list, workers: list) -> list[dict]:
     """Evaluate alert conditions. Returns list of active alerts with severity.
 
@@ -140,11 +167,17 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 "message": f"Download process dead on {w.get('server_key', '')} (sidecar still reporting)",
             }
 
-    # WARNING: Task stuck > 1 hour
+    # WARNING: Task stuck > 1 hour. Exempt a pool task admitted but holding
+    # no work (decision E) — checked first so a sharded task's `and`
+    # short-circuits before ever calling the pool-only helper, keeping the
+    # sharded path's alert (and its lack of extra DB reads) byte-identical.
     for t in tasks:
         if t.get("status") == "downloading":
             stale = now - (t.get("updated_at") or 0)
             if stale > 3600:
+                if ((t.get("dispatch_mode") or "sharded") == "pool"
+                        and _pool_task_holds_no_work(t.get("id", ""))):
+                    continue
                 key = f"task_stuck:{t.get('id', '')}"
                 new_alerts[key] = {
                     "severity": WARNING,
@@ -208,6 +241,18 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                     "server": server,
                     "message": anomaly.get("message", ""),
                 }
+
+    # CRITICAL/WARNING: pool_starved (decision A). The three triggers need
+    # Temporal RPCs, which only reconcile()'s async patrol can make —
+    # check_alerts runs every 10s off a synchronous thread and cannot make
+    # them itself, so it reads what the last reconcile pass already cached.
+    # Same pattern as health_verify_report above: read a cached report,
+    # re-key into new_alerts, done. The alerts are already fully shaped
+    # (severity/type/task_id/trigger/message/evidence) by inspect_pool_tasks.
+    reconciler_report = cache.get("reconciler_report")
+    if reconciler_report and isinstance(reconciler_report, dict):
+        for a in reconciler_report.get("pool_starved", []):
+            new_alerts[f"pool_starved:{a.get('task_id', '')}"] = a
 
     # Log state transitions
     al = _get_alert_logger()
