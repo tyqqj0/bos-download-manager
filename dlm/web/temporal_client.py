@@ -279,7 +279,16 @@ async def start_pool_download(task_dict: dict):
     client = await connected_client()
 
     queue_name = pool_task_queue(source)
-    expected = _expected_pool_pollers(source)
+    # init_db() takes SQLite's write lock, so _expected_pool_pollers must not
+    # run on the event loop: start_pool_download is awaited straight from the
+    # /queue/preempt and /doctor/fix handlers, which push every other SQLite
+    # touch through run_blocking. Bounded at busy_timeout (5s), but that is
+    # 5s of accept() gap for the whole web server. See
+    # tests/test_event_loop_safety.py — its AST scan only inspects the
+    # handler's own body, so this indirection is invisible to it.
+    expected = await asyncio.get_running_loop().run_in_executor(
+        None, _expected_pool_pollers, source
+    )
     actual = await _pool_poller_count(client, queue_name)
     if actual < expected:
         msg = (

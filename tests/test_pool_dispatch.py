@@ -416,6 +416,49 @@ def test_pool_task_in_dispatching_phase_does_not_block(db, monkeypatch):
     assert "t-wait2" in calls
 
 
+def test_pool_task_with_null_coordinator_phase_still_blocks_its_source(db, monkeypatch):
+    """The hole the T7 review reproduced. coordinator_phase has exactly two
+    writers (auto_dispatch's claim and create_pool_batches), so EVERY other
+    route to `downloading` leaves it NULL — preempt's claim (queue.py:341),
+    doctor's orphan repair, and reconcile()'s 1800s re-dispatch (which
+    refreshes claimed_at but not the phase). Reading NULL as "not listing"
+    left those sources entirely unguarded during exactly the window the
+    guard exists for: a second coordinator races the listing one for workers
+    that are idle only because they are about to be claimed.
+
+    The row below is shaped exactly as preempt's claim leaves it: status
+    downloading, priority 0, server NULL, fresh claimed_at, phase NULL, no
+    batch rows yet.
+    """
+    from dlm.web import reconciler
+    import dlm.web.temporal_client as tc
+
+    calls = []
+
+    async def fake_start(task):
+        calls.append(task["id"])
+
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+
+    _task(db, "t-preempted", status="downloading", mode="pool", source="hf")
+    conn = db._conn()
+    with conn:
+        conn.execute(
+            "UPDATE tasks SET priority = 0, server = NULL, claimed_at = ?, "
+            "coordinator_phase = NULL WHERE id = ?",
+            (time.time(), "t-preempted"),
+        )
+    assert db.get_task("t-preempted")["coordinator_phase"] is None
+
+    _task(db, "t-wait-null", status="pending", mode="pool", source="hf")
+    _worker(db, "w1")
+
+    asyncio.run(reconciler.auto_dispatch_pending())
+
+    assert db.get_task("t-wait-null")["status"] == "pending"
+    assert calls == []
+
+
 def test_sharded_task_with_no_shard_rows_still_blocks_source_g1_regression(db, monkeypatch):
     """This must fail if the pre-existing sharded criterion (NOT EXISTS
     shards) is ever narrowed, scoped to dispatch_mode, or otherwise altered
@@ -511,3 +554,51 @@ def test_add_task_endpoint_rejects_invalid_dispatch_mode(db):
     assert db.get_task is not None  # sanity: db fixture still usable
     all_tasks = db.get_all_tasks()
     assert not any(t.get("repo_id") == "org/repo-tasks-bad" for t in all_tasks)
+
+
+# ── 6. the mode vocabulary is single-sourced and the default is validated ──
+#
+# /api/tasks validates only a *client-supplied* dispatch_mode; the value
+# resolved from DEFAULT_DISPATCH_MODE went to upsert_task unchecked. So
+# DLM_DEFAULT_DISPATCH_MODE="Pool" (a capitalisation typo in S1's .env) would
+# have stored dispatch_mode='Pool' on every add: auto_dispatch claims it via
+# the sharded branch, start_task_download raises ValueError, the claim is
+# reverted to pending, and the task retries every 30s forever with nothing but
+# a reconciler error line. Validating at import turns that into one refused
+# `systemctl start dlm-web`.
+
+
+def test_default_dispatch_mode_is_validated_at_import():
+    import importlib
+
+    import dlm.web.fleet as fleet
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("DLM_DEFAULT_DISPATCH_MODE", "Pool")
+        with pytest.raises(ValueError, match="DLM_DEFAULT_DISPATCH_MODE"):
+            importlib.reload(fleet)
+    # Restore the module to its real (env-free) state for the rest of the suite.
+    importlib.reload(fleet)
+    assert fleet.DEFAULT_DISPATCH_MODE in fleet.VALID_DISPATCH_MODES
+
+
+def test_dispatch_mode_vocabulary_has_one_definition():
+    """Four local `VALID_DISPATCH_MODES = {...}` literals (queue.add,
+    queue.reshard, tasks.add) had already drifted on *when* they validate;
+    a third mode would have needed four edits (G8: pool policy lives in
+    fleet.py)."""
+    import pathlib
+    import re
+
+    from dlm.web.fleet import VALID_DISPATCH_MODES
+
+    assert VALID_DISPATCH_MODES == frozenset({"sharded", "pool"})
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "dlm"
+    literal = re.compile(r"VALID_DISPATCH_MODES\s*=")
+    definers = [
+        p.relative_to(root).as_posix()
+        for p in root.rglob("*.py")
+        if literal.search(p.read_text())
+    ]
+    assert definers == ["web/fleet.py"], definers

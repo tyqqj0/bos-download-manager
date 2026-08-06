@@ -76,9 +76,7 @@ async def add_to_queue(body: dict):
             fleet.DEFAULT_DISPATCH_MODE (grayscale period: "sharded").
     """
     from ...core.parser import parse_repo
-    from ..fleet import DEFAULT_DISPATCH_MODE
-
-    VALID_DISPATCH_MODES = {"sharded", "pool"}
+    from ..fleet import DEFAULT_DISPATCH_MODE, VALID_DISPATCH_MODES
 
     repo_id = body.get("repo_id", "").strip()
     if not repo_id:
@@ -929,8 +927,7 @@ async def reshard_task(body: dict):
     or 'pool').
     """
     from ..temporal_client import terminate_workflow_and_wait
-
-    VALID_DISPATCH_MODES = {"sharded", "pool"}
+    from ..fleet import VALID_DISPATCH_MODES
 
     task_id = body.get("task_id", "")
     shard_count = int(body.get("shard_count", 0) or 0)

@@ -142,7 +142,8 @@ class AddTaskRequest(BaseModel):
 @router.post("/tasks")
 async def add_task(req: AddTaskRequest):
     """Add a new download task — saves to pending, auto_dispatch picks it up."""
-    VALID_DISPATCH_MODES = {"sharded", "pool"}
+    from ..fleet import VALID_DISPATCH_MODES
+
     if req.dispatch_mode is not None and req.dispatch_mode not in VALID_DISPATCH_MODES:
         raise HTTPException(
             400,

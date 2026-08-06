@@ -22,7 +22,26 @@ DEAD_THRESHOLD = 1800  # 30 min without a task update = definitely dead
 # gate on "how many pool tasks may run at once" is fleet state exactly like
 # "how many workers are idle".
 POOL_MAX_CONCURRENT_TASKS = int(os.environ.get("DLM_POOL_MAX_CONCURRENT_TASKS", "4"))
+
+# The only definition of the mode vocabulary. It was previously restated as a
+# local literal in four places (queue.add, queue.reshard, tasks.add and
+# start_task_download's if/elif chain); a third mode would have needed four
+# edits, and the four copies had already drifted on WHEN they validate.
+VALID_DISPATCH_MODES = frozenset({"sharded", "pool"})
+
 DEFAULT_DISPATCH_MODE = os.environ.get("DLM_DEFAULT_DISPATCH_MODE", "sharded")
+if DEFAULT_DISPATCH_MODE not in VALID_DISPATCH_MODES:
+    # Fail at import, not per-request. A typo'd DLM_DEFAULT_DISPATCH_MODE (e.g.
+    # "Pool") would otherwise be persisted unvalidated by every /api/tasks add
+    # — the endpoint validates only a *client-supplied* mode — and each such
+    # task would then be claimed, fail start_task_download with a ValueError,
+    # be reverted to pending, and retry every 30s forever with nothing but a
+    # reconciler error line. A refused import surfaces in `systemctl status
+    # dlm-web` immediately and is a one-character fix.
+    raise ValueError(
+        f"DLM_DEFAULT_DISPATCH_MODE={DEFAULT_DISPATCH_MODE!r} is not one of "
+        f"{sorted(VALID_DISPATCH_MODES)}"
+    )
 POOL_MAX_BATCHES = 1500  # a task chunking past this many batches needs splitting, not a bigger pool
 
 # Window weights per priority band. The coordinator's per-wake window is

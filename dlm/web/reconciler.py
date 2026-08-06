@@ -238,6 +238,12 @@ async def auto_dispatch_pending() -> dict:
         #    'dispatching' once create_pool_batches lands its rows
         #    (routes/queue.py). Using coordinator_phase alone for pool tasks
         #    keeps the two criteria independently meaningful and testable.
+        #    NULL counts as listing: those are the only two writers, so every
+        #    OTHER route to `downloading` (preempt's claim at queue.py:341,
+        #    doctor's orphan repair, reconcile()'s 1800s re-dispatch — which
+        #    refreshes claimed_at but not the phase) leaves the column NULL,
+        #    and reading NULL as "not listing" left those sources completely
+        #    unguarded during exactly the window the guard exists for.
         conn = _conn()
         listing_cutoff = time.time() - 900
         rows = conn.execute(
@@ -247,7 +253,9 @@ async def auto_dispatch_pending() -> dict:
             "AND ("
             "  (COALESCE(t.dispatch_mode, 'sharded') != 'pool'"
             "   AND NOT EXISTS (SELECT 1 FROM shards s WHERE s.task_id = t.id))"
-            "  OR (t.dispatch_mode = 'pool' AND t.coordinator_phase = 'listing')"
+            "  OR (t.dispatch_mode = 'pool'"
+            "      AND (t.coordinator_phase = 'listing'"
+            "           OR t.coordinator_phase IS NULL))"
             ")",
             (listing_cutoff,),
         ).fetchall()
