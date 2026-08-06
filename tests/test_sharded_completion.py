@@ -50,14 +50,21 @@ class _Stubs:
     without raising, which is exactly how molmobot-data's shard ended.
     """
 
-    def __init__(self, num_shards=1, disk_ok=True, disk_ok_per_shard=None):
+    def __init__(self, num_shards=1, disk_ok=True, disk_ok_per_shard=None,
+                 remaining_files=10, drop_files=0, extra_partitions=0):
         self.num_shards = num_shards
         self.disk_ok = disk_ok
         # shard_index -> bool, for the mixed case
         self.disk_ok_per_shard = dict(disk_ok_per_shard or {})
+        # How many files the BOS filter leaves, and how badly the partition
+        # under-reports them — see the coverage tests.
+        self.remaining_files = remaining_files
+        self.drop_files = drop_files
+        self.extra_partitions = extra_partitions
         self.dashboard = []        # (status, phase) in call order
         self.shard_status = []     # (shard_id, status, error)
         self.aggregated = []
+        self.partition_calls = []  # args, so the task_id keying is checkable
 
     # -- registration --------------------------------------------------
 
@@ -94,7 +101,8 @@ class _Stubs:
     async def filter_filelist_against_bos(self, filelist_path, task_input):
         return {"filtered_path": "/tmp/fl.filtered.json",
                 "skipped_files": 0, "skipped_bytes": 0,
-                "remaining_files": 10, "remaining_bytes": 100 * 1024 ** 3}
+                "remaining_files": self.remaining_files,
+                "remaining_bytes": 100 * 1024 ** 3}
 
     async def report_resume_info(self, task_id, skipped_files, skipped_gb):
         return None
@@ -102,11 +110,28 @@ class _Stubs:
     async def query_idle_workers(self, source, exclude_task):
         return [WORKER_KEY] * self.num_shards
 
-    async def partition_files_greedy(self, filtered_path, num_shards, staging_dir):
+    async def partition_files_greedy(self, filtered_path, num_shards, staging_dir,
+                                     task_id=""):
+        # `total_files` is the real activity's key, and what /api/shards/create
+        # reads (queue.py: info["total_files"]). The stub said "count", which no
+        # production path uses — so the coordinator's coverage check saw zero
+        # files partitioned. A stub that disagrees with the contract tests the
+        # stub.
+        self.partition_calls.append(
+            {"filtered_path": filtered_path, "num_shards": num_shards,
+             "staging_dir": staging_dir, "task_id": task_id})
+
+        counts = [self.remaining_files // num_shards] * num_shards
+        for i in range(self.remaining_files % num_shards):
+            counts[i] += 1
+        if self.drop_files:
+            counts[-1] = max(0, counts[-1] - self.drop_files)
+        counts += [0] * self.extra_partitions
+
         return [{"filelist_key": f"batchlists/x/shard-{i}.json",
                  "filelist_md5": "abc",
-                 "count": 5,
-                 "total_bytes": 50 * 1024 ** 3} for i in range(num_shards)]
+                 "total_files": c,
+                 "total_bytes": 50 * 1024 ** 3} for i, c in enumerate(counts)]
 
     async def create_shards_in_db(self, task_id, partitions):
         return [f"s-{task_id}-{i}" for i in range(len(partitions))]
@@ -137,7 +162,8 @@ class _Stubs:
     async def load_progress(self, shard_task, filelist_md5):
         return []
 
-    async def download_shard_filelist(self, filelist_key, staging_dir):
+    async def download_shard_filelist(self, filelist_key, staging_dir,
+                                      expected_md5=""):
         return "/tmp/local-shard.json"
 
     async def read_filelist(self, local_filelist):
@@ -231,3 +257,63 @@ def test_all_shards_succeeding_still_reports_done():
     assert result.files_uploaded == 2
     assert result.bytes_uploaded == 2 * 50 * 1024 ** 3
     assert stubs.aggregated == ["t-sharded-1"]
+
+
+# --- the partition must account for every file ------------------------------
+#
+# The coordinator reads the filtered filelist from the listing worker's disk at
+# /data/staging/{task_name}/.filelist.filtered.json. Names are reused by
+# requirement — a resume MUST reuse the original name, and /queue/add permits
+# re-adding a repo whose previous row is terminal — so two tasks can point at
+# that one path. If the partition comes back short, nothing downstream notices:
+# a zero-file shard returns done immediately, step 8 sees every shard done, and
+# the task is reported done at 0 bytes. Which is the false-`done` signature.
+
+def test_a_short_partition_fails_the_task_instead_of_reporting_done():
+    stubs = _Stubs(num_shards=2, remaining_files=10, drop_files=3)
+    result = _run(stubs)
+
+    assert result.status == "failed"
+    assert "does not cover the filelist" in result.error
+    assert "7 files" in result.error and "expected 10" in result.error
+    assert _final_status(stubs) == "failed"
+    assert stubs.shard_status == [], "dispatched shards despite a short partition"
+    assert stubs.aggregated == [], "aggregated a task it never ran"
+
+
+def test_an_empty_partition_fails_the_task():
+    """A zero-file shard starts a workflow, holds a worker and returns done.
+    With num_shards clamped to the file count, one can only appear if the
+    partition disagrees with the filelist it was given."""
+    stubs = _Stubs(num_shards=2, remaining_files=10, extra_partitions=1)
+    result = _run(stubs)
+
+    assert result.status == "failed"
+    assert "empty partitions [2]" in result.error
+    assert _final_status(stubs) == "failed"
+
+
+def test_shard_count_is_clamped_to_the_number_of_files():
+    """8 shards over 3 files used to mean 5 workflows that download nothing,
+    each occupying a worker that busy_servers then reports as taken."""
+    stubs = _Stubs(num_shards=8, remaining_files=3)
+    result = _run(stubs)
+
+    assert result.status == "done"
+    assert stubs.partition_calls[0]["num_shards"] == 3
+    assert len(stubs.shard_status) == 3 * 2  # assign + done, per shard
+    assert result.files_uploaded == 3
+
+
+def test_the_partition_is_keyed_by_task_id_not_name():
+    """Two same-named tasks overwrote each other's shard filelists at
+    download-manager/filelists/{name}/shard-{i}.json — a shard could then
+    fetch another repo's file list and download it into this task's prefix."""
+    stubs = _Stubs(num_shards=1)
+    _run(stubs)
+
+    call = stubs.partition_calls[0]
+    assert call["task_id"] == "t-sharded-1", (
+        "coordinator did not pass the task id, so the BOS filelist key falls "
+        "back to the reusable task name")
+    assert call["staging_dir"].endswith("sharded-task")

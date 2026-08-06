@@ -167,8 +167,14 @@ done
 # Version manifest: md5 of the files that matter, per worker vs S1
 echo ""
 echo "[$(date)] Version manifest (md5 of key files):"
-MANIFEST_FILES="dlm/temporal/activities.py dlm/temporal/workflows.py dlm/temporal/pipeline.py dlm/temporal/__main__.py dlm/web/fleet.py dlm/web/reconciler.py dlm/web/routes/queue.py"
-local_md5=$(cd "$REPO_DIR" && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1)
+# Derived, not hand-written. The old list named seven files, so the gate said
+# OK while a worker ran a stale dlm/core/bos.py — the entire upload path,
+# including the multipart driver whose silent failure credits files that never
+# landed on BOS. Any file rsync can carry belongs in the hash, so enumerate
+# them: rsync --delete makes the trees identical on success, and LC_ALL=C
+# fixes the order across hosts.
+MANIFEST_CMD='find dlm -name "*.py" -not -path "*/__pycache__/*" -print0 | LC_ALL=C sort -z | xargs -0 cat | md5sum | cut -d" " -f1'
+local_md5=$(cd "$REPO_DIR" && eval "$MANIFEST_CMD")
 echo "  S1 (reference): $local_md5"
 for key in $TARGETS; do
     ip="${WORKERS[$key]:-$CUSTOM_IP}"
@@ -177,7 +183,7 @@ for key in $TARGETS; do
     # as MISMATCH when the deploy itself succeeded (bj1, 2026-08-03).
     remote_md5="UNREACHABLE"
     for attempt in 1 2 3; do
-        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1" 2>/dev/null); then
+        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && $MANIFEST_CMD" 2>/dev/null); then
             remote_md5="$m"
             break
         fi

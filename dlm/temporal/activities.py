@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 STAGING_PATH = Path("/data/staging")
 
 
+class FilelistMismatchError(Exception):
+    """The bytes at a shard's filelist key are not the bytes the coordinator
+    uploaded there.
+
+    Permanent by nature — the object was overwritten, so every retry re-reads
+    the same wrong content. Listed in workflows.NON_RETRYABLE_ERRORS by class
+    name so eight shards don't each burn five attempts on it.
+    """
+
+
 @activity.defn
 async def list_repo_files(task_input: TaskInput) -> dict:
     """List all files in a HF or ModelScope repo. Saves to disk, returns metadata.
@@ -495,11 +505,24 @@ async def check_disk_space(min_free_gb: int = 25) -> bool:
 
 @activity.defn
 async def partition_files_greedy(
-    filelist_path: str, num_shards: int, staging_dir: str
+    filelist_path: str, num_shards: int, staging_dir: str, task_id: str = ""
 ) -> list[dict]:
     """Partition files into N shards using greedy bin-packing by size.
 
-    Returns list of {filelist_path, total_files, total_bytes} per shard.
+    Returns list of {filelist_key, filelist_md5, total_files, total_bytes}
+    per shard. `total_files` across the result must equal the input length —
+    the coordinator checks it, because a partition that silently loses files
+    produces shards that report done having transferred nothing.
+
+    `task_id` keys the BOS filelist objects. It used to be the task NAME,
+    taken from the staging path, and names are not unique: a resume MUST
+    reuse the original name and /queue/add permits re-adding a repo whose
+    previous row is terminal. Two same-named tasks therefore overwrote each
+    other's shard filelists at
+    `download-manager/filelists/{name}/shard-{i}.json`, and a shard that
+    fetched the loser's copy would download another repo's files into this
+    task's BOS prefix. Defaulted for replay of executions that started before
+    this argument existed; falls back to the name those runs used.
     """
     path = Path(filelist_path)
     all_files = json.loads(path.read_text())
@@ -529,13 +552,13 @@ async def partition_files_greedy(
 
     import hashlib
 
-    task_name = Path(staging_dir).name
+    scope = task_id or Path(staging_dir).name
     for i, shard_files in enumerate(shards):
         shard_filelist = sdir / f".filelist-shard-{i}.json"
         content = json.dumps(shard_files)
         shard_filelist.write_text(content)
 
-        bos_key = f"download-manager/filelists/{task_name}/shard-{i}.json"
+        bos_key = f"download-manager/filelists/{scope}/shard-{i}.json"
         upload_file(bos, META_BUCKET, bos_key, str(shard_filelist))
 
         results.append({
@@ -545,13 +568,32 @@ async def partition_files_greedy(
             "total_bytes": shard_sizes[i],
         })
 
+    partitioned = sum(r["total_files"] for r in results)
+    if partitioned != len(all_files):
+        raise RuntimeError(
+            f"partition lost files: {partitioned} of {len(all_files)} from "
+            f"{filelist_path} — refusing to return a short partition"
+        )
+
     activity.heartbeat(f"partitioned {len(all_files)} files into {num_shards} shards, uploaded to BOS")
     return results
 
 
 @activity.defn
-async def download_shard_filelist(filelist_key: str, staging_dir: str) -> str:
-    """Download a shard filelist from BOS to local disk. Returns local path."""
+async def download_shard_filelist(filelist_key: str, staging_dir: str,
+                                  expected_md5: str = "") -> str:
+    """Download a shard filelist from BOS to local disk. Returns local path.
+
+    `expected_md5` is the hash the coordinator computed over the bytes it
+    uploaded. It was carried in ShardInput.filelist_md5 all along and only
+    ever used to validate resume markers — never the filelist itself. So a
+    shard fetched whatever was at the key and trusted it, which is precisely
+    the hole the name-keyed BOS path opened: a same-named task overwriting
+    `download-manager/filelists/{name}/shard-{i}.json` would have this shard
+    download another repo's files into this task's prefix, and everything
+    downstream would report success. Empty means an execution that started
+    before this argument existed; those replay unchecked rather than fail.
+    """
     from ..core.bos import create_bos_client
     from ..constants import META_BUCKET
 
@@ -565,7 +607,21 @@ async def download_shard_filelist(filelist_key: str, staging_dir: str) -> str:
     local_path = sdir / f".filelist-{Path(filelist_key).stem}.json"
 
     response = bos.get_object(META_BUCKET, filelist_key)
-    local_path.write_bytes(response.data.read())
+    payload = response.data.read()
+
+    if expected_md5:
+        import hashlib
+
+        got = hashlib.md5(payload).hexdigest()
+        if got != expected_md5:
+            raise FilelistMismatchError(
+                f"shard filelist at bos://{META_BUCKET}/{filelist_key} does not "
+                f"match the partition that produced this shard "
+                f"(md5 {got} != {expected_md5}) — another task likely overwrote "
+                f"it; refusing to download an unknown filelist"
+            )
+
+    local_path.write_bytes(payload)
 
     return str(local_path)
 
