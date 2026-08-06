@@ -41,7 +41,7 @@ Each active download: `id`, `name`, `server`, `speed_mbps`, `progress_pct`, `dow
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/doctor` | Health check report |
-| POST | `/api/doctor` | Auto-fix. Body: `{"actions":[...]}` — only `redispatch_orphaned`, `redispatch_pool`, `reset_stuck`, `skip_zombie` are supported; others come back as `unsupported_actions`. `redispatch_orphaned` and `reset_stuck` skip **pool** tasks and list them under `skipped_pool_tasks`; re-dispatching a pool orphan needs the explicit `redispatch_pool` action |
+| POST | `/api/doctor` | Auto-fix. Body: `{"actions":[...]}` — only `redispatch_orphaned`, `redispatch_pool`, `reset_stuck`, `skip_zombie` are supported; others come back as `unsupported_actions`. `redispatch_orphaned` and `reset_stuck` skip **pool** tasks unconditionally and list them under `skipped_pool_tasks`; re-dispatching a pool orphan needs the explicit `redispatch_pool` action, which also deletes the task's batch rows first (already-uploaded files are not re-downloaded — the BOS resume filter skips them again) |
 
 ## Servers
 

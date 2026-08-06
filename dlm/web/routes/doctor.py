@@ -207,8 +207,15 @@ async def fix(req: FixRequest):
     Available actions:
     - redispatch_orphaned: re-dispatch tasks with no Temporal workflow (sharded)
     - redispatch_pool: the same for POOL tasks — separately named on purpose,
-      see the decision-C note below; never part of the default
-    - reset_stuck: reset stuck tasks to pending (sharded)
+      see the decision-C note below; never part of the default. Deletes the
+      task's batch rows first (review finding R3): an orphan's completed
+      batches already landed their files on BOS, so the next coordinator's
+      BOS resume filter drops them and re-chunks different boundaries, which
+      create_pool_batches_in_db's idempotency check would otherwise reject as
+      a non-retryable mismatch. Same call resume_task (routes/queue.py) makes
+      for the same reason.
+    - reset_stuck: reset stuck tasks to pending (sharded) — never touches
+      pool tasks (review finding R2); see the decision-C note below
     - skip_zombie: revoke permanently failed tasks (retry_count >= 8)
 
     There is deliberately no "restart worker" action — restarting a worker is a
@@ -217,12 +224,19 @@ async def fix(req: FixRequest):
     Decision C removed the reconciler's automatic re-dispatch of pool orphans:
     a second PoolDownloadWorkflow re-runs list -> filter -> chunk, and T1's
     ruling on a chunking mismatch is no-delete + non-retryable error, so an
-    unwanted re-dispatch wedges the task instead of healing it. Both manual
-    paths that could reach it — `redispatch_orphaned` (the DEFAULT action, and
-    what the UI's fix button posts) and `reset_stuck` (via
-    status='pending' -> auto_dispatch_pending) — therefore skip pool tasks and
-    report them as skipped, unless the operator asks by name with
-    `redispatch_pool`. The matching `pool_orphaned` alert points at that action.
+    unwanted re-dispatch wedges the task instead of healing it.
+    `redispatch_orphaned` (the DEFAULT action, and what the UI's fix button
+    posts) skips pool tasks unless the SAME request also names
+    `redispatch_pool` explicitly. `reset_stuck` skips pool tasks
+    unconditionally, regardless of what else is in `actions`: it hands a task
+    to `auto_dispatch_pending` via status='pending', which starts a fresh pool
+    coordinator, and combining it with `redispatch_pool` in one request used
+    to start a SECOND coordinator on top of that (review finding R2) — the
+    listing-phase source guard then wedged the whole source for up to 15
+    minutes. `redispatch_pool` is the one deliberate pool recovery action;
+    both `redispatch_orphaned` and `reset_stuck` report their skipped pool
+    tasks in `skipped_pool_tasks`. The matching `pool_orphaned` alert points
+    at `redispatch_pool`.
     """
     from ..temporal_client import start_task_download
 
@@ -252,6 +266,23 @@ async def fix(req: FixRequest):
     def _is_pool(t: dict) -> bool:
         return (t.get("dispatch_mode") or "sharded") == "pool"
 
+    def _delete_pool_shards(task_id: str):
+        """Off-loop batch-row wipe for a pool redispatch (review finding R3).
+
+        Mirrors resume_task's do_update (routes/queue.py) — same SQLite call,
+        same reason: create_pool_batches_in_db's idempotency check rejects a
+        row set that doesn't match what it just chunked, and an orphan with
+        any completed batches is exactly that case (the BOS resume filter
+        drops their files, so the next chunking pass produces different
+        boundaries). The check is non-retryable, so leaving stale rows in
+        place would wedge this exact redispatch instead of healing it.
+        """
+        from ...queue.snapshot import delete_shards_by_task
+
+        def _do():
+            delete_shards_by_task(task_id)
+        return _do
+
     if "redispatch_orphaned" in actions or allow_pool:
         redispatched = []
         redispatched_pool = []
@@ -274,6 +305,10 @@ async def fix(req: FixRequest):
                 elif "redispatch_orphaned" not in actions:
                     continue  # only the explicit pool action was requested
                 try:
+                    if _is_pool(t):
+                        # See _delete_pool_shards' docstring for why this must
+                        # run before start_task_download, not after.
+                        await run_blocking(_delete_pool_shards(task_id))
                     # Unified dispatch entry — branches on dispatch_mode. The
                     # legacy workflow has no BOS resume filter and would
                     # re-download everything already uploaded.
@@ -285,7 +320,14 @@ async def fix(req: FixRequest):
                         (redispatched_pool if _is_pool(t) else redispatched).append(
                             f"{t.get('name', task_id)} (FAILED: {e})")
         except Exception as e:
-            redispatched.append(f"ERROR: {e}")
+            # Both lists: whichever of redispatch_orphaned/redispatch_pool
+            # actually ends up in `results` below must carry this (review
+            # finding M1) — a Temporal outage during a `redispatch_pool`-only
+            # request must not look like "nothing to do" just because the
+            # error landed on the list the caller didn't ask to see.
+            err = f"ERROR: {e}"
+            redispatched.append(err)
+            redispatched_pool.append(err)
         if "redispatch_orphaned" in actions:
             results["redispatch_orphaned"] = redispatched
         if allow_pool:
@@ -308,16 +350,23 @@ async def fix(req: FixRequest):
         stuck = [t for t in tasks
                  if t.get("status") == "downloading"
                  and now - (t.get("updated_at") or 0) > DEAD_THRESHOLD]
-        if not allow_pool:
-            # status='pending' hands the task to auto_dispatch_pending, which
-            # starts a fresh pool coordinator — the same wedge by another route.
-            keep = []
-            for t in stuck:
-                if _is_pool(t):
-                    _skip_pool(t, "reset_stuck")
-                else:
-                    keep.append(t)
-            stuck = keep
+        # reset_stuck never touches pool tasks — unconditionally, regardless
+        # of allow_pool (review finding R2). allow_pool only unlocks
+        # redispatch_pool above; reusing it here let
+        # {"actions": ["reset_stuck", "redispatch_pool"]} both start a fresh
+        # coordinator (redispatch_pool) AND hand the same task back to
+        # auto_dispatch_pending via status='pending' (reset_stuck), which
+        # started a SECOND coordinator on top of that — the listing-phase
+        # source guard then wedged the whole source for up to 15 minutes.
+        # status='pending' hands the task to auto_dispatch_pending, which
+        # starts a fresh pool coordinator — the same wedge by another route.
+        keep = []
+        for t in stuck:
+            if _is_pool(t):
+                _skip_pool(t, "reset_stuck")
+            else:
+                keep.append(t)
+        stuck = keep
         results["reset_stuck"] = await run_blocking(
             _rewrite(stuck, status="pending", phase="reset_by_doctor"))
 

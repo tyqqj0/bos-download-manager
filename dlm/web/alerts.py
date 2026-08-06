@@ -273,7 +273,10 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                     f"re-dispatched automatically. Confirm the coordinator is "
                     f"gone, then POST /api/doctor with "
                     f'{{"actions": ["redispatch_pool"]}} — the default fix '
-                    f"action deliberately refuses pool tasks."
+                    f"action deliberately refuses pool tasks. redispatch_pool "
+                    f"clears this task's batch-row bookkeeping before starting "
+                    f"the fresh coordinator; already-uploaded files are not "
+                    f"re-downloaded — the BOS resume filter skips them again."
                 ),
             }
 

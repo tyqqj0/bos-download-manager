@@ -850,6 +850,103 @@ def test_doctor_reset_stuck_skips_pool_tasks(db, monkeypatch):
                for s in out["skipped_pool_tasks"])
 
 
+def test_doctor_reset_stuck_still_skips_pool_when_redispatch_pool_also_requested(db, monkeypatch):
+    """Review finding R2: `allow_pool` (derived from "redispatch_pool" in
+    actions) used to also unlock reset_stuck's pool path, so
+    {"actions": ["reset_stuck", "redispatch_pool"]} both started a fresh
+    coordinator (redispatch_pool) AND handed the same task back to
+    auto_dispatch_pending via status='pending' (reset_stuck) — a
+    double-dispatch that the listing-phase source guard then turned into a
+    15-minute wedge of the whole source. reset_stuck must refuse pool tasks
+    unconditionally; redispatch_pool is the only deliberate pool action."""
+    from dlm.web.fleet import DEAD_THRESHOLD
+    from dlm.web.routes import doctor
+
+    started: list = []
+    _doctor_stub(monkeypatch, started)
+
+    stale = time.time() - DEAD_THRESHOLD - 100
+    _task(db, "t-p2", status="downloading", mode="pool", updated_at=stale)
+
+    out = asyncio.run(doctor.fix(
+        doctor.FixRequest(actions=["reset_stuck", "redispatch_pool"])))
+
+    # redispatch_pool acted on it exactly once...
+    assert started == ["t-p2"]
+    assert out["redispatch_pool"] == ["t-p2"]
+    # ...and reset_stuck did NOT also bounce it back to pending.
+    assert out["reset_stuck"] == []
+    assert db.get_task("t-p2")["status"] == "downloading"
+    assert any("t-p2" in s and "reset_stuck" in s for s in out["skipped_pool_tasks"])
+
+
+def test_doctor_redispatch_pool_surfaces_a_temporal_outage_when_requested_alone(db, monkeypatch):
+    """Review finding M1: a running_workflows() failure used to append its
+    error only to `redispatched`, which is only included in the response
+    when redispatch_orphaned is also in `actions` — an operator following
+    the pool_orphaned alert with exactly {"actions": ["redispatch_pool"]}
+    during a Temporal outage saw a clean empty list and concluded there was
+    nothing to do."""
+    from dlm.web.routes import doctor
+    import dlm.web.temporal_client as tc
+
+    async def boom():
+        raise RuntimeError("temporal frontend unavailable")
+
+    monkeypatch.setattr(tc, "running_workflows", boom)
+
+    _task(db, "t-m1-outage", status="downloading", mode="pool")
+
+    out = asyncio.run(doctor.fix(doctor.FixRequest(actions=["redispatch_pool"])))
+
+    assert "redispatch_orphaned" not in out
+    assert "redispatch_pool" in out
+    assert any("ERROR" in entry for entry in out["redispatch_pool"]), out
+
+
+def test_redispatch_pool_clears_stale_batch_rows_before_restarting(db, monkeypatch):
+    """Review finding R3's investigation: redispatch_pool calls
+    start_task_download and, before this fix, deleted nothing. A real
+    orphan's completed batches already landed their files on BOS, so the
+    fresh coordinator's BOS resume filter drops them and chunk_filelist
+    computes different batch boundaries than what is still on file —
+    create_pool_batches_in_db's idempotency check
+    (dlm/temporal/activities.py, routes/queue.py's create_pool_batches)
+    rejects that as a non-retryable PoolBatchMismatch. redispatch_pool must
+    clear the row set first — same call resume_task makes — so the rows are
+    already gone by the time the new coordinator's create_pool_batches_in_db
+    call runs. Proven here by inspecting the row set from inside the
+    (stubbed) start_task_download call itself: if the delete happened after
+    dispatch, or not at all, the rows would still be there."""
+    from dlm.web.routes import doctor
+
+    seen_at_start: list = []
+
+    async def fake_running(client=None):
+        return {}
+
+    async def fake_start(task):
+        from dlm.queue.snapshot import get_shards_by_task
+        seen_at_start.append(get_shards_by_task(task["id"]))
+
+    import dlm.web.temporal_client as tc
+    monkeypatch.setattr(tc, "running_workflows", fake_running)
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+
+    _task(db, "t-p3", status="downloading", mode="pool")
+    # A completed batch (already uploaded, filter will drop its files) plus
+    # a pending one — the exact "some batches completed" shape R3 describes.
+    db.upsert_shard({"id": "s-p3-0", "task_id": "t-p3", "shard_index": 0, "status": "done"})
+    db.upsert_shard({"id": "s-p3-1", "task_id": "t-p3", "shard_index": 1, "status": "pending"})
+    assert len(db.get_shards_by_task("t-p3")) == 2
+
+    out = asyncio.run(doctor.fix(doctor.FixRequest(actions=["redispatch_pool"])))
+
+    assert out["redispatch_pool"] == ["t-p3"]
+    assert seen_at_start == [[]]  # gone by the time the new coordinator started
+    assert db.get_shards_by_task("t-p3") == []  # and nothing recreated them (stubbed)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 3. task_stuck exemption (decision E)
 # ═══════════════════════════════════════════════════════════════════════
