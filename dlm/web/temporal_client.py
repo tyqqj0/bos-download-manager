@@ -214,8 +214,19 @@ async def _find_running_workflow_ids(client, task_id: str) -> list:
         return []
 
 
-async def cancel_workflow(task_id: str):
-    """Cancel running workflow(s) for a task — handles all ID patterns."""
+async def cancel_workflow(task_id: str, dispatch_mode: Optional[str] = None):
+    """Cancel running workflow(s) for a task — handles all ID patterns.
+
+    dispatch_mode='pool' skips the per-shard ShardWorkerWorkflow sweep below:
+    pool batches run as activities inside PoolDownloadWorkflow, not as child
+    workflows, so there is no shard-row-keyed handle to cancel there — only
+    the parent `pool-{task_id}` (already covered by PARENT_WORKFLOW_TYPES,
+    which includes PoolDownloadWorkflow) matters. Walking every batch row
+    (up to ~1500 for a pool task) to build a handle that can never exist is
+    pure wasted RPCs. Any other value (None/'sharded'/anything else) keeps
+    this function's sharded-path effect byte-identical to before — that is
+    the only branch this function makes on dispatch_mode.
+    """
     client = await connected_client()
     wf_ids = {f"{WORKFLOW_ID_PREFIXES[t]}{task_id}" for t in PARENT_WORKFLOW_TYPES}
     wf_ids.update(await _find_running_workflow_ids(client, task_id))
@@ -227,6 +238,9 @@ async def cancel_workflow(task_id: str):
             logger.info(f"Cancelled workflow {wf_id}")
         except Exception:
             pass
+
+    if dispatch_mode == "pool":
+        return
 
     # Also cancel shard child workflows
     try:
@@ -244,13 +258,25 @@ async def cancel_workflow(task_id: str):
         pass
 
 
-async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> bool:
+async def terminate_workflow_and_wait(
+    task_id: str, timeout_s: int = 120, dispatch_mode: Optional[str] = None
+) -> bool:
     """Terminate all workflows for a task and wait until they are closed.
 
     Unlike cancel_workflow (async cancel, returns immediately), this blocks
     until Temporal reports every handle closed — required before requeuing a
     task under the same workflow ID (e.g. /queue/reshard). Returns True when
     everything closed within the timeout.
+
+    dispatch_mode='pool' skips building per-shard ShardWorkerWorkflow handles
+    for the same reason cancel_workflow does: pool batches are activities,
+    not child workflows, so there are no such handles to wait on. Any other
+    value keeps the sharded-path effect byte-identical to before.
+
+    Each describe() call below already carries its own QUERY_TIMEOUT (15s)
+    RPC budget via rpc_timeout — that is what keeps one unresponsive handle
+    from silently consuming the whole `timeout_s` poll window; the overall
+    deadline is unchanged.
     """
     import time as _time
     from temporalio.client import WorkflowExecutionStatus
@@ -259,14 +285,15 @@ async def terminate_workflow_and_wait(task_id: str, timeout_s: int = 120) -> boo
     wf_ids = {f"{WORKFLOW_ID_PREFIXES[t]}{task_id}" for t in PARENT_WORKFLOW_TYPES}
     wf_ids.update(await _find_running_workflow_ids(client, task_id))
     handles = [client.get_workflow_handle(wf_id) for wf_id in wf_ids]
-    try:
-        from ..queue.snapshot import get_shards_by_task, init_db
-        init_db()
-        shard_prefix = WORKFLOW_ID_PREFIXES["ShardWorkerWorkflow"]
-        for shard in get_shards_by_task(task_id):
-            handles.append(client.get_workflow_handle(f"{shard_prefix}{shard['id']}"))
-    except Exception:
-        pass
+    if dispatch_mode != "pool":
+        try:
+            from ..queue.snapshot import get_shards_by_task, init_db
+            init_db()
+            shard_prefix = WORKFLOW_ID_PREFIXES["ShardWorkerWorkflow"]
+            for shard in get_shards_by_task(task_id):
+                handles.append(client.get_workflow_handle(f"{shard_prefix}{shard['id']}"))
+        except Exception:
+            pass
 
     for handle in handles:
         try:

@@ -130,7 +130,18 @@ async def add_to_queue(body: dict):
 
 @router.post("/queue/pause")
 async def pause_task(body: dict):
-    """Pause a running task (cancels the Temporal workflow)."""
+    """Pause a running task (cancels the Temporal workflow).
+
+    dispatch_mode='pool': once the cancel lands, this also resets the task's
+    in-flight batch rows (running/claimed -> pending, server=NULL, speed=0)
+    via release_pool_batches — reusing its SQL rather than adding a second
+    reset path. That reset must stay gated on dispatch_mode == 'pool': its
+    SQL clears every non-done/non-failed row for the task regardless of
+    mode, and a sharded task's shard rows are still owned by the sharded
+    workflow's own bookkeeping — running them through this reset would wipe
+    rows pause has no business touching. `failed` rows are left alone in
+    both modes; they are an operator's only per-batch attribution.
+    """
     task_id = body.get("task_id", "")
     if not task_id:
         return {"error": "task_id is required"}
@@ -139,25 +150,38 @@ async def pause_task(body: dict):
         snapshot.init_db()
         task = snapshot.get_task(task_id)
         if not task:
-            return {"error": f"Task {task_id} not found"}
+            return None, {"error": f"Task {task_id} not found"}
         if task["status"] not in ("downloading", "pending"):
-            return {"error": f"Cannot pause task in status={task['status']}"}
+            return None, {"error": f"Cannot pause task in status={task['status']}"}
         snapshot.update_task_progress(task_id, status="paused", phase=None, speed_mbps=0)
-        return None
+        return task.get("dispatch_mode"), None
 
-    error = await _run_blocking(do_update)
+    dispatch_mode, error = await _run_blocking(do_update)
     if error:
         return error
 
     from ..temporal_client import cancel_workflow
-    await cancel_workflow(task_id)
+    await cancel_workflow(task_id, dispatch_mode=dispatch_mode)
+
+    if dispatch_mode == "pool":
+        await release_pool_batches({"task_id": task_id})
 
     return {"ok": True, "task_id": task_id, "status": "paused"}
 
 
 @router.post("/queue/resume")
 async def resume_task(body: dict):
-    """Resume a paused/failed task (starts a new workflow)."""
+    """Resume a paused/failed task (starts a new workflow).
+
+    Deletes the task's shard/batch rows as part of the pending transition.
+    For a pool task this is required, not cosmetic: chunking recomputes
+    batch boundaries on the next dispatch, and create_pool_batches_in_db
+    rejects a request whose row set doesn't match what's already on file —
+    stale rows from before the pause would make the very next dispatch
+    error out. For a sharded task this is a no-op in effect (create_shards
+    already deletes-then-recreates unconditionally on its own), so doing it
+    here uniformly is safe.
+    """
     task_id = body.get("task_id", "")
     if not task_id:
         return {"error": "task_id is required"}
@@ -174,6 +198,7 @@ async def resume_task(body: dict):
 
     def do_update():
         snapshot.update_task_progress(task_id, status="pending", phase="resuming", speed_mbps=0, error=None)
+        snapshot.delete_shards_by_task(task_id)
     await _run_blocking(do_update)
 
     # auto_dispatch will pick this up and assign to an idle worker
@@ -856,20 +881,38 @@ async def release_pool_batches(body: dict):
 
 @router.post("/queue/reshard")
 async def reshard_task(body: dict):
-    """Change a task's shard count via lossless restart.
+    """Change a task's shard count and/or dispatch_mode via lossless restart.
 
-    Terminates the running workflows, waits for them to close, deletes the old
-    shard rows, and requeues the task with the new max_workers. The BOS resume
-    filter makes the restart cheap — already-uploaded files are skipped.
+    Terminates the running workflows, waits for them to close, deletes the
+    old shard/batch rows, and requeues the task with the new max_workers
+    and/or dispatch_mode. The BOS resume filter makes the restart cheap —
+    already-uploaded files are skipped.
 
-    Body: task_id, shard_count
+    Validation is deliberately relaxed from "shard_count >= 1 always": a
+    request needs EITHER shard_count >= 1 OR a valid dispatch_mode
+    ('sharded'/'pool'); neither is an error, and an invalid dispatch_mode
+    string is an error rather than a silent fallback. This lets a pure mode
+    flip (sharded<->pool) or a pure pool restart — for which shard_count is
+    meaningless, chunking recomputes batches — go through reshard without
+    inventing a fake shard_count. A sharded->sharded call that omits
+    dispatch_mode (every call site before this task existed) is unaffected.
+
+    Body: task_id, shard_count (optional), dispatch_mode (optional, 'sharded'
+    or 'pool').
     """
     from ..temporal_client import terminate_workflow_and_wait
 
+    VALID_DISPATCH_MODES = {"sharded", "pool"}
+
     task_id = body.get("task_id", "")
     shard_count = int(body.get("shard_count", 0) or 0)
-    if not task_id or shard_count < 1:
-        return {"error": "task_id and shard_count >= 1 required"}
+    requested_mode = body.get("dispatch_mode")
+
+    if requested_mode is not None and requested_mode not in VALID_DISPATCH_MODES:
+        return {"error": f"invalid dispatch_mode={requested_mode!r}, "
+                          f"expected one of {sorted(VALID_DISPATCH_MODES)}"}
+    if not task_id or (shard_count < 1 and requested_mode is None):
+        return {"error": "task_id and (shard_count >= 1 or a valid dispatch_mode) are required"}
 
     def do_check():
         snapshot.init_db()
@@ -883,9 +926,24 @@ async def reshard_task(body: dict):
     if error:
         return {"error": error}
 
-    closed = await terminate_workflow_and_wait(task_id)
+    # Terminate against the task's CURRENT (pre-flip) dispatch_mode — that is
+    # what determines whether per-shard child workflow handles exist to wait
+    # on, independent of what this call is about to change it to.
+    closed = await terminate_workflow_and_wait(task_id, dispatch_mode=task.get("dispatch_mode"))
     if not closed:
         return {"error": "workflows did not close within timeout — task state unchanged, retry later"}
+
+    # New max_workers: an explicit shard_count always wins. Otherwise fall
+    # back to whatever is already stored — this is what makes a pure mode
+    # flip (no shard_count supplied) a no-op on max_workers, and what makes a
+    # pool->sharded flip "resume with the last known shard_count" per the T8
+    # brief. max_workers can be NULL in the DB (pre-existing trap: the schema
+    # DEFAULT of 0 does not apply once a caller INSERTs an explicit NULL) —
+    # `or 0` guards the int() conversion so a pool task that never set
+    # max_workers doesn't crash the flip; 0 already means "auto-shard" to
+    # start_sharded_download.
+    new_max_workers = shard_count if shard_count >= 1 else int(task.get("max_workers") or 0)
+    new_dispatch_mode = requested_mode if requested_mode is not None else (task.get("dispatch_mode") or "sharded")
 
     def do_requeue():
         conn = snapshot._conn()
@@ -894,8 +952,8 @@ async def reshard_task(body: dict):
         # requeuing blindly would silently discard the new shard count.
         cur = conn.execute(
             "UPDATE tasks SET status = 'pending', server = NULL, max_workers = ?, "
-            "speed_mbps = 0, updated_at = ? WHERE id = ? AND status = ?",
-            (shard_count, time.time(), task_id, task["status"]),
+            "dispatch_mode = ?, speed_mbps = 0, updated_at = ? WHERE id = ? AND status = ?",
+            (new_max_workers, new_dispatch_mode, time.time(), task_id, task["status"]),
         )
         if cur.rowcount == 0:
             conn.commit()
@@ -903,7 +961,8 @@ async def reshard_task(body: dict):
         conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
         conn.commit()
         return {
-            "ok": True, "task_id": task_id, "shard_count": shard_count,
+            "ok": True, "task_id": task_id, "shard_count": new_max_workers,
+            "dispatch_mode": new_dispatch_mode,
             "note": "requeued; auto_dispatch restarts it with the new shard count, "
                     "BOS filter skips already-uploaded files",
         }
