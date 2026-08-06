@@ -226,8 +226,9 @@ async def auto_dispatch_pending() -> dict:
         # 4. Coordinator-race guard: a downloading task with no shard rows means
         #    its sharded coordinator is still listing/filtering — its workers
         #    look idle but will be claimed shortly. Don't dispatch that source
-        #    until shards exist. Keyed on claimed_at (set once at claim time,
-        #    never refreshed by progress reports) so a legacy non-sharded task
+        #    until shards exist. Keyed on claimed_at (written at claim time and
+        #    refreshed only by reconcile()'s re-dispatch below, never by
+        #    progress reports) so a legacy non-sharded task
         #    can't pin its source forever; a dead coordinator stops blocking
         #    after 15 min (reconcile() cleans it up).
         #
