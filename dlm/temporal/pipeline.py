@@ -17,6 +17,7 @@ import errno
 import logging
 import os
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -35,6 +36,70 @@ class _StallDetected(Exception):
 class _AccessDenied(Exception):
     """Raised for 403/gated repo errors — no point retrying."""
     pass
+
+
+class _TempPathHolder:
+    """Cross-thread channel: the download call (running in a worker thread)
+    reports the real temp path it is writing to; the async stall monitor
+    (running on the event loop thread) reads it.
+
+    One instance per download attempt. A plain attribute swap is enough —
+    CPython's GIL makes the write atomically visible to the reading thread;
+    this is progress monitoring, not a correctness-critical lock.
+    """
+
+    def __init__(self):
+        self.path: Optional[Path] = None
+
+
+# huggingface_hub writes to a path it names with `uuid.uuid4()` *inside*
+# `_download_to_tmp_and_move` (added upstream to defend against broken
+# flock() on Lustre/GPFS/some NFS mounts — huggingface_hub#4228). That name
+# cannot be predicted from data we hold ahead of time — not from
+# `file_info.path`, not even from the file's HTTP etag — it is only
+# knowable from inside the call. `http_get` (classic) and `xet_get` (Xet
+# storage) both receive that real path as an argument, so patching those —
+# not the private function that invents the uuid — is the stable
+# interception point: both are called with the fully-resolved temp
+# path/file already in hand, on both the http_get and xet_get branches.
+_HF_TEMP_PATH_LOCAL = threading.local()
+_hf_patch_lock = threading.Lock()
+_hf_patched = False
+
+
+def _ensure_hf_temp_path_patch():
+    """Monkeypatch huggingface_hub's low-level writers once per process so a
+    download's real temp path is observable from outside the call that
+    creates it. Idempotent and thread-safe to call from every attempt.
+    """
+    global _hf_patched
+    if _hf_patched:
+        return
+    with _hf_patch_lock:
+        if _hf_patched:
+            return
+        from huggingface_hub import file_download as _fd
+
+        _orig_http_get = _fd.http_get
+        _orig_xet_get = _fd.xet_get
+
+        def _patched_http_get(url, temp_file, **kwargs):
+            holder = getattr(_HF_TEMP_PATH_LOCAL, "holder", None)
+            if holder is not None:
+                name = getattr(temp_file, "name", None)
+                if name:
+                    holder.path = Path(name)
+            return _orig_http_get(url, temp_file, **kwargs)
+
+        def _patched_xet_get(*, incomplete_path, **kwargs):
+            holder = getattr(_HF_TEMP_PATH_LOCAL, "holder", None)
+            if holder is not None:
+                holder.path = incomplete_path
+            return _orig_xet_get(incomplete_path=incomplete_path, **kwargs)
+
+        _fd.http_get = _patched_http_get
+        _fd.xet_get = _patched_xet_get
+        _hf_patched = True
 
 
 # Download concurrency adapts to file size. Big files saturate the link on
@@ -117,21 +182,28 @@ class PipelineEngine:
         self._prefix = ""
         self._concurrency = DOWNLOAD_WORKERS  # set from batch contents in run()
 
-    def _download_one_file(self, file_info: FileInfo, cancel_event: "threading.Event | None" = None) -> Optional[Path]:
+    def _download_one_file(
+        self,
+        file_info: FileInfo,
+        cancel_event: "threading.Event | None" = None,
+        temp_path_holder: "_TempPathHolder | None" = None,
+    ) -> Optional[Path]:
         """Download a single file. Runs in thread pool.
 
         Dispatches to HuggingFace or ModelScope based on task.source.
         """
         if self.task.source == "modelscope":
-            return self._download_one_file_modelscope(file_info, cancel_event)
-        return self._download_one_file_hf(file_info, cancel_event)
+            return self._download_one_file_modelscope(file_info, cancel_event, temp_path_holder)
+        return self._download_one_file_hf(file_info, cancel_event, temp_path_holder)
 
-    def _download_one_file_hf(self, file_info: FileInfo, cancel_event) -> Optional[Path]:
+    def _download_one_file_hf(
+        self, file_info: FileInfo, cancel_event, temp_path_holder: "_TempPathHolder | None" = None
+    ) -> Optional[Path]:
         """HuggingFace download with mirror fallback."""
-        import threading
         from huggingface_hub import hf_hub_download
 
         os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(HTTP_TIMEOUT))
+        _ensure_hf_temp_path_patch()
 
         endpoints = [MIRROR_PRIMARY]
         if MIRROR_FALLBACK:
@@ -140,7 +212,11 @@ class PipelineEngine:
         for endpoint in endpoints:
             if cancel_event and cancel_event.is_set():
                 return None
+            if temp_path_holder is not None:
+                temp_path_holder.path = None
             t0 = time.time()
+            prev_holder = getattr(_HF_TEMP_PATH_LOCAL, "holder", None)
+            _HF_TEMP_PATH_LOCAL.holder = temp_path_holder
             try:
                 local_path = hf_hub_download(
                     repo_id=self.task.repo_id,
@@ -173,10 +249,20 @@ class PipelineEngine:
                 })
                 logger.warning(f"Download failed from {endpoint} for {file_info.path}: {e}")
                 continue
+            finally:
+                _HF_TEMP_PATH_LOCAL.holder = prev_holder
         return None
 
-    def _download_one_file_modelscope(self, file_info: FileInfo, cancel_event) -> Optional[Path]:
-        """ModelScope per-file download."""
+    def _download_one_file_modelscope(
+        self, file_info: FileInfo, cancel_event, temp_path_holder: "_TempPathHolder | None" = None
+    ) -> Optional[Path]:
+        """ModelScope per-file download.
+
+        `temp_path_holder` is accepted for signature symmetry with the HF
+        path but unused here: the SDK's own `.part`/`._____temp` staging
+        names are already exact and derivable (see `_wait_with_growth_check`),
+        unlike huggingface_hub's uuid-named temp files.
+        """
         from modelscope import dataset_file_download
 
         if cancel_event and cancel_event.is_set():
@@ -191,13 +277,14 @@ class PipelineEngine:
                 local_dir=str(self.staging_dir),
                 token=token,
             )
+            p = Path(local_path)
             self._emit_event("file_downloaded", {
                 "file": file_info.path,
                 "size_bytes": file_info.size,
                 "duration_s": round(time.time() - t0, 1),
                 "endpoint": "modelscope",
             })
-            return Path(local_path)
+            return p
         except Exception as e:
             err_str = str(e)
             if isinstance(e, OSError) and e.errno == errno.ENAMETOOLONG:
@@ -278,8 +365,6 @@ class PipelineEngine:
 
     async def _producer(self, files: list[FileInfo], queue: asyncio.Queue):
         """Download files using thread pool, put completed FileInfo onto queue."""
-        import threading
-
         loop = asyncio.get_running_loop()
         sem = asyncio.Semaphore(self._concurrency)
 
@@ -297,13 +382,14 @@ class PipelineEngine:
                 for attempt in range(MAX_FILE_RETRIES):
                     cancel_event = threading.Event()
                     self._cancel_events.append(cancel_event)
+                    temp_path_holder = _TempPathHolder()
                     try:
                         download_future = loop.run_in_executor(
-                            self._executor, self._download_one_file, file_info, cancel_event
+                            self._executor, self._download_one_file, file_info, cancel_event, temp_path_holder
                         )
                         # Monitor file growth instead of hard timeout
                         local_path = await self._wait_with_growth_check(
-                            download_future, file_info, cancel_event
+                            download_future, file_info, cancel_event, temp_path_holder
                         )
                         if local_path:
                             self.stats.downloaded_files += 1
@@ -319,12 +405,18 @@ class PipelineEngine:
                         return
                     except _StallDetected:
                         cancel_event.set()
-                        # Clean up .incomplete residue for THIS specific file only
-                        filename = file_info.path.split("/")[-1]
-                        for p in self.staging_dir.rglob(f"{filename}.incomplete"):
-                            p.unlink(missing_ok=True)
-                        for p in self.staging_dir.rglob(f".cache/**/{filename}.incomplete"):
-                            p.unlink(missing_ok=True)
+                        # Clean up THIS file's residue only, using the exact
+                        # same paths growth was checked against (defect 3 +
+                        # 4 share one source of truth for "where is this
+                        # file's partial data" — never a basename/rglob
+                        # search across the whole staging tree, which used
+                        # to delete a *different* file's in-progress bytes
+                        # whenever basenames collided across directories).
+                        for p in self._residue_candidates(file_info, temp_path_holder):
+                            try:
+                                p.unlink(missing_ok=True)
+                            except OSError:
+                                pass
                         logger.warning(
                             f"Stall detected for {file_info.path} "
                             f"(no growth for {STALL_TIMEOUT}s, attempt {attempt + 1})"
@@ -340,18 +432,50 @@ class PipelineEngine:
         # Launch all downloads concurrently (semaphore limits to DOWNLOAD_WORKERS at a time)
         tasks = [asyncio.create_task(download_with_limit(f)) for f in files]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        # Count any unhandled exceptions as failures (prevents silent file drops)
+        # Count any unhandled exceptions as failures (prevents silent file drops).
+        # asyncio.CancelledError is a BaseException, not an Exception, since
+        # Python 3.8 — return_exceptions=True still puts the instance into
+        # `results`, so `isinstance(r, Exception)` alone silently let every
+        # cancelled download (pause/preempt/reshard, or _AccessDenied/
+        # _StallDetected setting cancel_event) through uncounted. Note
+        # download_with_limit never increments failed_files itself when a
+        # CancelledError escapes here — both of its except clauses catch
+        # Exception subclasses only, so a CancelledError bypasses them and
+        # the "all retries exhausted" tail below them is never reached
+        # either — so counting it here cannot double-count.
         for r in results:
-            if isinstance(r, Exception):
+            if isinstance(r, (Exception, asyncio.CancelledError)):
                 self.stats.failed_files += 1
                 logger.error(f"Unhandled download error: {r}")
         await queue.put(None)  # signal consumer to stop
+
+    def _residue_candidates(
+        self, file_info: FileInfo, temp_path_holder: "_TempPathHolder | None"
+    ) -> list[Path]:
+        """Every path this file's partial data could currently live at.
+
+        Shared by the stall monitor (reads sizes) and the stall cleanup
+        (unlinks) so there is exactly one answer to "where is this file's
+        partial data" — see `_wait_with_growth_check` for why a basename
+        search across the whole staging tree is not on this list.
+        """
+        target_path = self.staging_dir / file_info.path
+        candidates = [
+            target_path,
+            Path(str(target_path) + ".incomplete"),
+            Path(str(target_path) + ".part"),
+            self.staging_dir / "._____temp" / file_info.path,
+        ]
+        if temp_path_holder is not None and temp_path_holder.path is not None:
+            candidates.append(temp_path_holder.path)
+        return candidates
 
     async def _wait_with_growth_check(
         self,
         download_future: asyncio.Future,
         file_info: FileInfo,
         cancel_event,
+        temp_path_holder: "_TempPathHolder | None" = None,
     ) -> Optional[Path]:
         """Wait for download to complete, checking file size growth periodically.
 
@@ -359,10 +483,20 @@ class PipelineEngine:
         this only declares a stall if the file on disk stops growing for STALL_TIMEOUT
         seconds. A 50GB file downloading at 1MB/s will take 14 hours but won't be killed
         as long as bytes keep arriving.
+
+        Growth is measured only from this file's own known-or-reported
+        candidate paths (`_residue_candidates`) — never from a substring/
+        basename match against the whole staging tree. That used to both
+        (a) miss real growth entirely for HuggingFace xet/local-dir
+        downloads, whose temp file is named with a uuid huggingface_hub
+        generates *inside* the download call — unknowable in advance, only
+        knowable by having that call report it via `temp_path_holder` (see
+        `_ensure_hf_temp_path_patch`) — and (b) credit a *different* file's
+        growth to this one whenever basenames collided across directories,
+        which is common in sharded datasets.
         """
         last_size = 0
         last_growth_time = time.time()
-        target_path = self.staging_dir / file_info.path
 
         while not download_future.done():
             await asyncio.sleep(STALL_CHECK_INTERVAL)
@@ -379,22 +513,30 @@ class PipelineEngine:
                 )
                 raise _StallDetected(f"Disk full abort: {file_info.path}")
 
-            # Check file size growth (handles .incomplete and ModelScope temp files)
-            current_size = 0
+            # Check file size growth across every path this file's partial
+            # data could live at right now.
+            current_size = None
             try:
-                for candidate in [
-                    target_path,
-                    Path(str(target_path) + ".incomplete"),
-                    Path(str(target_path) + ".part"),
-                    self.staging_dir / "._____temp" / file_info.path,
-                ]:
+                for candidate in self._residue_candidates(file_info, temp_path_holder):
                     if candidate.exists():
-                        current_size = max(current_size, candidate.stat().st_size)
-                for p in self.staging_dir.glob(".cache/**/*.incomplete"):
-                    if file_info.path.split("/")[-1] in str(p):
-                        current_size = max(current_size, p.stat().st_size)
+                        current_size = max(current_size or 0, candidate.stat().st_size)
             except OSError:
                 pass
+
+            if current_size is None:
+                # No candidate exists yet for this file — inconclusive, not
+                # evidence of a stall. This is expected early in an attempt
+                # (before any temp file exists) and can persist for the
+                # whole attempt if huggingface_hub never reports a temp
+                # path (e.g. served from its own cache with no incomplete
+                # file at all). Reset the clock rather than accumulate
+                # silent "no growth" time against a file we cannot observe:
+                # a false stall here bricked every large HF download for
+                # 35 hours straight (molmobot-data, 2026-08). The activity's
+                # own heartbeat/start_to_close timeout is the backstop for
+                # an actual hang.
+                last_growth_time = time.time()
+                continue
 
             if current_size > last_size:
                 last_size = current_size
@@ -425,10 +567,7 @@ class PipelineEngine:
                     pending, return_when=asyncio.FIRST_COMPLETED
                 )
                 pending -= done
-                for t in done:
-                    exc = t.exception()
-                    if exc:
-                        logger.error(f"Upload task error: {exc}")
+                self._count_upload_task_failures(done)
 
             file_info = await queue.get()
             if file_info is None:
@@ -440,10 +579,7 @@ class PipelineEngine:
         # Drain remaining uploads
         if pending:
             done, _ = await asyncio.wait(pending)
-            for t in done:
-                exc = t.exception()
-                if exc:
-                    logger.error(f"Upload task error: {exc}")
+            self._count_upload_task_failures(done)
 
         self.stats.phase = "done"
 
@@ -454,6 +590,39 @@ class PipelineEngine:
                     d.rmdir()
                 except OSError:
                     pass
+
+    def _count_upload_task_failures(self, done: set) -> None:
+        """Classify finished `_upload_one` tasks without re-raising.
+
+        Shared by both `_consumer` call sites (the backpressure wait inside
+        the pull loop, and the final drain after the queue is exhausted) —
+        one place so the two cannot drift, as they did when this was four
+        duplicated lines at each site. The sites differ in which tasks end
+        up in `done` (`FIRST_COMPLETED` vs. waiting for everything) and in
+        what happens to `pending` afterward; that bookkeeping stays at each
+        call site — only the "given a finished task, count it correctly"
+        step is shared, and that step is identical at both sites.
+
+        `Task.exception()` *raises* `CancelledError` for a cancelled task
+        instead of returning it, so a single cancelled upload used to
+        propagate straight out of `_consumer` — killing the whole consumer
+        loop while the producer kept filling a queue nobody was left to
+        drain. Check `cancelled()` first so cancellation is counted, not
+        fatal. `_upload_one` already counts and logs its own
+        retry-exhausted failures internally (it catches `Exception` and
+        never re-raises), so anything visible here is either cancellation
+        or a bug outside its try block — neither already counted — safe to
+        count unconditionally without double counting.
+        """
+        for t in done:
+            if t.cancelled():
+                self.stats.failed_files += 1
+                logger.error("Upload task cancelled")
+                continue
+            exc = t.exception()
+            if exc:
+                self.stats.failed_files += 1
+                logger.error(f"Upload task error: {exc}")
 
     async def _upload_one(self, fi: FileInfo, sem: asyncio.Semaphore):
         """Upload a single file to BOS with retry.
