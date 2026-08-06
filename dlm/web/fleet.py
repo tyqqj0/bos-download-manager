@@ -44,6 +44,13 @@ if DEFAULT_DISPATCH_MODE not in VALID_DISPATCH_MODES:
     )
 POOL_MAX_BATCHES = 1500  # a task chunking past this many batches needs splitting, not a bigger pool
 
+# T9 pool patrol thresholds (decision A) — the single definition the
+# reconciler's patrol reads; doctor.py surfaces the patrol's output by
+# passing through reconciler_report rather than re-deriving it, so there is
+# no second literal anywhere to drift.
+POOL_STARVED_SCHEDULED_S = 900  # a pending activity SCHEDULED longer than this (plan's 15 min)
+POOL_STARVED_ATTEMPT = 3  # T10's pre-restart check treats attempt>=3 as "a human must look"
+
 # Window weights per priority band. The coordinator's per-wake window is
 # `max(1, floor(P * W_i / sum(W_active)))` — P being alive workers serving the
 # source — so these decide how a busy pool is split between concurrent pool

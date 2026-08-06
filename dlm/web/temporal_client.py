@@ -67,6 +67,10 @@ WORKFLOW_ID_PREFIXES = {
 # WORKFLOW_TYPES.
 LEGACY_DOWNLOAD_ID_PREFIX = WORKFLOW_ID_PREFIXES["DownloadDatasetWorkflow"]
 SHARD_WORKER_ID_PREFIX = WORKFLOW_ID_PREFIXES["ShardWorkerWorkflow"]
+# Same reasoning, for the pool patrol's workflow_id construction
+# (reconciler.inspect_pool_tasks) — it needs the PoolDownloadWorkflow prefix
+# without re-inlining the type name outside this module.
+POOL_DOWNLOAD_ID_PREFIX = WORKFLOW_ID_PREFIXES["PoolDownloadWorkflow"]
 
 CONNECT_TIMEOUT = 5  # seconds to reach the frontend; connect() has no deadline
 QUERY_TIMEOUT = timedelta(seconds=15)  # per list/describe RPC
@@ -240,6 +244,75 @@ async def _pool_poller_count(client: Client, queue_name: str) -> int:
     return len(response.pollers)
 
 
+# Maps the raw proto enum to the plain strings the pool patrol (decision A)
+# switches on, so reconciler.py never has to import temporalio.api directly.
+_PENDING_ACTIVITY_STATE_NAMES = None
+
+
+def _pending_activity_state_names() -> dict:
+    global _PENDING_ACTIVITY_STATE_NAMES
+    if _PENDING_ACTIVITY_STATE_NAMES is None:
+        from temporalio.api.enums.v1 import PendingActivityState
+
+        _PENDING_ACTIVITY_STATE_NAMES = {
+            PendingActivityState.PENDING_ACTIVITY_STATE_SCHEDULED: "SCHEDULED",
+            PendingActivityState.PENDING_ACTIVITY_STATE_STARTED: "STARTED",
+            PendingActivityState.PENDING_ACTIVITY_STATE_CANCEL_REQUESTED: "CANCEL_REQUESTED",
+        }
+    return _PENDING_ACTIVITY_STATE_NAMES
+
+
+def _proto_timestamp_to_epoch(ts) -> float:
+    """Seconds since epoch for a protobuf `Timestamp`.
+
+    Caller must have already checked `HasField` — this only converts.
+    `Timestamp.ToDatetime()` returns a naive datetime and `.timestamp()`
+    would interpret that as local time — wrong for a UTC wall-clock proto.
+    `seconds`/`nanos` are already Unix-epoch, so read them directly.
+    """
+    return ts.seconds + ts.nanos / 1e9
+
+
+async def pending_activities(workflow_id: str) -> list[dict]:
+    """Normalised pending-activity rows for one workflow, or [] if absent.
+
+    Feeds the pool patrol's trigger 2 (SCHEDULED aged past
+    POOL_STARVED_SCHEDULED_S) and trigger 3 (attempt climbing) — see decision
+    A. `handle.describe()` returns a `WorkflowExecutionDescription`; the
+    pending activities live on the raw proto
+    (`desc.raw_description.pending_activities`), each a `PendingActivityInfo`
+    with `activity_type.name`, `state` (`PendingActivityState`), `attempt`,
+    `scheduled_time`, `last_started_time` — verified against the installed
+    temporalio (1.31.0) by introspecting the message's own DESCRIPTOR; every
+    name in the brief matched exactly, no differences to report.
+
+    An inspection pass must never be able to stop the scheduler loop: any
+    failure (workflow not found, RPC error, timeout) returns [] rather than
+    raising. `rpc_timeout=QUERY_TIMEOUT` reuses the module's existing RPC
+    deadline rather than adding a second one.
+    """
+    try:
+        client = await connected_client()
+        handle = client.get_workflow_handle(workflow_id)
+        desc = await handle.describe(rpc_timeout=QUERY_TIMEOUT)
+    except Exception:
+        return []
+
+    state_names = _pending_activity_state_names()
+    rows = []
+    for pai in desc.raw_description.pending_activities:
+        rows.append({
+            "activity_type": pai.activity_type.name,
+            "state": state_names.get(pai.state, "UNSPECIFIED"),
+            "attempt": pai.attempt,
+            "scheduled_at": _proto_timestamp_to_epoch(pai.scheduled_time)
+            if pai.HasField("scheduled_time") else None,
+            "last_started_at": _proto_timestamp_to_epoch(pai.last_started_time)
+            if pai.HasField("last_started_time") else None,
+        })
+    return rows
+
+
 def _expected_pool_pollers(source: str) -> int:
     """Alive workers that would serve this source's pool queue.
 
@@ -289,7 +362,26 @@ async def start_pool_download(task_dict: dict):
     expected = await asyncio.get_running_loop().run_in_executor(
         None, _expected_pool_pollers, source
     )
-    actual = await _pool_poller_count(client, queue_name)
+    # T7 review (routed to T9): the describe RPC uses the SDK default
+    # retry=False, so a transient gRPC blip refuses the dispatch — the
+    # correct fail-closed direction — but on its own raises the same kind of
+    # exception a caller sees from any other failure, so "the fleet is
+    # under-polled" and "the network blipped" were distinguishable in the
+    # log only by luck of the underlying gRPC error text. Both branches below
+    # still refuse (raise PoolPollerGateError, no fallback to sharded); only
+    # the log message and the exception's message differ, so a human
+    # scanning the log — or a future alert keyed on message content — can
+    # tell them apart.
+    try:
+        actual = await _pool_poller_count(client, queue_name)
+    except Exception as e:
+        msg = (
+            f"pool gate: describe_task_queue RPC failed for {queue_name}: {e} "
+            f"(network/RPC issue — refusing dispatch fail-closed, this is NOT "
+            f"necessarily under-polling)"
+        )
+        logger.critical(msg)
+        raise PoolPollerGateError(msg) from e
     if actual < expected:
         msg = (
             f"pool gate rejected task {task_dict.get('id')}: {queue_name} has "
