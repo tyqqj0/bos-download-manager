@@ -151,7 +151,7 @@ Six branches, each with a distinct trigger. Pick the matching branch and follow 
      `{"task_id": "<id>", "shard_count": N}`
    - Jump the queue: `POST /api/queue/jump` body `{"task_id": "<id>"}`
    - Requeue a failed/paused/revoked task: `POST /api/tasks/<id>/retry`
-   - Revoke task (also terminates its workflows): `POST /api/tasks/<id>/skip`
+   - Revoke task (terminates its workflows first; 502 + no state change if they don't close): `POST /api/tasks/<id>/skip`
    - Retry task: `POST /api/tasks/<id>/retry`
    - Cancel + delete: `DELETE /api/queue/<id>`
    - Cleanup staging: `POST /api/servers/<key>/cleanup`

@@ -4,11 +4,15 @@ Keeps the same endpoint signatures so the existing frontend works unchanged.
 Under the hood, routes to Redis/Celery/SQLite.
 """
 
+import logging
 from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from . import run_blocking
+
+logger = logging.getLogger("dlm.web")
 
 router = APIRouter(tags=["tasks"])
 
@@ -204,90 +208,122 @@ async def add_task(req: AddTaskRequest):
 
 @router.post("/tasks/{task_id}/retry")
 async def retry_task(task_id: str):
-    """Retry a failed task — sets to pending for auto_dispatch to pick up."""
-    def _do():
-        from ...queue.snapshot import get_task, upsert_task, init_db
-        init_db()
+    """Retry a task — delegates to /api/queue/retry.
 
-        task = get_task(task_id)
-        if not task:
-            return {"error": f"Task not found: {task_id}"}
-        if task.get("status") not in ("failed", "revoked", "paused", "pending"):
-            return {"error": f"Cannot retry task with status: {task.get('status')}"}
+    This is the endpoint the dashboard's Retry button calls (static/app.js).
+    It used to set status=pending on its own, which is the hazard /queue/retry
+    was hardened against: the live coordinator and its children keep
+    downloading into /data/staging while the task becomes dispatchable again,
+    so the next 30s cycle stacks a second pipeline on the same hosts and the
+    new coordinator collides with the old children on their deterministic
+    IDs. One implementation, reachable from both paths.
+    """
+    from .queue import retry_task as queue_retry
 
-        task["status"] = "pending"
-        task["error"] = None
-        task["error_class"] = None
-        task["phase"] = None
-        task["speed_mbps"] = 0
-        task["server"] = None
-        task["retry_count"] = (task.get("retry_count") or 0) + 1
-        upsert_task(task)
-
-        return {"status": "pending", "message": "Task queued for auto-dispatch"}
-
-    result = await run_blocking(_do)
+    result = await queue_retry({"task_id": task_id})
     if "error" in result:
         raise HTTPException(400, result["error"])
-    return result
+    return {"status": "pending", "message": "Task queued for auto-dispatch",
+            **{k: v for k, v in result.items() if k != "ok"}}
 
 
 @router.post("/tasks/{task_id}/skip")
-async def skip_task(task_id: str):
-    """Skip/revoke a task."""
-    from ..temporal_client import cancel_workflow
+async def skip_task(task_id: str, force: bool = False):
+    """Skip/revoke a task, terminating its workflows first.
+
+    Order and honesty both matter here. Marking the row `revoked` while the
+    pipeline is still alive is the worst outcome available: /api/task-progress
+    discards reports for terminal tasks, so the dashboard shows a stopped task
+    while bytes keep landing on BOS and staging keeps filling. The old code
+    swallowed every cancel error (`except Exception: pass`) and returned 200
+    regardless.
+
+    So: terminate first, mark revoked only once Temporal confirms closed. If
+    termination fails the state is left alone and the call reports it —
+    `?force=true` marks the row anyway for the case where Temporal itself is
+    down and the operator accepts an untracked pipeline.
+    """
+    from ..temporal_client import terminate_workflow_and_wait
+
+    def _get():
+        from ...queue.snapshot import get_task, init_db
+        init_db()
+        return get_task(task_id)
+
+    task = await run_blocking(_get)
+    if not task:
+        raise HTTPException(400, f"Task not found: {task_id}")
+
+    closed = False
+    try:
+        closed = await terminate_workflow_and_wait(task_id)
+    except Exception as e:
+        logger.error(f"skip {task_id}: terminate failed: {e}")
+        if not force:
+            raise HTTPException(502, (
+                f"could not terminate workflows for {task_id}: {e} — task state "
+                "unchanged. Retry, or pass ?force=true to revoke the row anyway "
+                "(the pipeline may keep running untracked)."
+            ))
+    if not closed and not force:
+        raise HTTPException(502, (
+            f"workflows for {task_id} did not close within timeout — task state "
+            "unchanged. Retry, or pass ?force=true to revoke the row anyway "
+            "(the pipeline may keep running untracked)."
+        ))
 
     def _do():
-        from ...queue.snapshot import get_task, update_task_progress, init_db
+        from ...queue.snapshot import update_task_progress, init_db
         init_db()
-
-        task = get_task(task_id)
-        if not task:
-            return {"error": f"Task not found: {task_id}"}
-
         update_task_progress(task_id, status="revoked", phase=None, speed_mbps=0)
-        return {"id": task_id, "status": "skipped"}
+        return {"id": task_id, "status": "skipped", "workflows_closed": closed}
 
-    result = await run_blocking(_do)
-    if "error" in result:
-        raise HTTPException(400, result["error"])
-
-    # Cancel Temporal workflow (best effort)
-    try:
-        await cancel_workflow(task_id)
-    except Exception:
-        pass
-
-    return result
+    return await run_blocking(_do)
 
 
 @router.delete("/tasks/{task_id}")
-async def delete_task(task_id: str):
-    """Delete a task."""
-    from ..temporal_client import cancel_workflow
+async def delete_task(task_id: str, force: bool = False):
+    """Delete a task, terminating its workflows first.
+
+    The rows are the only handle on the running work: deleting them first
+    (what this did) removes the shards from get_running_shards(), so
+    busy_servers frees hosts that are still writing to /data/staging and
+    terminate loses the children it would have found through those rows.
+    """
+    from ..temporal_client import terminate_workflow_and_wait
+
+    def _get():
+        from ...queue.snapshot import get_task, init_db
+        init_db()
+        return get_task(task_id)
+
+    task = await run_blocking(_get)
+    if not task:
+        raise HTTPException(400, f"Task not found: {task_id}")
+
+    closed = False
+    try:
+        closed = await terminate_workflow_and_wait(task_id)
+    except Exception as e:
+        logger.error(f"delete {task_id}: terminate failed: {e}")
+        if not force:
+            raise HTTPException(502, (
+                f"could not terminate workflows for {task_id}: {e} — nothing "
+                "deleted. Retry, or pass ?force=true."
+            ))
+    if not closed and not force:
+        raise HTTPException(502, (
+            f"workflows for {task_id} did not close within timeout — nothing "
+            "deleted. Retry, or pass ?force=true."
+        ))
 
     def _do():
-        from ...queue.snapshot import get_task, delete_task, init_db
+        from ...queue.snapshot import delete_task as db_delete, init_db
         init_db()
+        db_delete(task_id)
+        return {"id": task_id, "deleted": True, "workflows_closed": closed}
 
-        task = get_task(task_id)
-        if not task:
-            return {"error": f"Task not found: {task_id}"}
-
-        delete_task(task_id)
-        return {"id": task_id, "deleted": True}
-
-    result = await run_blocking(_do)
-    if "error" in result:
-        raise HTTPException(400, result["error"])
-
-    # Cancel Temporal workflow (best effort)
-    try:
-        await cancel_workflow(task_id)
-    except Exception:
-        pass
-
-    return result
+    return await run_blocking(_do)
 
 
 class ParseRequest(BaseModel):

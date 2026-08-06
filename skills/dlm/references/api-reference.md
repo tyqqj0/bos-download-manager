@@ -20,7 +20,7 @@ Each active download: `id`, `name`, `server`, `speed_mbps`, `progress_pct`, `dow
 | POST | `/api/tasks` | Create task. Body: `url_or_repo`, `category`, `type`, `priority`, `name?`, `size_gb?`, `no_dispatch?` |
 | POST | `/api/queue/add` | Create task (queue-native). Body: `repo_id`, `name?`, `type`, `category`, `source`, `priority` (0=jump queue), `shard_count` (0=auto) |
 | GET | `/api/tasks/{id}` | Get single task (incl. `resume_skipped_files/gb` — BOS resume filter evidence) |
-| POST | `/api/tasks/{id}/skip` | Revoke task + terminate its workflows |
+| POST | `/api/tasks/{id}/skip` | Terminate workflows, then revoke. 502 (state unchanged) if they don't close; `?force=true` revokes anyway |
 | POST | `/api/tasks/{id}/retry` | Requeue a failed/revoked/paused/pending task |
 | POST | `/api/queue/pause` | Pause (durable — progress reports cannot resurrect). Body: `task_id` |
 | POST | `/api/queue/resume` | Requeue a paused task. Body: `task_id` |

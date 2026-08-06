@@ -73,7 +73,8 @@ curl -X POST http://154.85.43.52:8080/api/queue/reshard -H 'Content-Type: applic
 # Pause (resumable) / resume / revoke
 curl -X POST .../api/queue/pause  -d '{"task_id":"t-..."}'
 curl -X POST .../api/queue/resume -d '{"task_id":"t-..."}'
-curl -X POST .../api/tasks/{id}/skip        # revoke + terminate workflows (sweeps suffixed IDs too)
+curl -X POST .../api/tasks/{id}/skip        # terminate workflows, THEN revoke (refuses 502 if they don't close;
+                                            # ?force=true revokes anyway. Same for DELETE /api/tasks/{id})
 
 # Inspect
 curl .../api/dashboard ; curl .../api/tasks/{id}/shards ; curl .../api/doctor
