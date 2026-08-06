@@ -58,32 +58,6 @@ def _worker(db, key, *, disk_free_gb=500):
 
 
 @pytest.fixture(autouse=True)
-def _never_touch_the_production_alert_log(monkeypatch, tmp_path):
-    """Two independent guards, because one monkeypatch is "unlikely", not
-    "impossible" (see the section-0 note below for what this cost):
-
-    1. the module's cached logger is replaced with a NullHandler-only one, so
-       _get_alert_logger() short-circuits and never builds a FileHandler;
-    2. ALERT_LOG_PATH points at this test's tmp_path, so anything that DOES
-       rebuild the logger — including a test that deliberately resets the
-       cache — lands in the test's own directory.
-
-    _active_alerts is reset too: it is module-global de-dupe state, and a leak
-    across tests turns one test's alerts into another's RESOLVED lines.
-    """
-    import logging as _logging
-    from dlm.web import alerts as alerts_mod
-
-    monkeypatch.setattr(alerts_mod, "ALERT_LOG_PATH", tmp_path / "dlm-alerts.log")
-
-    null = _logging.getLogger("dlm.alerts.pytest-null")
-    null.handlers = [_logging.NullHandler()]
-    null.propagate = False
-    monkeypatch.setattr(alerts_mod, "_alert_logger", null)
-    monkeypatch.setattr(alerts_mod, "_active_alerts", {})
-
-
-@pytest.fixture(autouse=True)
 def _isolate_patrol_state():
     """Trigger 1's zero-poller confirmation streak is module state that spans
     patrol cycles by design (review finding I8). Reset it around every test so
@@ -101,11 +75,16 @@ def _isolate_patrol_state():
 #
 # check_alerts unconditionally calls _get_alert_logger(), which opens
 # logging.FileHandler(alerts.ALERT_LOG_PATH) in append mode and swallows only
-# OSError/PermissionError. This file is the suite's only caller. On a dev box
-# /data is absent so nothing happens — but on S1 /data exists and
+# OSError/PermissionError. This file is the suite's only caller of
+# check_alerts today, but the guard against it now lives in
+# tests/conftest.py as an autouse fixture (review finding M4) — structural,
+# not per-file discipline, so a future test file that starts calling
+# check_alerts is covered without remembering to copy this block. On a dev
+# box /data is absent so nothing happens — but on S1 /data exists and
 # scripts/deploy-workers.sh runs `pytest tests/ -q` as its deploy gate, so
 # every deploy appended fabricated CRITICALs ("pool-hf has 0 activity
-# pollers") and RESOLVED churn to the live incident log a human greps.
+# pollers") and RESOLVED churn to the live incident log a human greps. The
+# two tests below pin the conftest.py guard itself.
 
 
 def test_no_test_in_this_file_can_touch_the_production_alert_log(db, monkeypatch, tmp_path):
@@ -1056,6 +1035,34 @@ def test_the_exemption_predicate_gates_on_dispatch_mode():
     assert pool_task_holds_no_work({"dispatch_mode": "pool"}, queued) is True
     assert pool_task_holds_no_work({"dispatch_mode": "sharded"}, queued) is False
     assert pool_task_holds_no_work({}, queued) is False  # default is sharded
+
+
+def test_read_state_only_fetches_pool_batches_for_stale_tasks(db):
+    """Review finding M3: pool_batches used to be fetched for every
+    downloading pool task regardless of staleness — diagnose()'s stuck check
+    only ever consults it for a task already past STALE_THRESHOLD (see the
+    `if age > STALE_THRESHOLD` gate above the exemption call), and fix()
+    discards it outright, so a task not yet past the threshold was a batch
+    read (up to POOL_MAX_CONCURRENT_TASKS x N sources) neither caller could
+    act on."""
+    from dlm.web.fleet import STALE_THRESHOLD
+    from dlm.web.routes.doctor import _read_state
+
+    _task(db, "t-fresh-batches", status="downloading", mode="pool",
+          updated_at=time.time())
+    db.upsert_shard({"id": "s-fb-0", "task_id": "t-fresh-batches", "shard_index": 0,
+                      "status": "pending"})
+
+    _task(db, "t-stale-batches", status="downloading", mode="pool",
+          updated_at=time.time() - STALE_THRESHOLD - 60)
+    db.upsert_shard({"id": "s-sb-0", "task_id": "t-stale-batches", "shard_index": 0,
+                      "status": "pending"})
+
+    _, _, _, pool_batches = _read_state()
+
+    assert "t-fresh-batches" not in pool_batches
+    assert "t-stale-batches" in pool_batches
+    assert len(pool_batches["t-stale-batches"]) == 1
 
 
 def test_doctor_still_reports_a_pool_task_with_a_running_batch_as_stuck(db, monkeypatch):

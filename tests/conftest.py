@@ -11,6 +11,46 @@ import threading
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_the_production_alert_log(monkeypatch, tmp_path):
+    """Structural version of a guard review finding I5 first pinned only in
+    tests/test_pool_observability.py, moved here per review finding M4 so a
+    future test file that starts calling check_alerts is covered without
+    remembering to copy it.
+
+    check_alerts unconditionally calls _get_alert_logger(), which opens
+    logging.FileHandler(alerts.ALERT_LOG_PATH) in append mode and swallows
+    only OSError/PermissionError. On a dev box /data is absent so nothing
+    happens — but scripts/deploy-workers.sh runs `pytest tests/ -q` as its
+    deploy gate on S1, where /data exists, so any test that reaches
+    check_alerts without this guard appends fabricated alerts (and RESOLVED
+    churn) to the live incident log a human greps.
+
+    Two independent guards, because one monkeypatch is "unlikely", not
+    "impossible" (see tests/test_pool_observability.py's pinning tests for
+    what dropping either one costs):
+
+    1. the module's cached logger is replaced with a NullHandler-only one, so
+       _get_alert_logger() short-circuits and never builds a FileHandler;
+    2. ALERT_LOG_PATH points at this test's tmp_path, so anything that DOES
+       rebuild the logger — including a test that deliberately resets the
+       cache — lands in the test's own directory.
+
+    _active_alerts is reset too: it is module-global de-dupe state, and a leak
+    across tests turns one test's alerts into another's RESOLVED lines.
+    """
+    import logging as _logging
+    from dlm.web import alerts as alerts_mod
+
+    monkeypatch.setattr(alerts_mod, "ALERT_LOG_PATH", tmp_path / "dlm-alerts.log")
+
+    null = _logging.getLogger("dlm.alerts.pytest-null")
+    null.handlers = [_logging.NullHandler()]
+    null.propagate = False
+    monkeypatch.setattr(alerts_mod, "_alert_logger", null)
+    monkeypatch.setattr(alerts_mod, "_active_alerts", {})
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     """A fresh, isolated SQLite snapshot DB for one test.

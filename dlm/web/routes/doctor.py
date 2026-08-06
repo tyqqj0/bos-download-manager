@@ -32,7 +32,12 @@ def _read_state() -> tuple[list, list, list, dict]:
     the handler would be a SQLite call on the event loop that
     tests/test_event_loop_safety.py cannot see (its AST scan only inspects a
     handler's own body, so a helper doing the read would pass and still be
-    wrong). Bounded by POOL_MAX_CONCURRENT_TASKS, not by the task table.
+    wrong). Narrowed to tasks already past STALE_THRESHOLD (review finding
+    M3) — pool_task_holds_no_work's exemption is only ever consulted for a
+    task the stuck check has already aged past that threshold, and `fix()`
+    doesn't use pool_batches at all, so fetching it for every downloading
+    pool task (up to POOL_MAX_CONCURRENT_TASKS x N sources) was reading rows
+    neither caller could act on.
     """
     from ...queue.snapshot import (
         get_all_tasks, get_running_shards, get_shards_by_task, get_workers, init_db,
@@ -41,11 +46,13 @@ def _read_state() -> tuple[list, list, list, dict]:
 
     init_db()
     tasks = get_all_tasks()
+    now = time.time()
     pool_batches = {
         t["id"]: get_shards_by_task(t["id"])
         for t in tasks
         if t.get("status") == "downloading"
         and (t.get("dispatch_mode") or "sharded") == "pool"
+        and now - (t.get("updated_at") or 0) > STALE_THRESHOLD
     }
     return (tasks, dedupe_workers(get_workers()), get_running_shards(),
             pool_batches)
