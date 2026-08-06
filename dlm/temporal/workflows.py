@@ -7,7 +7,8 @@ from datetime import timedelta
 from typing import Optional
 
 from temporalio import workflow
-from temporalio.common import RetryPolicy
+from temporalio.common import Priority, RetryPolicy
+from temporalio.workflow import ActivityCancellationType
 
 with workflow.unsafe.imports_passed_through():
     from ..core.naming import shard_task_name
@@ -795,3 +796,366 @@ class ShardedDownloadWorkflow:
             files_uploaded=total_uploaded,
             bytes_uploaded=total_bytes_up,
         )
+
+
+# ── Pool dispatch (work-stealing) ───────────────────────────────────
+
+# A pool batch waits in a shared queue behind every other task's batches, so
+# its timers are sized for queueing, not just for running:
+#   schedule_to_close  the ONLY timer covering queue wait + all retries. An
+#                      empty pool (every worker down) would otherwise sit
+#                      silent forever instead of failing the task.
+#   start_to_close     one attempt's ceiling — a 32 GiB batch on a slow link.
+#   heartbeat          run_pool_batch beats through preflight and the engine.
+# Deliberately no schedule_to_start: a retry would land back on the same
+# empty queue, so timing out on "not started yet" only destroys work.
+POOL_BATCH_SCHEDULE_TO_CLOSE = timedelta(hours=48)
+POOL_BATCH_START_TO_CLOSE = timedelta(hours=12)
+POOL_BATCH_HEARTBEAT = timedelta(minutes=10)
+
+# 5 minutes, not 30 seconds: a batch that failed because its worker died
+# should not be re-dispatched onto the same still-dying worker three times in
+# 90 seconds. Temporal has no anti-affinity, so backoff is the only lever.
+POOL_BATCH_RETRY = RetryPolicy(
+    initial_interval=timedelta(minutes=5),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=30),
+    maximum_attempts=3,
+    non_retryable_error_types=NON_RETRYABLE_ERRORS + [
+        "BatchLimitExceededError",
+        "PoolBatchMismatch",
+    ],
+)
+
+
+@workflow.defn
+class PoolDownloadWorkflow:
+    """Coordinator for pool (work-stealing) dispatch.
+
+    Where ShardedDownloadWorkflow cuts the repo into one shard per worker up
+    front and hands each worker a child workflow, this cuts it into many
+    small batches and keeps a sliding window of them in flight on a shared
+    queue. Any worker that finishes a batch takes the next one, so a worker
+    that joins late, recovers, or simply runs faster contributes without a
+    reshard — and two tasks can share a fleet without either one having to
+    own whole machines.
+
+    Determinism rules this loop must keep (a replay that violates one fails
+    with NonDeterminismError after the next deploy, not now):
+      * `workflow.start_activity` WITHOUT await — awaiting serializes the
+        whole window into one batch at a time.
+      * `workflow.wait(..., FIRST_COMPLETED)`, never `asyncio.wait`: the
+        latter returns real sets, whose iteration order varies per process.
+      * completed handles processed in batch-index order, and every
+        `h.result()` wrapped — an uncaught ActivityError kills the workflow
+        and cancels every in-flight batch with it.
+    """
+
+    @workflow.run
+    async def run(self, task_input: TaskInput) -> TaskResult:
+        task_id = task_input.id
+
+        await workflow.execute_activity(
+            "report_to_dashboard",
+            args=[task_id, "downloading", "listing files", 0, 0, 0, None, None],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        # Step 1: list — same activity the sharded path uses, and like it,
+        # everything downstream reads the filelist off this worker's disk, so
+        # those activities are pinned to its personal queue.
+        try:
+            filelist_result = await workflow.execute_activity(
+                "list_repo_files",
+                args=[task_input],
+                start_to_close_timeout=timedelta(minutes=30),
+                heartbeat_timeout=timedelta(minutes=3),
+                retry_policy=ACTIVITY_RETRY,
+            )
+        except Exception as e:
+            return await self._fail(task_id, str(e)[:500])
+
+        listing_queue = filelist_result.get("worker_queue", "download-workers")
+        if filelist_result.get("count", 0) == 0:
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_id, "done", "empty repo", 100, 0, 0, None, None],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            return TaskResult(status="done")
+
+        # Step 2: BOS-aware resume filter (pinned to the listing worker)
+        try:
+            filter_result = await workflow.execute_activity(
+                "filter_filelist_against_bos",
+                args=[filelist_result["path"], task_input],
+                task_queue=listing_queue,
+                start_to_close_timeout=timedelta(minutes=15),
+                heartbeat_timeout=timedelta(minutes=3),
+                retry_policy=ACTIVITY_RETRY,
+            )
+        except Exception as e:
+            return await self._fail(task_id, f"BOS resume filter failed: {str(e)[:400]}")
+
+        skipped_files = filter_result["skipped_files"]
+        skipped_gb = filter_result["skipped_bytes"] / (1024 ** 3)
+
+        await workflow.execute_activity(
+            "report_resume_info",
+            args=[task_id, skipped_files, skipped_gb],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        if filter_result["remaining_files"] == 0:
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_id, "done",
+                      f"all {skipped_files} files already on BOS", 100, 0,
+                      round(skipped_gb, 2), None, None],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            return TaskResult(status="done")
+
+        # Step 3: chunk into batches (pinned — reads the filtered filelist)
+        try:
+            chunks = await workflow.execute_activity(
+                "chunk_filelist",
+                args=[filter_result["filtered_path"], task_input],
+                task_queue=listing_queue,
+                start_to_close_timeout=timedelta(minutes=15),
+                heartbeat_timeout=timedelta(minutes=3),
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=30),
+                    maximum_attempts=3,
+                    non_retryable_error_types=NON_RETRYABLE_ERRORS + ["BatchLimitExceededError"],
+                ),
+            )
+        except Exception as e:
+            return await self._fail(task_id, f"Chunking failed: {str(e)[:400]}")
+
+        batch_keys = chunks["batch_keys"]
+        batch_counts = chunks["counts"]
+        batch_bytes = chunks["bytes"]
+        num_batches = len(batch_keys)
+        if num_batches == 0:
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_id, "done", "nothing left to download", 100, 0,
+                      round(skipped_gb, 2), None, None],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            return TaskResult(status="done")
+
+        # Step 4: batch rows. Idempotent — a retry re-sends the identical
+        # body and resets any row a dead attempt left running.
+        batch_infos = [
+            {
+                "shard_index": i,
+                "filelist_key": batch_keys[i],
+                "total_files": batch_counts[i],
+                "total_bytes": batch_bytes[i],
+            }
+            for i in range(num_batches)
+        ]
+        try:
+            create_result = await workflow.execute_activity(
+                "create_pool_batches_in_db",
+                args=[task_id, batch_infos],
+                start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(seconds=30),
+                    maximum_attempts=3,
+                    non_retryable_error_types=NON_RETRYABLE_ERRORS + ["PoolBatchMismatch"],
+                ),
+            )
+        except Exception as e:
+            return await self._fail(task_id, f"Batch row creation failed: {str(e)[:400]}")
+
+        if create_result.get("ignored"):
+            # An operator stopped the task while we were listing. Its status is
+            # already whatever they set; do not overwrite it.
+            return TaskResult(status="paused", error="task stopped before dispatch")
+
+        shard_ids = create_result["shard_ids"]
+
+        phase = f"pool: {num_batches} batches"
+        if skipped_files:
+            phase += f", skipped {skipped_files} files ({skipped_gb:.1f} GB) on BOS"
+        await workflow.execute_activity(
+            "report_to_dashboard",
+            args=[task_id, "downloading", phase, 0, 0, 0, None, None],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        # Step 5: the window loop.
+        outcome = await self._run_window_loop(
+            task_input, shard_ids, batch_keys, list(range(num_batches))
+        )
+
+        # Step 6: one re-dispatch round for whatever failed. A single poison
+        # worker can eat a batch's three attempts and fail an otherwise
+        # healthy task; a second pass usually lands the batch elsewhere.
+        retried_failures: list[int] = []
+        if outcome["failed"]:
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_id, "downloading",
+                      f"retrying {len(outcome['failed'])} failed batches",
+                      None, None, None, None, None],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            retry_outcome = await self._run_window_loop(
+                task_input, shard_ids, batch_keys, sorted(outcome["failed"])
+            )
+            retried_failures = retry_outcome["failed"]
+            outcome["uploaded_files"] += retry_outcome["uploaded_files"]
+            outcome["uploaded_bytes"] += retry_outcome["uploaded_bytes"]
+
+        await workflow.execute_activity(
+            "aggregate_task_from_shards",
+            args=[task_id],
+            start_to_close_timeout=timedelta(seconds=60),
+        )
+
+        if retried_failures:
+            return await self._fail(
+                task_id,
+                f"{len(retried_failures)}/{num_batches} batches failed after retry",
+            )
+
+        total_gb = outcome["uploaded_bytes"] / (1024 ** 3)
+        await workflow.execute_activity(
+            "report_to_dashboard",
+            args=[task_id, "done", None, 100, 0, round(total_gb, 2), None, None],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        return TaskResult(
+            status="done",
+            files_uploaded=outcome["uploaded_files"],
+            bytes_uploaded=outcome["uploaded_bytes"],
+        )
+
+    async def _fail(self, task_id: str, error: str) -> TaskResult:
+        await workflow.execute_activity(
+            "report_to_dashboard",
+            args=[task_id, "failed", None, None, None, None, None, error],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        return TaskResult(status="failed", error=error)
+
+    async def _run_window_loop(
+        self,
+        task_input: TaskInput,
+        shard_ids: list,
+        batch_keys: list,
+        pending: list,
+    ) -> dict:
+        """Keep up to `window` batches in flight until `pending` is drained.
+
+        `pending` is a list of batch indices, consumed in order. Returns
+        `{"failed": [idx...], "uploaded_files": int, "uploaded_bytes": int}`.
+        """
+        task_id = task_input.id
+        queue = f"pool-{'ms' if task_input.source == 'modelscope' else 'hf'}"
+        # Priority 0-2 is the queue-jump band; Temporal's in-queue priority is
+        # a free tie-break on top of the window, never the fairness mechanism.
+        priority = Priority(priority_key=1 if (task_input.priority or 0) <= 2 else 3)
+
+        remaining = list(pending)
+        in_flight: dict = {}       # batch_index -> activity handle
+        window = 1                 # first wake recomputes it from live P
+        uploaded_files = 0
+        uploaded_bytes = 0
+        failed: list = []
+
+        try:
+            while remaining or in_flight:
+                # Fill the window. start_activity, NOT execute_activity: an
+                # await here would run the window one batch at a time.
+                while remaining and len(in_flight) < window:
+                    idx = remaining.pop(0)
+                    in_flight[idx] = workflow.start_activity(
+                        "run_pool_batch",
+                        args=[task_input, idx, batch_keys[idx]],
+                        task_queue=queue,
+                        schedule_to_close_timeout=POOL_BATCH_SCHEDULE_TO_CLOSE,
+                        start_to_close_timeout=POOL_BATCH_START_TO_CLOSE,
+                        heartbeat_timeout=POOL_BATCH_HEARTBEAT,
+                        retry_policy=POOL_BATCH_RETRY,
+                        cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+                        priority=priority,
+                    )
+
+                if not in_flight:
+                    break
+
+                # workflow.wait, never asyncio.wait — the latter's real sets
+                # iterate in process-dependent order and replay explodes.
+                await workflow.wait(
+                    list(in_flight.values()), return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # Sorted by batch index so the sequence of activity calls this
+                # produces is identical on replay.
+                results = []
+                for idx in sorted(in_flight):
+                    handle = in_flight[idx]
+                    if not handle.done():
+                        continue
+                    try:
+                        stats = handle.result()
+                    except Exception as e:
+                        failed.append(idx)
+                        results.append({
+                            "batch_index": idx,
+                            "shard_id": shard_ids[idx],
+                            "status": "failed",
+                            "error": str(e)[:500],
+                        })
+                        continue
+                    if stats and stats.get("ignored"):
+                        # Parent task stopped: the batch declined to run and
+                        # the row must stay as the operator left it.
+                        continue
+                    uploaded_files += (stats or {}).get("uploaded_files", 0)
+                    uploaded_bytes += (stats or {}).get("uploaded_bytes", 0)
+                    results.append({
+                        "batch_index": idx,
+                        "shard_id": shard_ids[idx],
+                        "status": "done",
+                        "error": None,
+                    })
+
+                for r in results:
+                    in_flight.pop(r["batch_index"], None)
+                # Handles that finished with `ignored` are done too, and must
+                # not be waited on again.
+                for idx in [i for i, h in in_flight.items() if h.done()]:
+                    in_flight.pop(idx, None)
+
+                # One bookkeeping activity per wake: writes the terminal batch
+                # rows and returns the recomputed window.
+                window_info = await workflow.execute_activity(
+                    "record_batches_and_window",
+                    args=[task_id, results],
+                    start_to_close_timeout=timedelta(minutes=5),
+                    retry_policy=ACTIVITY_RETRY,
+                )
+                window = max(1, int(window_info.get("window", 1)))
+        except asyncio.CancelledError:
+            # Shielded: a bare activity call here would itself be cancelled,
+            # leaving rows claiming workers that have already stopped.
+            await asyncio.shield(
+                workflow.execute_activity(
+                    "release_pool_batches",
+                    args=[task_id],
+                    start_to_close_timeout=timedelta(minutes=2),
+                )
+            )
+            raise
+
+        return {
+            "failed": failed,
+            "uploaded_files": uploaded_files,
+            "uploaded_bytes": uploaded_bytes,
+        }

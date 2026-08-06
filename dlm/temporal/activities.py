@@ -1267,3 +1267,116 @@ async def run_pool_batch(
         "total_files": total_files,
         "total_bytes": total_bytes,
     }
+
+
+# ── Pool coordinator bookkeeping (T5) ───────────────────────────────
+
+
+@activity.defn
+async def create_pool_batches_in_db(task_id: str, batch_infos: list[dict]) -> dict:
+    """Create this task's batch rows via T1's idempotent pool endpoint.
+
+    Returns `{"ignored": bool, "shard_ids": [...]}`. `ignored` means an
+    operator stopped the task (or it no longer exists) — that response
+    carries no `shard_ids`, so the coordinator must check it before reading
+    them. Blind-indexing `data["shard_ids"]` the way `create_shards_in_db`
+    does would KeyError here and burn every retry against a task that was
+    deliberately paused.
+
+    A mismatch (rows on file whose chunking differs from what we just
+    computed) is raised non-retryable: the endpoint deliberately does not
+    delete rows that in-flight batches may already be reporting against, so
+    retrying re-sends the identical body and fails identically. Recovery is
+    an operator action — reshard the task, which requeues it and clears the
+    old rows.
+    """
+    import requests
+    resp = requests.post(
+        f"{_coordinator()}/api/pool/batches/create",
+        json={
+            "task_id": task_id,
+            "shard_infos": batch_infos,
+            "expected_count": len(batch_infos),
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("ignored"):
+        return {"ignored": True, "shard_ids": []}
+    if data.get("error"):
+        raise ApplicationError(
+            f"pool batch rows for {task_id} do not match this chunking "
+            f"({data['error']}); reshard the task to clear them",
+            type="PoolBatchMismatch",
+            non_retryable=True,
+        )
+    return {"ignored": False, "shard_ids": data["shard_ids"]}
+
+
+@activity.defn
+async def record_batches_and_window(task_id: str, results: list[dict]) -> dict:
+    """Write finished batches' terminal rows, then read the new window size.
+
+    One activity per coordinator wake, not one per batch: the window loop
+    wakes on every batch completion, and separate bookkeeping activities
+    would roughly double each batch's history footprint (~12 events vs ~6),
+    putting a 1,500-batch task near Temporal's 10k-event warning line.
+
+    `results` is `[{"batch_index": int, "shard_id": str, "status":
+    "done"|"failed", "error": str|None}, ...]` — only batches that finished
+    since the last wake. Terminal batch rows are written here, i.e. by the
+    coordinator (G4: the activities that *run* batches only ever raise).
+    A row whose parent task is already terminal is skipped by the endpoint's
+    own guard, so a late wake cannot resurrect a stopped task.
+
+    Returns `{"window": int, "p": int, ...}` — the window this task may keep
+    in flight until the next wake.
+    """
+    import requests
+
+    for r in sorted(results, key=lambda r: r.get("batch_index", 0)):
+        payload = {"shard_id": r["shard_id"], "status": r["status"]}
+        if r.get("error"):
+            payload["error"] = str(r["error"])[:500]
+        resp = requests.post(
+            f"{_coordinator()}/api/shards/status", json=payload, timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(
+                f"recording batch {r.get('batch_index')} of {task_id} "
+                f"as {r['status']} failed: {data['error']}"
+            )
+        activity.heartbeat(f"recorded batch {r.get('batch_index')} as {r['status']}")
+
+    resp = requests.get(
+        f"{_coordinator()}/api/pool/window", params={"task_id": task_id}, timeout=30
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(f"window query for {task_id} failed: {data['error']}")
+    return data
+
+
+@activity.defn
+async def release_pool_batches(task_id: str) -> int:
+    """Release this task's non-done batch rows back to pending.
+
+    Called from the coordinator's cancellation path (shielded) so a paused or
+    terminated task leaves no row claiming a worker that has stopped working
+    on it. Returns how many rows were released.
+    """
+    import requests
+    resp = requests.post(
+        f"{_coordinator()}/api/pool/batches/release",
+        json={"task_id": task_id},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(f"releasing batches of {task_id} failed: {data['error']}")
+    return int(data.get("released", 0))

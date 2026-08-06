@@ -765,6 +765,87 @@ async def pool_alive_workers_api(source: str = "hf"):
     return await _run_blocking(do_query)
 
 
+@router.get("/pool/window")
+async def pool_window_api(task_id: str):
+    """This task's current window size — how many batches it may keep in
+    flight. Called once per coordinator wake by `record_batches_and_window`.
+
+    `window = max(1, floor(P * W_self / sum(W_active)))`, P = alive workers
+    serving this task's source. Computed here, not on the worker, because
+    every input is S1-local state and the weights are fleet policy (fleet.py
+    owns them alongside MIN_SHARD_DISK_GB).
+
+    The floor of 1 is what keeps a task alive when it is outvoted: a task
+    whose fair share rounds to zero still gets one slot and makes progress
+    slowly, rather than stalling until its neighbours finish. The `sum`
+    bounds total pool concurrency at ~P however many tasks are admitted.
+    """
+    from ..fleet import alive_workers, pool_task_weight, worker_serves
+
+    def do_query():
+        snapshot.init_db()
+        task = snapshot.get_task(task_id)
+        if not task:
+            return {"error": f"Task {task_id} not found"}
+
+        source = task.get("source") or "hf"
+        p = len([
+            w.get("server_key") for w in alive_workers(snapshot.get_workers())
+            if worker_serves(w.get("server_key") or "", source)
+        ])
+
+        # Active = pool-mode tasks still downloading on the same source. A
+        # task competing for a different source's workers doesn't consume
+        # this task's P, so it must not dilute the share either.
+        active = [
+            t for t in snapshot.get_tasks_by_status("downloading")
+            if (t.get("dispatch_mode") or "sharded") == "pool"
+            and (t.get("source") or "hf") == source
+        ]
+        w_self = pool_task_weight(task.get("priority") or 0)
+        w_sum = sum(pool_task_weight(t.get("priority") or 0) for t in active)
+        # This task may not be in `active` yet (its own status write races the
+        # first wake), so make sure it is counted.
+        if not any(t.get("id") == task_id for t in active):
+            w_sum += w_self
+
+        window = max(1, int(p * w_self / w_sum)) if w_sum > 0 else 1
+        return {
+            "window": window, "p": p, "weight": w_self,
+            "weight_sum": w_sum, "active_pool_tasks": len(active),
+        }
+    return await _run_blocking(do_query)
+
+
+@router.post("/pool/batches/release")
+async def release_pool_batches(body: dict):
+    """Reset this task's in-flight batch rows to pending/server=NULL/speed=0.
+
+    The coordinator's cancellation path calls this (shielded) so a paused or
+    reshard-bound task leaves no row claiming to be running on a worker that
+    has already stopped — those rows are what busy_servers, the dashboard and
+    the reconciler read. `done` rows are left alone: their bytes are on BOS.
+
+    No TERMINAL guard: unlike assign/status this only ever *releases* rows,
+    and the task being terminal is precisely when it is called.
+    """
+    task_id = body.get("task_id", "")
+    if not task_id:
+        return {"error": "task_id is required"}
+
+    def do_release():
+        snapshot.init_db()
+        conn = snapshot._conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE shards SET status='pending', server=NULL, speed_mbps=0 "
+                "WHERE task_id=? AND status!='done'",
+                (task_id,),
+            )
+        return {"ok": True, "released": cur.rowcount}
+    return await _run_blocking(do_release)
+
+
 @router.post("/queue/reshard")
 async def reshard_task(body: dict):
     """Change a task's shard count via lossless restart.

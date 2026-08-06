@@ -25,6 +25,21 @@ POOL_MAX_CONCURRENT_TASKS = int(os.environ.get("DLM_POOL_MAX_CONCURRENT_TASKS", 
 DEFAULT_DISPATCH_MODE = os.environ.get("DLM_DEFAULT_DISPATCH_MODE", "sharded")
 POOL_MAX_BATCHES = 1500  # a task chunking past this many batches needs splitting, not a bigger pool
 
+# Window weights per priority band. The coordinator's per-wake window is
+# `max(1, floor(P * W_i / sum(W_active)))` — P being alive workers serving the
+# source — so these decide how a busy pool is split between concurrent pool
+# tasks. Priority 0-2 ("P0", the queue-jump band) gets 1.5x the share of
+# everything else; the sum keeps total concurrency bounded by P no matter how
+# many tasks are admitted.
+POOL_WEIGHT_P0 = 1.5
+POOL_WEIGHT_DEFAULT = 1.0
+POOL_P0_MAX_PRIORITY = 2  # priority <= this is the P0 band
+
+
+def pool_task_weight(priority: int) -> float:
+    """Window weight for one pool task's priority."""
+    return POOL_WEIGHT_P0 if (priority or 0) <= POOL_P0_MAX_PRIORITY else POOL_WEIGHT_DEFAULT
+
 # Terminal/operator states. A progress report must never move a task out of
 # one of these — a dying workflow's late report used to resurrect tasks an
 # operator had explicitly stopped (2026-07-31 incident).
