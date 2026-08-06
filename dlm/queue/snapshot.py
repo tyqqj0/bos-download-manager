@@ -133,9 +133,12 @@ def init_db():
 # then present a listing coordinator as "past listing" and the guard would
 # let a second coordinator onto the same source — the exact double dispatch
 # it exists to prevent. Written as one CASE rather than a per-mode branch
-# because there are three claim sites (auto_dispatch, reconcile()'s orphan
-# re-dispatch, /queue/preempt) and a fourth is a matter of time; sharded
-# rows write their own value back, so their behaviour is unchanged.
+# because there are two claim sites a pool task can reach (auto_dispatch and
+# /queue/preempt) and a third is a matter of time; sharded rows write their
+# own value back, so their behaviour is unchanged. reconcile()'s orphan
+# re-dispatch was a third site until decision C stopped re-dispatching pool
+# tasks at all — see the comment at that UPDATE for why the fragment is
+# deliberately absent there.
 CLAIM_RESET_PHASE_SQL = (
     "coordinator_phase = CASE WHEN dispatch_mode = 'pool' "
     "THEN 'listing' ELSE coordinator_phase END"

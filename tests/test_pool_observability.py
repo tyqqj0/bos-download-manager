@@ -409,6 +409,11 @@ def test_stale_orphaned_sharded_task_is_still_redispatched_g1_regression(db, mon
 
     assert "t-sharded-orphan" in report["redispatched"]
     assert "t-sharded-orphan" in calls
+    # claimed_at is refreshed so the listing-phase source guard covers the new
+    # coordinator. The only assertion worth keeping from the test I6 deleted
+    # (tests/test_pool_dispatch.py's retargeted phase test) — after the SQL
+    # fragment came out of that UPDATE this is all it still writes.
+    assert db.get_task("t-sharded-orphan")["claimed_at"] > time.time() - 60
     assert "pool_orphaned" not in report or not any(
         o["task_id"] == "t-sharded-orphan" for o in report["pool_orphaned"]
     )

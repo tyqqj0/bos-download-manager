@@ -614,9 +614,12 @@ def test_dispatch_mode_vocabulary_has_one_definition():
 # coordinator onto the same source — with batch rows gone, "no rows" could
 # not catch it either. Reproduced with a real preempt claim before the fix.
 #
-# The fix is one shared assignment (snapshot.CLAIM_RESET_PHASE_SQL) in all
-# three claim sites; these tests pin the write side of each. Sharded rows
-# write their own value back, which is the G1 case each test also asserts.
+# The fix is one shared assignment (snapshot.CLAIM_RESET_PHASE_SQL) in every
+# claim site a pool task can reach — /queue/preempt and auto_dispatch_pending;
+# these tests pin the write side of each. Sharded rows write their own value
+# back, which is the G1 case each test also asserts. reconcile()'s orphan
+# re-dispatch was a third site until decision C removed pool from that path
+# entirely, so the fragment is gone from there (T9 review finding I6).
 
 
 def test_preempt_claim_resets_stale_pool_phase_to_listing(db, monkeypatch):
@@ -698,41 +701,3 @@ def test_auto_dispatch_claim_resets_stale_pool_phase_to_listing(db, monkeypatch)
     assert row["coordinator_phase"] == "listing"
 
 
-def test_reconcile_redispatch_resets_stale_sharded_phase_to_listing(db, monkeypatch):
-    """reconcile()'s orphan re-dispatch refreshes claimed_at *so the guard
-    covers the new coordinator* — which only works if the phase it reads
-    belongs to that coordinator and not to the dead one.
-
-    Was a pool-mode test before T9 (decision C): T9 moves a stale pool
-    orphan onto report["pool_orphaned"] instead of this re-dispatch path
-    entirely (see tests/test_pool_observability.py), so this task's
-    coordinator_phase would never be touched here for pool anymore — this
-    is now sharded to keep covering the write side of CLAIM_RESET_PHASE_SQL
-    for the path G1 still requires to redispatch exactly as before.
-    """
-    from dlm.web import reconciler
-    import dlm.web.temporal_client as tc
-
-    async def fake_running(client=None):
-        return {}
-
-    async def fake_start(task):
-        return None
-
-    monkeypatch.setattr(tc, "running_workflows", fake_running)
-    monkeypatch.setattr(tc, "start_task_download", fake_start)
-
-    _task(db, "t-orphan", status="downloading", mode="sharded", source="hf")
-    conn = db._conn()
-    with conn:  # stale past DEAD_THRESHOLD (1800s), no shard rows
-        conn.execute(
-            "UPDATE tasks SET updated_at = ? WHERE id = ?",
-            (time.time() - 3600, "t-orphan"),
-        )
-
-    report = asyncio.run(reconciler.reconcile())
-
-    assert "t-orphan" in report["redispatched"], report
-    row = db.get_task("t-orphan")
-    assert row["coordinator_phase"] is None  # sharded: CASE writes its own value back
-    assert row["claimed_at"] > time.time() - 60

@@ -44,7 +44,6 @@ async def reconcile() -> dict:
     Returns a report of actions taken.
     """
     from ..queue.snapshot import (
-        CLAIM_RESET_PHASE_SQL,
         get_tasks_by_status, update_task_progress, get_shards_by_task,
         complete_task, init_db, _conn,
     )
@@ -149,15 +148,18 @@ async def reconcile() -> dict:
                     # The legacy DownloadDatasetWorkflow has no BOS resume
                     # filter and must not be reachable here.
                     # Refresh claimed_at so the listing-phase source guard
-                    # covers this coordinator too, and reset a pool task's
-                    # phase: the new coordinator starts by listing again, so
-                    # a 'dispatching' left by the previous run would tell the
-                    # guard this source needs no protection.
+                    # covers this coordinator too.
+                    # snapshot.CLAIM_RESET_PHASE_SQL is deliberately NOT
+                    # applied here: decision C's `continue` above means only
+                    # sharded tasks reach this UPDATE, and sharded tasks have
+                    # no coordinator_phase — the fragment's CASE would write
+                    # the existing value straight back. It is still applied at
+                    # the claim sites that can see a pool task
+                    # (auto_dispatch_pending below, routes/queue.py's resume).
                     mode = task.get("dispatch_mode") or "sharded"
                     conn2 = _conn()
                     conn2.execute(
-                        f"UPDATE tasks SET claimed_at = ?, {CLAIM_RESET_PHASE_SQL} "
-                        "WHERE id = ?",
+                        "UPDATE tasks SET claimed_at = ? WHERE id = ?",
                         (time.time(), task_id),
                     )
                     conn2.commit()
