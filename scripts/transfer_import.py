@@ -238,6 +238,7 @@ def poll_until_done(dcloud, task_id, item):
 
 
 def main():
+    global STATE_PATH
     parser = argparse.ArgumentParser()
     parser.add_argument("--execute", action="store_true",
                         help="actually import (default: dry-run)")
@@ -250,7 +251,15 @@ def main():
                              "aborting. ONLY safe because the 2026-08-03 rh20t "
                              "experiment proved overwrite/skip-same semantics "
                              "(partial 268MB -> exactly BOS size, no duplication)")
+    parser.add_argument("--state", default=STATE_PATH,
+                        help="state/resume file. A second concurrent lane MUST "
+                             "pass its own: save_state rewrites the whole JSON, "
+                             "so two processes sharing one file lose each "
+                             "other's records (the default file belongs to the "
+                             "round started 2026-08-03)")
     args = parser.parse_args()
+
+    STATE_PATH = args.state
 
     manifest = MANIFEST
     if args.manifest:
