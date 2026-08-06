@@ -25,6 +25,7 @@ function app() {
         transferPaused: false,
         shardDetail: null,
         shardTaskId: null,
+        shardDispatchMode: 'sharded',
 
         // Storage tab state
         storageBucket: 'auwomo-data',
@@ -749,8 +750,10 @@ function app() {
                 const res = await fetch(`/api/tasks/${taskId}/shards`);
                 const data = await res.json();
                 this.shardDetail = data.shards || [];
+                this.shardDispatchMode = data.dispatch_mode || 'sharded';
             } catch (e) {
                 this.shardDetail = [];
+                this.shardDispatchMode = 'sharded';
                 console.error('fetchShards:', e);
             }
         },
@@ -758,6 +761,49 @@ function app() {
         closeShards() {
             this.shardDetail = null;
             this.shardTaskId = null;
+            this.shardDispatchMode = 'sharded';
+        },
+
+        // Per-server aggregation for a pool task's batch rows (decision F) —
+        // collapses up to POOL_MAX_BATCHES (1500) rows into one line per
+        // server actually holding work, instead of a 1500-row table.
+        serverBatches() {
+            const byServer = {};
+            for (const s of (this.shardDetail || [])) {
+                const server = s.server;
+                if (!server) continue;
+                if (!byServer[server]) {
+                    byServer[server] = { server, running: 0, done: 0, speed_mbps: 0, doneBytes: 0, totalBytes: 0 };
+                }
+                const agg = byServer[server];
+                if (s.status === 'running') agg.running += 1;
+                else if (s.status === 'done') agg.done += 1;
+                agg.speed_mbps += s.speed_mbps || 0;
+                agg.doneBytes += s.done_bytes || 0;
+                agg.totalBytes += s.total_bytes || 0;
+            }
+            return Object.values(byServer)
+                .sort((a, b) => a.server.localeCompare(b.server))
+                .map(agg => ({
+                    server: agg.server,
+                    running: agg.running,
+                    done: agg.done,
+                    speed_mbps: agg.speed_mbps,
+                    done_pct: agg.totalBytes ? Math.round((agg.doneBytes / agg.totalBytes) * 1000) / 10 : 0,
+                }));
+        },
+
+        // The modal's error line: unbounded for a pool task's up-to-1500
+        // rows, so cap what is shown there (first few + a count). The
+        // sharded table stays as-is — shard counts are small.
+        shardErrorSummary() {
+            const errored = (this.shardDetail || []).filter(s => s.error);
+            if (this.shardDispatchMode === 'pool') {
+                const shown = errored.slice(0, 5).map(s => `#${s.shard_index}: ${s.error}`);
+                const extra = errored.length - shown.length;
+                return shown.join('; ') + (extra > 0 ? ` (+${extra} more)` : '');
+            }
+            return errored.map(s => `#${s.shard_index}: ${s.error}`).join('; ');
         },
 
         shardPct(shard) {

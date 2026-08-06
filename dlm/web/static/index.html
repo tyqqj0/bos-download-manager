@@ -398,7 +398,7 @@
                     <button @click="closeShards()" class="text-gray-400 hover:text-white text-xl">&times;</button>
                 </div>
                 <div x-show="shardDetail && shardDetail.length === 0" class="text-gray-500 text-sm">No shards found</div>
-                <table x-show="shardDetail && shardDetail.length > 0" class="w-full text-sm">
+                <table x-show="shardDetail && shardDetail.length > 0 && shardDispatchMode !== 'pool'" class="w-full text-sm">
                     <thead>
                         <tr class="text-gray-500 text-xs border-b border-gray-700">
                             <th class="px-2 py-1 text-left">#</th>
@@ -432,9 +432,40 @@
                         </template>
                     </tbody>
                 </table>
+                <!-- Pool tasks: per-server aggregation instead of a
+                     per-batch table — a pool task can carry up to 1500
+                     batch rows in shardDetail. -->
+                <table x-show="shardDetail && shardDetail.length > 0 && shardDispatchMode === 'pool'" class="w-full text-sm">
+                    <thead>
+                        <tr class="text-gray-500 text-xs border-b border-gray-700">
+                            <th class="px-2 py-1 text-left">Server</th>
+                            <th class="px-2 py-1 text-left">Running</th>
+                            <th class="px-2 py-1 text-left">Done</th>
+                            <th class="px-2 py-1 text-left">Progress</th>
+                            <th class="px-2 py-1 text-left">Speed</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="sb in serverBatches()" :key="sb.server">
+                            <tr class="border-b border-gray-700/50">
+                                <td class="px-2 py-1.5 text-gray-300" x-text="sb.server"></td>
+                                <td class="px-2 py-1.5 text-gray-400" x-text="sb.running"></td>
+                                <td class="px-2 py-1.5 text-gray-400" x-text="sb.done"></td>
+                                <td class="px-2 py-1.5 text-gray-400 text-xs">
+                                    <span x-text="sb.done_pct + '%'"></span>
+                                    <div class="w-16 bg-gray-700 rounded-full h-1 mt-0.5">
+                                        <div class="bg-blue-500 h-1 rounded-full"
+                                             :style="`width: ${sb.done_pct}%`"></div>
+                                    </div>
+                                </td>
+                                <td class="px-2 py-1.5 text-blue-300 text-xs font-mono" x-text="sb.speed_mbps ? formatSpeed(sb.speed_mbps) : '-'"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
                 <div class="mt-2 text-xs text-red-400"
                      x-show="shardDetail && shardDetail.some(s => s.error)"
-                     x-text="(shardDetail || []).filter(s => s.error).map(s => '#' + s.shard_index + ': ' + s.error).join('; ')"></div>
+                     x-text="shardErrorSummary()"></div>
             </div>
         </div>
 
