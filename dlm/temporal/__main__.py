@@ -20,6 +20,8 @@ from .workflows import (
     SplitDownloadWorkflow,
     ShardedDownloadWorkflow,
     ShardWorkerWorkflow,
+    PoolDownloadWorkflow,
+    pool_task_queue,
 )
 from .activities import (
     list_repo_files,
@@ -43,7 +45,125 @@ from .activities import (
     download_shard_filelist,
     filter_filelist_against_bos,
     report_resume_info,
+    pool_alive_workers,
+    chunk_filelist,
+    run_pool_batch,
+    create_pool_batches_in_db,
+    record_batches_and_window,
+    release_pool_batches,
 )
+
+
+# Registered on both existing Workers (the coordinator queue and each
+# worker's personal queue) — everything except the pool-batch executor
+# itself, which only the third (pool) Worker below runs.
+WORKFLOWS = [
+    DownloadDatasetWorkflow,
+    SplitDownloadWorkflow,       # keep for bj1-4 backward compat
+    ShardedDownloadWorkflow,
+    ShardWorkerWorkflow,
+    PoolDownloadWorkflow,
+]
+
+ACTIVITIES = [
+    list_repo_files,
+    load_progress,
+    read_filelist,
+    partition_filelist,
+    save_progress,
+    clear_progress,
+    run_pipeline_batch,
+    cleanup_staging,
+    cleanup_all_staging,
+    report_to_dashboard,
+    check_disk_space,
+    partition_files_greedy,
+    create_shards_in_db,
+    update_shard_status,
+    report_shard_progress,
+    query_idle_workers,
+    aggregate_task_from_shards,
+    assign_shard_server,
+    download_shard_filelist,
+    filter_filelist_against_bos,
+    report_resume_info,
+    pool_alive_workers,
+    chunk_filelist,
+    run_pool_batch,
+    create_pool_batches_in_db,
+    record_batches_and_window,
+    release_pool_batches,
+]
+
+
+def _pool_source_for_worker(server_key: str) -> str:
+    """Which pool queue (source) this worker's third Worker should serve.
+
+    Mirrors `dlm.web.fleet.source_for_worker`'s semantics exactly (BJ nodes
+    -> modelscope, everything else -> hf). Re-derived here rather than
+    imported: this module runs ON the workers, and `dlm.web` pulls in
+    FastAPI/uvicorn — dependencies a bare download worker has no business
+    needing. If fleet's routing rule ever changes, this must change with it.
+    """
+    return "modelscope" if server_key.startswith("bj") else "hf"
+
+
+def build_worker_specs(server_key: str, task_queue: str) -> list[dict]:
+    """The task_queue/workflows/activities/concurrency for this process's Workers.
+
+    Three Workers, three jobs:
+      - `task_queue` (default "download-workers"): the shared coordinator
+        queue where `Sharded`/`PoolDownloadWorkflow` coordinators and
+        `DownloadDatasetWorkflow` land.
+      - the worker's personal queue ("download-{server_key}"): activities
+        pinned there because they read a filelist the listing worker wrote
+        to its own local disk (list_repo_files, filter_filelist_against_bos,
+        chunk_filelist, partition_files_greedy, ...).
+      - the pool queue for this worker's source (`pool_task_queue(...)`):
+        `run_pool_batch` only, `workflows=[]` — this Worker never runs a
+        workflow task, only the shared-queue batch executor.
+
+    Why the third one matters: the pool coordinator dispatches batches to
+    `pool-{hf,ms}` via `workflow.start_activity`, with no `schedule_to_start`
+    timeout (by design — see workflows.py's pool section). A deploy that
+    starts Workers for only the first two queues does NOT error: the
+    activity just sits scheduled on a queue nobody polls, bounded only by
+    `schedule_to_close` (48h). Silent stall, not a crash — which is why this
+    registration is pulled into its own testable function rather than left
+    inline in `run_worker`.
+
+    A pure function (no Client/Worker objects) so a test can assert the
+    three-queue layout without a live Temporal connection.
+    """
+    personal_queue = f"download-{server_key}"
+    pool_queue = pool_task_queue(_pool_source_for_worker(server_key))
+
+    specs = []
+    seen_queues = set()
+    for queue, max_concurrent_activities in (
+        (task_queue, 1),
+        (personal_queue, 2),
+    ):
+        if queue in seen_queues:
+            continue
+        seen_queues.add(queue)
+        specs.append({
+            "task_queue": queue,
+            "workflows": WORKFLOWS,
+            "activities": ACTIVITIES,
+            "max_concurrent_activities": max_concurrent_activities,
+        })
+
+    if pool_queue not in seen_queues:
+        seen_queues.add(pool_queue)
+        specs.append({
+            "task_queue": pool_queue,
+            "workflows": [],
+            "activities": [run_pool_batch],
+            "max_concurrent_activities": 1,
+        })
+
+    return specs
 
 
 def parse_args():
@@ -118,54 +238,30 @@ async def run_worker(args):
     os.environ["DLM_SERVER_KEY"] = args.server_key
     os.environ["DLM_WORKER_QUEUE"] = personal_queue
 
-    # Register activities and workflows
-    activities = [
-        list_repo_files,
-        load_progress,
-        read_filelist,
-        partition_filelist,
-        save_progress,
-        clear_progress,
-        run_pipeline_batch,
-        cleanup_staging,
-        cleanup_all_staging,
-        report_to_dashboard,
-        check_disk_space,
-        partition_files_greedy,
-        create_shards_in_db,
-        update_shard_status,
-        report_shard_progress,
-        query_idle_workers,
-        aggregate_task_from_shards,
-        assign_shard_server,
-        download_shard_filelist,
-        filter_filelist_against_bos,
-        report_resume_info,
-    ]
-
-    workflows = [
-        DownloadDatasetWorkflow,
-        SplitDownloadWorkflow,       # keep for bj1-4 backward compat
-        ShardedDownloadWorkflow,
-        ShardWorkerWorkflow,
-    ]
-
-    queues = list(dict.fromkeys([task_queue, personal_queue]))
+    # Register activities, workflows, and the pool queue — see
+    # build_worker_specs' docstring for why the third (pool) Worker exists.
+    specs = build_worker_specs(args.server_key, task_queue)
+    queues = [s["task_queue"] for s in specs]
     logger.info(f"Starting worker: server_key={args.server_key}, queues={queues}")
-    logger.info(f"Registered {len(workflows)} workflows, {len(activities)} activities")
+    logger.info(
+        "Registered %d workflows, %d activities (shared); pool queue=%s activities=%s",
+        len(WORKFLOWS), len(ACTIVITIES),
+        pool_task_queue(_pool_source_for_worker(args.server_key)),
+        [a.__name__ for a in specs[-1]["activities"]],
+    )
 
     import uuid
     build_id = f"{args.server_key}-{uuid.uuid4().hex[:8]}"
 
     workers = []
-    for i, q in enumerate(queues):
+    for spec in specs:
         w = Worker(
             client,
-            task_queue=q,
-            workflows=workflows,
-            activities=activities,
+            task_queue=spec["task_queue"],
+            workflows=spec["workflows"],
+            activities=spec["activities"],
             max_concurrent_workflow_tasks=1,
-            max_concurrent_activities=2 if q == personal_queue else 1,
+            max_concurrent_activities=spec["max_concurrent_activities"],
             build_id=build_id,
         )
         workers.append(w)

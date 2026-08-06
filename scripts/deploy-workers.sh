@@ -2,10 +2,23 @@
 # scripts/deploy-workers.sh
 # Sync code to all workers and restart temporal worker daemons.
 # Run from S1 (154.85.43.52).
+#
+# FORBIDDEN companion: scripts/safe-deploy.sh cancels every running workflow
+# fleet-wide before it syncs — fine for a quiet fleet, fatal while a live
+# download (e.g. Egocentric-100K) is in flight. This script never cancels
+# anything; that is the whole reason it exists as a separate path.
 set -euo pipefail
 
 REPO_DIR="/root/code/bos-download-manager"
 REMOTE_DIR="/root/code/bos-download-manager"
+
+# temporalio floor asserted per host below (G6): PoolDownloadWorkflow's
+# window loop needs Priority (added 1.9, but the version pinned after the
+# T1-T9 review is >=1.30 — see pyproject.toml). Kept as named constants,
+# not an inline literal, so the ssh-side check and this comment can't drift
+# apart the way a hand-copied version string would.
+TEMPORALIO_MIN_MAJOR=1
+TEMPORALIO_MIN_MINOR=30
 
 declare -A WORKERS=(
     [w1]="156.240.120.209"
@@ -44,14 +57,21 @@ declare -A QUEUES=(
 RESTART=true
 TARGETS=""
 CUSTOM_IP=""
+TWO_PHASE=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-restart) RESTART=false; shift ;;
+        --sync-only-then-restart) TWO_PHASE=true; shift ;;
         --worker) TARGETS="$TARGETS $2"; shift 2 ;;
         --ip) CUSTOM_IP="$2"; shift 2 ;;
-        *) echo "Usage: $0 [--no-restart] [--worker w1] [--worker bjN --ip X.X.X.X] ..."; exit 1 ;;
+        *) echo "Usage: $0 [--no-restart | --sync-only-then-restart] [--worker w1] [--worker bjN --ip X.X.X.X] ..."; exit 1 ;;
     esac
 done
+
+if [ "$TWO_PHASE" = true ] && [ "$RESTART" = false ]; then
+    echo "ERROR: --sync-only-then-restart and --no-restart are mutually exclusive."
+    exit 1
+fi
 
 # Default: all workers
 if [ -z "$TARGETS" ]; then
@@ -59,6 +79,28 @@ if [ -z "$TARGETS" ]; then
 fi
 
 echo "[$(date)] Deploying to: $TARGETS"
+
+# ── Gate (G7): pytest must be green locally before any host is touched.
+# A missing/too-old pytest is a LOUD abort, not a silent skip-and-proceed —
+# that gap is exactly how an untested pool-dispatch rollout would reach the
+# fleet. Uses whatever `python3` this deploy runs under (on S1 that is S1's
+# python3; the repo's requires-python>=3.10 floor is asserted by pip/pytest
+# themselves failing, not re-checked here).
+echo "[$(date)] Gate: pytest tests/ -q ..."
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "GATE FAILED: python3 not found on this host — cannot run 'pytest tests/ -q'."
+    exit 1
+fi
+if ! python3 -m pytest --version >/dev/null 2>&1; then
+    echo "GATE FAILED: 'python3 -m pytest' is not runnable under $(python3 --version 2>&1)."
+    echo "  Install with: python3 -m pip install -e '${REPO_DIR}[dev]'  (pyproject.toml's [dev] extra)"
+    exit 1
+fi
+if ! (cd "$REPO_DIR" && python3 -m pytest tests/ -q); then
+    echo "GATE FAILED: pytest tests/ -q did not pass — fix before deploying."
+    exit 1
+fi
+echo "[$(date)] Gate: pytest OK."
 
 # One flaky host must never abort the fleet loop: on 2026-08-03 a single
 # transient kex_exchange_identification reset (BJ sshd MaxStartups
@@ -68,21 +110,31 @@ echo "[$(date)] Deploying to: $TARGETS"
 # and the script exits nonzero at the end if any host is not clean.
 FAILED_HOSTS=""
 
-for key in $TARGETS; do
-    ip="${WORKERS[$key]:-$CUSTOM_IP}"
-    if [ -z "$ip" ]; then
-        echo "  ERROR: Unknown worker '$key' (use --ip for dynamic hosts)"
-        FAILED_HOSTS="$FAILED_HOSTS $key"
-        continue
-    fi
-    queue="${QUEUES[$key]:-}"
+# The queue a host serves, given the static QUEUES map (bj* always has one;
+# w* use the shared default unless overridden). Pure — safe to call from a
+# subshell via $(...).
+compute_queue() {
+    local key="$1"
+    local q="${QUEUES[$key]:-}"
     # Any bjN not in the static map still needs its personal queue
-    if [ -z "$queue" ] && [[ "$key" == bj* ]]; then
-        queue="download-$key"
+    if [ -z "$q" ] && [[ "$key" == bj* ]]; then
+        q="download-$key"
     fi
+    echo "$q"
+}
 
+# ── Per-host steps, extracted into functions so --sync-only-then-restart can
+# run "sync everyone" and "restart everyone" as two uniform passes instead of
+# interleaving them host by host. The point of the two-phase mode: a rolling
+# deploy leaves some hosts on old code and some on new for however long the
+# loop takes; splitting sync from restart makes that mixed-version window
+# short (just phase 2's loop) and simultaneous-ish, instead of stretched
+# across the whole fleet while phase 1 is still syncing later hosts.
+
+sync_and_check_host() {
+    local key="$1" ip="$2"
     echo "  [$key] $ip — syncing code..."
-    synced=false
+    local synced=false
     for attempt in 1 2 3; do
         if rsync -az --delete \
             --exclude '.git' \
@@ -100,7 +152,7 @@ for key in $TARGETS; do
     if [ "$synced" = false ]; then
         echo "  [$key] ERROR: rsync failed after 3 attempts — skipping host"
         FAILED_HOSTS="$FAILED_HOSTS $key"
-        continue
+        return 1
     fi
 
     # Sidecar unit: installed/refreshed on EVERY deploy, not only restarts.
@@ -109,7 +161,7 @@ for key in $TARGETS; do
     # for a month. rsync above already put the unit at deploy/, so install
     # from there. enable --now starts a missing sidecar but leaves a running
     # one alone (code reload happens in the restart branch, same as workers).
-    ssh "root@$ip" bash -s "$key" "$REMOTE_DIR" <<'SIDECAR_SCRIPT' || { echo "  [$key] ERROR: sidecar install ssh failed — skipping host"; FAILED_HOSTS="$FAILED_HOSTS $key"; continue; }
+    ssh "root@$ip" bash -s "$key" "$REMOTE_DIR" <<'SIDECAR_SCRIPT' || { echo "  [$key] ERROR: sidecar install ssh failed — skipping host"; FAILED_HOSTS="$FAILED_HOSTS $key"; return 1; }
         SERVER_KEY="$1"
         REMOTE_DIR="$2"
         # The unit hardcodes /usr/bin/python3; a host where that interpreter
@@ -129,46 +181,126 @@ for key in $TARGETS; do
         fi
 SIDECAR_SCRIPT
 
-    if [ "$RESTART" = true ]; then
-        echo "  [$key] $ip — restarting worker (queue=${queue:-default})..."
-        ssh "root@$ip" bash -s "$key" "$queue" <<'REMOTE_SCRIPT' || { echo "  [$key] ERROR: restart ssh failed"; FAILED_HOSTS="$FAILED_HOSTS $key"; continue; }
-            SERVER_KEY="$1"
-            TASK_QUEUE="${2:-}"
-            pkill -f "dlm.temporal" 2>/dev/null || true
-            sleep 2
-            cd /root/code/bos-download-manager
-            export DLM_SERVER_KEY="$SERVER_KEY"
-            export DLM_TASK_QUEUE="$TASK_QUEUE"
-            nohup bash scripts/start-temporal-worker.sh > /var/log/dlm-worker.log 2>&1 &
-            sleep 3
-            if ps aux | grep -q "[p]ython3 -m dlm.temporal"; then
-                echo "      Worker $SERVER_KEY started successfully"
-            else
-                echo "      ERROR: Worker $SERVER_KEY failed to start"
-                tail -5 /var/log/dlm-worker.log
-            fi
-
-            # Sidecar watchdog: unit install/enable already happened in the
-            # sync phase; a restart deploy also reloads its code. sleep before
-            # is-active — checked immediately, a unit dying 0.2s later still
-            # reads as active.
-            systemctl restart "dlm-sidecar@$SERVER_KEY" 2>/dev/null
-            sleep 3
-            if systemctl is-active --quiet "dlm-sidecar@$SERVER_KEY"; then
-                echo "      Sidecar $SERVER_KEY active"
-            else
-                echo "      WARN: sidecar $SERVER_KEY not active"
-                systemctl status "dlm-sidecar@$SERVER_KEY" --no-pager 2>/dev/null | tail -3
-            fi
-REMOTE_SCRIPT
+    # G6: assert the deployed temporalio on THIS host satisfies >=1.30,<2.
+    # PoolDownloadWorkflow's window loop uses Priority; a host still on an
+    # older pin would sync clean and only fail the first time a pool batch
+    # with priority routing actually lands there — silent until then.
+    echo "  [$key] $ip — checking temporalio version (>=${TEMPORALIO_MIN_MAJOR}.${TEMPORALIO_MIN_MINOR},<2)..."
+    local remote_version=""
+    for attempt in 1 2 3; do
+        if remote_version=$(ssh -o ConnectTimeout=10 "root@$ip" 'python3 -c "import temporalio; print(temporalio.__version__)"' 2>/dev/null); then
+            [ -n "$remote_version" ] && break
+        fi
+        remote_version=""
+        sleep 5
+    done
+    if [ -z "$remote_version" ]; then
+        echo "  [$key] ERROR: could not read 'import temporalio; __version__' on $key (ssh failed or not installed)."
+        echo "      Remedy: bash scripts/install-deps.sh on $key"
+        FAILED_HOSTS="$FAILED_HOSTS $key"
+        return 1
     fi
-done
+    if ! python3 -c "
+import sys
+v = '$remote_version'.strip()
+try:
+    major, minor = (int(p) for p in v.split('.')[:2])
+except Exception:
+    sys.exit(1)
+sys.exit(0 if (major == $TEMPORALIO_MIN_MAJOR and minor >= $TEMPORALIO_MIN_MINOR) else 1)
+"; then
+        echo "  [$key] ERROR: temporalio $remote_version on $key does not satisfy >=${TEMPORALIO_MIN_MAJOR}.${TEMPORALIO_MIN_MINOR},<2."
+        echo "      Remedy: bash scripts/install-deps.sh on $key"
+        FAILED_HOSTS="$FAILED_HOSTS $key"
+        return 1
+    fi
+    echo "  [$key] temporalio $remote_version OK"
+    return 0
+}
 
-# Version manifest: md5 of the files that matter, per worker vs S1
+restart_host() {
+    local key="$1" ip="$2" queue="$3"
+    echo "  [$key] $ip — restarting worker (queue=${queue:-default})..."
+    ssh "root@$ip" bash -s "$key" "$queue" <<'REMOTE_SCRIPT' || { echo "  [$key] ERROR: restart ssh failed"; FAILED_HOSTS="$FAILED_HOSTS $key"; return 1; }
+        SERVER_KEY="$1"
+        TASK_QUEUE="${2:-}"
+        pkill -f "dlm.temporal" 2>/dev/null || true
+        sleep 2
+        cd /root/code/bos-download-manager
+        export DLM_SERVER_KEY="$SERVER_KEY"
+        export DLM_TASK_QUEUE="$TASK_QUEUE"
+        nohup bash scripts/start-temporal-worker.sh > /var/log/dlm-worker.log 2>&1 &
+        sleep 3
+        if ps aux | grep -q "[p]ython3 -m dlm.temporal"; then
+            echo "      Worker $SERVER_KEY started successfully"
+        else
+            echo "      ERROR: Worker $SERVER_KEY failed to start"
+            tail -5 /var/log/dlm-worker.log
+        fi
+
+        # Sidecar watchdog: unit install/enable already happened in the
+        # sync phase; a restart deploy also reloads its code. sleep before
+        # is-active — checked immediately, a unit dying 0.2s later still
+        # reads as active.
+        systemctl restart "dlm-sidecar@$SERVER_KEY" 2>/dev/null
+        sleep 3
+        if systemctl is-active --quiet "dlm-sidecar@$SERVER_KEY"; then
+            echo "      Sidecar $SERVER_KEY active"
+        else
+            echo "      WARN: sidecar $SERVER_KEY not active"
+            systemctl status "dlm-sidecar@$SERVER_KEY" --no-pager 2>/dev/null | tail -3
+        fi
+REMOTE_SCRIPT
+}
+
+if [ "$TWO_PHASE" = true ]; then
+    echo ""
+    echo "[$(date)] Phase 1/2: sync + sidecar + temporalio version check on all targets (no restart yet)..."
+    for key in $TARGETS; do
+        ip="${WORKERS[$key]:-$CUSTOM_IP}"
+        if [ -z "$ip" ]; then
+            echo "  ERROR: Unknown worker '$key' (use --ip for dynamic hosts)"
+            FAILED_HOSTS="$FAILED_HOSTS $key"
+            continue
+        fi
+        sync_and_check_host "$key" "$ip" || continue
+    done
+
+    echo ""
+    echo "[$(date)] Phase 2/2: restarting workers (hosts that failed phase 1 are skipped)..."
+    for key in $TARGETS; do
+        case " $FAILED_HOSTS " in
+            *" $key "*) echo "  [$key] skipped restart — failed phase 1"; continue ;;
+        esac
+        ip="${WORKERS[$key]:-$CUSTOM_IP}"
+        queue="$(compute_queue "$key")"
+        restart_host "$key" "$ip" "$queue" || continue
+    done
+else
+    for key in $TARGETS; do
+        ip="${WORKERS[$key]:-$CUSTOM_IP}"
+        if [ -z "$ip" ]; then
+            echo "  ERROR: Unknown worker '$key' (use --ip for dynamic hosts)"
+            FAILED_HOSTS="$FAILED_HOSTS $key"
+            continue
+        fi
+        queue="$(compute_queue "$key")"
+        sync_and_check_host "$key" "$ip" || continue
+        if [ "$RESTART" = true ]; then
+            restart_host "$key" "$ip" "$queue" || continue
+        fi
+    done
+fi
+
+# Version manifest: md5-of-md5s over every dlm/*.py file, sorted by path.
+# The previous manifest only hashed 4 named files and missed __main__.py —
+# this task added six activities + a workflow + a helper to exactly that
+# file, and a manifest that can't see it would report every host "OK" while
+# actually running the old registration.
 echo ""
-echo "[$(date)] Version manifest (md5 of key files):"
-MANIFEST_FILES="dlm/temporal/activities.py dlm/temporal/workflows.py dlm/web/reconciler.py dlm/web/routes/queue.py"
-local_md5=$(cd "$REPO_DIR" && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1)
+echo "[$(date)] Version manifest (md5-of-md5s over all dlm/*.py, sorted):"
+MANIFEST_CMD="find dlm -name '*.py' -not -path '*/__pycache__/*' | sort | xargs md5sum | md5sum"
+local_md5=$(cd "$REPO_DIR" && eval "$MANIFEST_CMD" | cut -d' ' -f1)
 echo "  S1 (reference): $local_md5"
 for key in $TARGETS; do
     ip="${WORKERS[$key]:-$CUSTOM_IP}"
@@ -177,7 +309,7 @@ for key in $TARGETS; do
     # as MISMATCH when the deploy itself succeeded (bj1, 2026-08-03).
     remote_md5="UNREACHABLE"
     for attempt in 1 2 3; do
-        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && cat $MANIFEST_FILES | md5sum | cut -d' ' -f1" 2>/dev/null); then
+        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && $MANIFEST_CMD" 2>/dev/null | cut -d' ' -f1); then
             remote_md5="$m"
             break
         fi
