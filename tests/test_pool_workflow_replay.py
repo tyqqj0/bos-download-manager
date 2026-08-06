@@ -321,10 +321,17 @@ def test_batch_failing_both_rounds_fails_the_task():
     assert ("failed", None, result.error) in stubs.dashboard
 
 
-def test_cancellation_releases_batch_rows_via_shield():
+def test_cancellation_releases_batch_rows():
     """A paused task must leave no row claiming a worker that has stopped.
-    The cleanup activity runs under asyncio.shield, so it survives the
-    cancellation that triggered it."""
+
+    Scope note: this verifies the cleanup activity RUNS on cancellation. It
+    does NOT prove the `asyncio.shield` around it is load-bearing — the test
+    passes with the shield removed, because this harness lets a post-cancel
+    activity through. The shield stays because it is the SDK's documented
+    pattern for exactly this (and design rule 6 requires it); on a real
+    server a cancelled workflow's unshielded cleanup activity is itself
+    cancelled. Proving that needs a cluster, i.e. T10.
+    """
     # Batches run long enough that the cancel lands mid-flight — cancelling
     # after the loop has already drained would prove nothing.
     stubs = _PoolActivityStubs(num_batches=6, windows=[2] * 6, batch_seconds=2.0)
