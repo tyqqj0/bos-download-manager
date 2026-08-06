@@ -183,11 +183,23 @@ async def fix(req: FixRequest):
 
     Available actions:
     - redispatch_orphaned: re-dispatch tasks with no Temporal workflow (sharded)
-    - reset_stuck: reset stuck tasks to pending
+    - redispatch_pool: the same for POOL tasks — separately named on purpose,
+      see the decision-C note below; never part of the default
+    - reset_stuck: reset stuck tasks to pending (sharded)
     - skip_zombie: revoke permanently failed tasks (retry_count >= 8)
 
     There is deliberately no "restart worker" action — restarting a worker is a
     host-level operation and goes through scripts/deploy-workers.sh.
+
+    Decision C removed the reconciler's automatic re-dispatch of pool orphans:
+    a second PoolDownloadWorkflow re-runs list -> filter -> chunk, and T1's
+    ruling on a chunking mismatch is no-delete + non-retryable error, so an
+    unwanted re-dispatch wedges the task instead of healing it. Both manual
+    paths that could reach it — `redispatch_orphaned` (the DEFAULT action, and
+    what the UI's fix button posts) and `reset_stuck` (via
+    status='pending' -> auto_dispatch_pending) — therefore skip pool tasks and
+    report them as skipped, unless the operator asks by name with
+    `redispatch_pool`. The matching `pool_orphaned` alert points at that action.
     """
     from ..temporal_client import start_task_download
 
@@ -197,12 +209,29 @@ async def fix(req: FixRequest):
     actions = req.actions or ["redispatch_orphaned"]
 
     unknown = [a for a in actions
-               if a not in ("redispatch_orphaned", "reset_stuck", "skip_zombie")]
+               if a not in ("redispatch_orphaned", "redispatch_pool",
+                            "reset_stuck", "skip_zombie")]
     if unknown:
         results["unsupported_actions"] = unknown
 
-    if "redispatch_orphaned" in actions:
+    allow_pool = "redispatch_pool" in actions
+    skipped_pool: list[str] = []
+
+    def _skip_pool(t: dict, action: str):
+        skipped_pool.append(
+            f"{t.get('name') or t['id']}: pool task skipped by {action} — a new "
+            f"pool coordinator re-runs list/filter/chunk and can wedge the task "
+            f"on a chunking mismatch (no-delete + error). Check the "
+            f"pool_orphaned alert, then POST /api/doctor with "
+            f'{{"actions": ["redispatch_pool"]}} to do it deliberately.'
+        )
+
+    def _is_pool(t: dict) -> bool:
+        return (t.get("dispatch_mode") or "sharded") == "pool"
+
+    if "redispatch_orphaned" in actions or allow_pool:
         redispatched = []
+        redispatched_pool = []
         try:
             from ..temporal_client import running_workflows
             # Deadline required: this scan decides whether a task gets a
@@ -215,18 +244,29 @@ async def fix(req: FixRequest):
                 task_id = t["id"]
                 if has_live_workflow(task_id, running_ids):
                     continue
+                if _is_pool(t):
+                    if not allow_pool:
+                        _skip_pool(t, "redispatch_orphaned")
+                        continue
+                elif "redispatch_orphaned" not in actions:
+                    continue  # only the explicit pool action was requested
                 try:
                     # Unified dispatch entry — branches on dispatch_mode. The
                     # legacy workflow has no BOS resume filter and would
                     # re-download everything already uploaded.
                     await start_task_download(t)
-                    redispatched.append(t.get("name", task_id))
+                    (redispatched_pool if _is_pool(t) else redispatched).append(
+                        t.get("name", task_id))
                 except Exception as e:
                     if "already started" not in str(e).lower():
-                        redispatched.append(f"{t.get('name', task_id)} (FAILED: {e})")
+                        (redispatched_pool if _is_pool(t) else redispatched).append(
+                            f"{t.get('name', task_id)} (FAILED: {e})")
         except Exception as e:
             redispatched.append(f"ERROR: {e}")
-        results["redispatch_orphaned"] = redispatched
+        if "redispatch_orphaned" in actions:
+            results["redispatch_orphaned"] = redispatched
+        if allow_pool:
+            results["redispatch_pool"] = redispatched_pool
 
     def _rewrite(matches, **fields) -> list:
         """Apply one status change per matching task, off the event loop."""
@@ -245,6 +285,16 @@ async def fix(req: FixRequest):
         stuck = [t for t in tasks
                  if t.get("status") == "downloading"
                  and now - (t.get("updated_at") or 0) > DEAD_THRESHOLD]
+        if not allow_pool:
+            # status='pending' hands the task to auto_dispatch_pending, which
+            # starts a fresh pool coordinator — the same wedge by another route.
+            keep = []
+            for t in stuck:
+                if _is_pool(t):
+                    _skip_pool(t, "reset_stuck")
+                else:
+                    keep.append(t)
+            stuck = keep
         results["reset_stuck"] = await run_blocking(
             _rewrite(stuck, status="pending", phase="reset_by_doctor"))
 
@@ -253,5 +303,8 @@ async def fix(req: FixRequest):
                    if t.get("status") == "failed" and (t.get("retry_count") or 0) >= 8]
         results["skip_zombie"] = await run_blocking(
             _rewrite(zombies, status="revoked", phase=None))
+
+    if skipped_pool:
+        results["skipped_pool_tasks"] = skipped_pool
 
     return results

@@ -242,10 +242,11 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                     "message": anomaly.get("message", ""),
                 }
 
-    # CRITICAL/WARNING: pool_starved (decision A). The three triggers need
-    # Temporal RPCs, which only reconcile()'s async patrol can make —
-    # check_alerts runs every 10s off a synchronous thread and cannot make
-    # them itself, so it reads what the last reconcile pass already cached.
+    # CRITICAL/WARNING: pool_starved (decision A) and pool_orphaned (review
+    # finding C2). The three pool_starved triggers need Temporal RPCs, which
+    # only reconcile()'s async patrol can make — check_alerts runs every 10s
+    # off a synchronous thread and cannot make them itself, so it reads what
+    # the last reconcile pass already cached.
     # Same pattern as health_verify_report above: read a cached report,
     # re-key into new_alerts, done. The alerts are already fully shaped
     # (severity/type/task_id/trigger/message/evidence) by inspect_pool_tasks.
@@ -253,6 +254,33 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
     if reconciler_report and isinstance(reconciler_report, dict):
         for a in reconciler_report.get("pool_starved", []):
             new_alerts[f"pool_starved:{a.get('task_id', '')}"] = a
+
+        # CRITICAL: pool_orphaned — a downloading pool task with no live
+        # workflow. Decision C deliberately does not auto-re-dispatch it (a
+        # second PoolDownloadWorkflow can wedge the task on a chunking
+        # mismatch), and no other surface an operator watches can see it:
+        # pool_starved's trigger 1 finds healthy pollers, its triggers 2/3
+        # describe a workflow that no longer exists and get nothing back, and
+        # task_stuck is exempted by decision E for exactly this row shape.
+        # Distinct from pool_starved on purpose — the operator action is
+        # different, so sharing the type would make the message wrong.
+        for o in reconciler_report.get("pool_orphaned", []):
+            task_id = o.get("task_id", "")
+            name = o.get("name") or task_id
+            new_alerts[f"pool_orphaned:{task_id}"] = {
+                "severity": CRITICAL,
+                "type": "pool_orphaned",
+                "task_id": task_id,
+                "task_name": o.get("name", ""),
+                "stale_seconds": o.get("stale_seconds"),
+                "message": (
+                    f"Pool task {name} has no live workflow and is NOT "
+                    f"re-dispatched automatically. Confirm the coordinator is "
+                    f"gone, then POST /api/doctor with "
+                    f'{{"actions": ["redispatch_pool"]}} — the default fix '
+                    f"action deliberately refuses pool tasks."
+                ),
+            }
 
     # Log state transitions
     al = _get_alert_logger()

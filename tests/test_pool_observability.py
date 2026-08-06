@@ -461,6 +461,116 @@ def test_pool_task_with_a_failed_batch_still_auto_fails(db, monkeypatch):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 2b. The recovery story for a pool orphan (review findings C2 + I7):
+#     an alert tells the human, an explicitly-named action lets them act,
+#     and the default fix button can no longer do it by accident.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_alerts_raise_critical_pool_orphaned_naming_the_explicit_action():
+    """Decision C removed the automatic re-dispatch for pool orphans and
+    assumed pool_starved would carry them to a human. It structurally
+    cannot: pollers are alive (trigger 1 sees pollers > 0), and describe on
+    a workflow that no longer exists returns no pending activities at all
+    (triggers 2/3 never run), while task_stuck is exempted by decision E.
+    Without its own alert the state is detected and reported nowhere."""
+    from dlm.web.alerts import CRITICAL, check_alerts
+    from dlm.web.cache import cache
+
+    cache.set("reconciler_report", {
+        "pool_orphaned": [
+            {"task_id": "t-orphan-pool", "name": "Egocentric-100K",
+             "stale_seconds": 4200},
+        ],
+    })
+    try:
+        out = check_alerts(tasks=[], workers=[])
+    finally:
+        cache.set("reconciler_report", None)
+
+    hits = [a for a in out if a["type"] == "pool_orphaned"]
+    assert len(hits) == 1, out
+    assert hits[0]["severity"] == CRITICAL
+    assert hits[0]["task_id"] == "t-orphan-pool"
+    # The operator action after I7 is the explicitly-named pool re-dispatch,
+    # NOT the default fix button (which now refuses pool tasks).
+    assert "redispatch_pool" in hits[0]["message"]
+
+
+def _doctor_stub(monkeypatch, started):
+    import dlm.web.temporal_client as tc
+
+    async def fake_running(client=None):
+        return {}
+
+    async def fake_start(task):
+        started.append(task["id"])
+
+    monkeypatch.setattr(tc, "running_workflows", fake_running)
+    monkeypatch.setattr(tc, "start_task_download", fake_start)
+
+
+def test_doctor_default_fix_refuses_to_redispatch_a_pool_orphan(db, monkeypatch):
+    """`redispatch_orphaned` is the DEFAULT action and what the UI's fix
+    button posts. Re-dispatching a pool task there re-runs list -> filter ->
+    chunk and hits T1's non-retryable no-delete-and-error on a chunking
+    mismatch — the exact wedge decision C forbids."""
+    from dlm.web.routes import doctor
+
+    started: list = []
+    _doctor_stub(monkeypatch, started)
+
+    _task(db, "t-doc-pool", status="downloading", mode="pool")
+    _task(db, "t-doc-sharded", status="downloading", mode="sharded")
+
+    out = asyncio.run(doctor.fix(doctor.FixRequest()))
+
+    assert started == ["t-doc-sharded"]  # sharded orphan still healed (G1)
+    assert "t-doc-sharded" in out["redispatch_orphaned"]
+    skipped = out["skipped_pool_tasks"]
+    assert len(skipped) == 1 and "t-doc-pool" in skipped[0]
+    assert "redispatch_pool" in skipped[0]  # names the way to do it on purpose
+
+
+def test_doctor_redispatches_a_pool_orphan_only_on_the_explicit_action(db, monkeypatch):
+    from dlm.web.routes import doctor
+
+    started: list = []
+    _doctor_stub(monkeypatch, started)
+
+    _task(db, "t-doc-pool2", status="downloading", mode="pool")
+
+    out = asyncio.run(doctor.fix(doctor.FixRequest(actions=["redispatch_pool"])))
+
+    assert started == ["t-doc-pool2"]
+    assert "t-doc-pool2" in out["redispatch_pool"]
+    assert not out.get("unsupported_actions")
+
+
+def test_doctor_reset_stuck_skips_pool_tasks(db, monkeypatch):
+    """`reset_stuck` reaches the same wedge indirectly: status='pending'
+    hands the task straight to auto_dispatch_pending, which starts a fresh
+    pool coordinator."""
+    from dlm.web.fleet import DEAD_THRESHOLD
+    from dlm.web.routes import doctor
+
+    started: list = []
+    _doctor_stub(monkeypatch, started)
+
+    stale = time.time() - DEAD_THRESHOLD - 100
+    _task(db, "t-stuck-pool", status="downloading", mode="pool", updated_at=stale)
+    _task(db, "t-stuck-sharded", status="downloading", mode="sharded", updated_at=stale)
+
+    out = asyncio.run(doctor.fix(doctor.FixRequest(actions=["reset_stuck"])))
+
+    assert out["reset_stuck"] == ["t-stuck-sharded"]
+    assert db.get_task("t-stuck-pool")["status"] == "downloading"
+    assert db.get_task("t-stuck-sharded")["status"] == "pending"
+    assert any("t-stuck-pool" in s and "redispatch_pool" in s
+               for s in out["skipped_pool_tasks"])
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 3. task_stuck exemption (decision E)
 # ═══════════════════════════════════════════════════════════════════════
 
