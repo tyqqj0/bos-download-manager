@@ -38,6 +38,26 @@ class _AccessDenied(Exception):
     pass
 
 
+class _UpstreamEmpty(Exception):
+    """Raised when the source serves an empty body for a file it lists as
+    non-empty — no point retrying.
+
+    ModelScope answers `HTTP 200` with `Content-Length: 0` for files whose
+    listed size is hundreds of MB (verified 2026-08-07 against 14 paths under
+    `data/RoboDojo_depth/`, both through the SDK and the raw-file endpoint):
+    their metadata still carries the size but the blob is gone. The size guard
+    correctly refuses to hand 0 bytes to the uploader, but routing that through
+    the ordinary retry path re-asked the same dead endpoint every ~15s forever
+    at no cost to anyone but us. Treated like `_AccessDenied`: counted as a
+    failed file so the shard reports honestly, and not retried.
+
+    Only the ModelScope paths raise it, because they have one endpoint. An
+    empty response on the HF path may be one bad mirror, which a retry can
+    route around.
+    """
+    pass
+
+
 class _TempPathHolder:
     """Cross-thread channel: the download call (running in a worker thread)
     reports the real temp path it is writing to; the async stall monitor
@@ -311,6 +331,12 @@ class PipelineEngine:
             # exception handling as any other failed attempt below, so it
             # retries instead of raising past the retry loop.
             size = p.stat().st_size
+            if file_info.size and size == 0:
+                p.unlink(missing_ok=True)
+                raise _UpstreamEmpty(
+                    f"upstream served 0 bytes for {file_info.path} "
+                    f"(listed size {file_info.size}) — skipping, not retrying"
+                )
             if file_info.size and size != file_info.size:
                 p.unlink(missing_ok=True)
                 raise RuntimeError(
@@ -325,6 +351,8 @@ class PipelineEngine:
             return p
         except Exception as e:
             err_str = str(e)
+            if isinstance(e, _UpstreamEmpty):
+                raise  # permanent — must not be swallowed into a retry
             if isinstance(e, OSError) and e.errno == errno.ENAMETOOLONG:
                 # The SDK flattens the full repo path into a lock-file name,
                 # which overflows the 255-byte filename limit on deep paths.
@@ -340,6 +368,8 @@ class PipelineEngine:
                         "endpoint": "modelscope-http",
                     })
                     return local_path
+                except _UpstreamEmpty:
+                    raise  # permanent — the fallback endpoint is empty too
                 except Exception as e2:
                     err_str = f"{err_str[:150]}; http fallback failed: {e2}"
             elif "403" in err_str or "forbidden" in err_str.lower():
@@ -386,6 +416,12 @@ class PipelineEngine:
                             if chunk:
                                 f.write(chunk)
                 size = tmp.stat().st_size
+                if file_info.size and size == 0:
+                    tmp.unlink(missing_ok=True)
+                    raise _UpstreamEmpty(
+                        f"upstream served 0 bytes for {file_info.path} "
+                        f"(listed size {file_info.size}) — skipping, not retrying"
+                    )
                 if file_info.size and size != file_info.size:
                     raise RuntimeError(
                         f"size mismatch for {file_info.path}: got {size}, expected {file_info.size}"
@@ -439,6 +475,16 @@ class PipelineEngine:
                     except _AccessDenied as e:
                         cancel_event.set()
                         self.stats.failed_files += 1
+                        logger.error(str(e))
+                        return
+                    except _UpstreamEmpty as e:
+                        cancel_event.set()
+                        self.stats.failed_files += 1
+                        self._emit_event("file_failed", {
+                            "file": file_info.path,
+                            "error": "upstream_empty",
+                            "endpoint": "modelscope",
+                        })
                         logger.error(str(e))
                         return
                     except _StallDetected:

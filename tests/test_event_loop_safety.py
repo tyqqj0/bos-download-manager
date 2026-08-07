@@ -72,7 +72,14 @@ def _function(tree: ast.AST, name: str) -> ast.AST:
 
 
 def test_every_scheduler_stage_has_a_deadline():
-    """A hang in any stage stops the loop for good; try/except does not catch it."""
+    """A hang in any stage stops the loop for good; try/except does not catch it.
+
+    `loop.run_in_executor` is NOT a deadline — it hands work to a thread and
+    awaits a future that never expires. Accepting it here is how the three
+    bare executor stages passed this test while `_poll_transfers` sat on an
+    unbounded DCloud login. Only wrappers that actually impose a timeout
+    count; `_blocking_stage` is checked separately below.
+    """
     loop = _function(_tree("scheduler.py"), "background_scheduler")
 
     awaited = [
@@ -82,12 +89,31 @@ def test_every_scheduler_stage_has_a_deadline():
     bare = []
     for a in awaited:
         called = _calls([a.value])[:1]
-        if called and called[0] in ("asyncio.wait_for", "loop.run_in_executor",
+        if called and called[0] in ("asyncio.wait_for", "_blocking_stage",
                                     "asyncio.sleep"):
             continue
         bare.append(called[0] if called else "?")
 
     assert not bare, f"scheduler awaits without a deadline: {bare}"
+
+
+def test_the_blocking_stage_wrapper_actually_imposes_the_timeout():
+    """The test above trusts `_blocking_stage`; this is what earns the trust."""
+    fn = _function(_tree("scheduler.py"), "_blocking_stage")
+
+    awaited = [n for n in _own_body(fn) if isinstance(n, ast.Await)]
+    assert awaited, "_blocking_stage awaits nothing — it cannot be running the stage"
+    for a in awaited:
+        assert _calls([a.value])[:1] == ["asyncio.wait_for"], (
+            "_blocking_stage must wrap every await in asyncio.wait_for, "
+            "otherwise it launders an unbounded call as a bounded one"
+        )
+
+    src = (WEB / "scheduler.py").read_text()
+    assert "loop.run_in_executor" not in src.split("async def background_scheduler")[1], (
+        "background_scheduler still calls run_in_executor directly — route it "
+        "through _blocking_stage"
+    )
 
 
 def _docstrings(tree: ast.AST) -> set[int]:
@@ -180,3 +206,64 @@ def test_doctor_orphan_report_has_no_undefined_reference():
                    "STALE_THRESHOLD", "WORKER_TIMEOUT", "has_live_workflow"}
 
     assert not unresolved, f"undefined names in diagnose(): {sorted(unresolved)}"
+
+
+# --- runtime behaviour of the deadline, not just its presence ----------------
+
+def test_a_hanging_blocking_stage_gives_up_and_the_loop_moves_on():
+    """The AST tests prove the wrapper is used; this proves it works.
+
+    A blocking call that never returns must not park the loop. It must also
+    not raise into the cycle body, or one wedged stage skips every stage
+    after it — which is what a bare `await` in the outer try/except did.
+    """
+    import asyncio
+    import time
+
+    from dlm.web import scheduler
+
+    original = scheduler.STAGE_TIMEOUT
+    scheduler.STAGE_TIMEOUT = 0.05
+    try:
+        async def go():
+            loop = asyncio.get_running_loop()
+            started = time.monotonic()
+            result = await scheduler._blocking_stage(
+                loop, lambda: time.sleep(0.6), "hangs")
+            return result, time.monotonic() - started
+
+        result, elapsed = asyncio.run(go())
+    finally:
+        scheduler.STAGE_TIMEOUT = original
+
+    assert result is None, "an abandoned stage must not look like a result"
+    assert elapsed < 0.5, f"loop was parked for {elapsed:.2f}s past the deadline"
+
+
+def test_a_raising_blocking_stage_returns_none_instead_of_propagating():
+    import asyncio
+
+    from dlm.web import scheduler
+
+    def boom():
+        raise RuntimeError("sqlite is locked")
+
+    async def go():
+        return await scheduler._blocking_stage(
+            asyncio.get_running_loop(), boom, "boom")
+
+    assert asyncio.run(go()) is None
+
+
+def test_a_healthy_blocking_stage_returns_its_value():
+    """None means failure, so a successful stage must be distinguishable —
+    `cache.set_dashboard` is guarded on exactly this."""
+    import asyncio
+
+    from dlm.web import scheduler
+
+    async def go():
+        return await scheduler._blocking_stage(
+            asyncio.get_running_loop(), lambda: {"tasks": 3}, "ok")
+
+    assert asyncio.run(go()) == {"tasks": 3}

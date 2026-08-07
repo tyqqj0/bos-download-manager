@@ -40,6 +40,15 @@ SSH from S1 to all workers with pubkey. From dev machine, use S1 as jump host; `
 ## Common Commands
 
 ```bash
+# Tests (152 as of 2026-08-07). No venv is checked in and neither the dev box
+# nor S1 has pytest installed; build a throwaway one:
+python3.12 -m venv /tmp/dlm-test-venv
+/tmp/dlm-test-venv/bin/pip install pytest fastapi temporalio bce-python-sdk \
+    python-dotenv huggingface_hub requests pycryptodome
+/tmp/dlm-test-venv/bin/python -m pytest tests/ -q   # run from the repo root
+```
+
+```bash
 # Deploy code + restart workers (from S1; prints md5 version manifest — must all match)
 bash scripts/deploy-workers.sh                 # all 16
 bash scripts/deploy-workers.sh --worker bj1    # subset
@@ -64,7 +73,8 @@ curl -X POST http://154.85.43.52:8080/api/queue/reshard -H 'Content-Type: applic
 # Pause (resumable) / resume / revoke
 curl -X POST .../api/queue/pause  -d '{"task_id":"t-..."}'
 curl -X POST .../api/queue/resume -d '{"task_id":"t-..."}'
-curl -X POST .../api/tasks/{id}/skip        # revoke + terminate workflows (sweeps suffixed IDs too)
+curl -X POST .../api/tasks/{id}/skip        # terminate workflows, THEN revoke (refuses 502 if they don't close;
+                                            # ?force=true revokes anyway. Same for DELETE /api/tasks/{id})
 
 # Inspect
 curl .../api/dashboard ; curl .../api/tasks/{id}/shards ; curl .../api/doctor

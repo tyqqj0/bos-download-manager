@@ -71,12 +71,20 @@ def test_hf_worker_has_three_distinct_queues():
 def test_bj_worker_collapses_coordinator_and_personal_queue():
     """bj hosts run with --task-queue == their own personal queue (source
     isolation, per deploy-workers.sh's QUEUES map) — that must collapse to
-    one Worker, not two Workers polling the same queue."""
+    one Worker, not two Workers polling the same queue.
+
+    The ms coordinator queue is NOT a duplicate and must be there: with only
+    the personal and pool queues, a bj host polled no shared coordinator queue
+    at all, so every coordinator ran on the HK-only `download-workers` and a
+    ModelScope listing landed on w6 (`No module named 'modelscope'`,
+    t-20260806-cbf39e). fleet.polled_queues adds it; see
+    tests/test_coordinator_routing.py for the per-host table."""
     from dlm.temporal.__main__ import build_worker_specs
 
     specs = build_worker_specs("bj1", "download-bj1")
     queues = [s["task_queue"] for s in specs]
-    assert queues == ["download-bj1", "pool-ms"]
+    assert queues == ["download-bj1", "download-ms-workers", "pool-ms"]
+    assert len(set(queues)) == len(queues), "no duplicate Worker for the same queue"
 
 
 def test_shared_activities_and_workflows_lists_unchanged_membership():

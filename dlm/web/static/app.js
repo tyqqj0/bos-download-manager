@@ -23,7 +23,7 @@ function app() {
         // — never hardcode a literal mode here, that just moves the bug that
         // let the UI defeat a DLM_DEFAULT_DISPATCH_MODE flip (see submitAdd
         // and defaultDispatchMode below).
-        addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: '', no_dispatch: false, parsed: null, error: '' },
+        addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: '', shard_count: 0, no_dispatch: false, parsed: null, error: '' },
         // Populated from /api/dashboard's default_dispatch_mode (fetchDashboard)
         // so the add-form select can show the live server default instead of
         // a client-side guess.
@@ -265,6 +265,11 @@ function app() {
                     type: this.addForm.type,
                     priority: this.addForm.priority,
                     no_dispatch: this.addForm.no_dispatch,
+                    // 0 = "let the server pick" — sharded mode only. Pool mode
+                    // ignores it (it sizes its own batches), so it is sent
+                    // unconditionally rather than gated on dispatch_mode: the
+                    // form's mode-awareness lands after pool ships.
+                    shard_count: Number(this.addForm.shard_count) || 0,
                 };
                 // '' means "server default" (see addForm init) — omit the key
                 // entirely so the backend applies fleet.DEFAULT_DISPATCH_MODE
@@ -277,9 +282,12 @@ function app() {
                 });
                 if (res.ok) {
                     const data = await res.json();
-                    this.showToast(`Added: ${data.task?.name || 'task'}`, 'success');
+                    const paused = data.task?.status === 'paused';
+                    this.showToast(
+                        `Added: ${data.task?.name || 'task'}${paused ? ' (paused)' : ''}`,
+                        'success');
                     this.showAddModal = false;
-                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: '', no_dispatch: false, parsed: null, error: '' };
+                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: '', shard_count: 0, no_dispatch: false, parsed: null, error: '' };
                     await this.fetchTasks();
                 } else {
                     const data = await res.json();

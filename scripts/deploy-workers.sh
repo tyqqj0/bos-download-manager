@@ -311,9 +311,18 @@ fi
 # when their code is byte-identical — and a gate that cries wolf on two hosts
 # is a gate nobody believes on the day the versions genuinely diverge.
 echo ""
-echo "[$(date)] Version manifest (md5-of-md5s over all dlm/*.py, sorted):"
-MANIFEST_CMD="find dlm -name '*.py' -not -path '*/__pycache__/*' | LC_ALL=C sort | xargs md5sum | md5sum"
-local_md5=$(cd "$REPO_DIR" && eval "$MANIFEST_CMD" | cut -d' ' -f1)
+echo "[$(date)] Version manifest (md5 over the contents of every dlm/**/*.py):"
+# Derived, not hand-written. The old list named seven files, so the gate said
+# OK while a worker ran a stale dlm/core/bos.py — the entire upload path,
+# including the multipart driver whose silent failure credits files that never
+# landed on BOS. Any file rsync can carry belongs in the hash, so enumerate
+# them: rsync --delete makes the trees identical on success, and LC_ALL=C
+# fixes the order across hosts.
+# The `cut` lives INSIDE the command, not at each use site, so the local and
+# remote invocations cannot drift apart (a use site that forgot the cut would
+# compare "<md5>  -" against "<md5>" and report MISMATCH forever).
+MANIFEST_CMD='find dlm -name "*.py" -not -path "*/__pycache__/*" -print0 | LC_ALL=C sort -z | xargs -0 cat | md5sum | cut -d" " -f1'
+local_md5=$(cd "$REPO_DIR" && eval "$MANIFEST_CMD")
 echo "  S1 (reference): $local_md5"
 for key in $TARGETS; do
     ip="${WORKERS[$key]:-$CUSTOM_IP}"
@@ -325,7 +334,7 @@ for key in $TARGETS; do
     # false-MISMATCH bug this loop exists to fix.
     remote_md5="UNREACHABLE"
     for attempt in 1 2 3; do
-        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && $MANIFEST_CMD" 2>/dev/null | cut -d' ' -f1); then
+        if m=$(ssh -o ConnectTimeout=10 "root@$ip" "cd $REMOTE_DIR && $MANIFEST_CMD" 2>/dev/null); then
             remote_md5="$m"
             break
         fi

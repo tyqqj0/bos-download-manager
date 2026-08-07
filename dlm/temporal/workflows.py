@@ -21,6 +21,11 @@ NON_RETRYABLE_ERRORS = [
     "NotFoundError",
     "GatedRepoError",
     "AuthError",
+    # activities.FilelistMismatchError — the shard's filelist object was
+    # overwritten by another task, so every retry re-reads the same wrong
+    # bytes. Matched by class name; importing activities here would break
+    # workflow determinism.
+    "FilelistMismatchError",
 ]
 
 ACTIVITY_RETRY = RetryPolicy(
@@ -428,7 +433,7 @@ class ShardWorkerWorkflow:
         staging_dir = f"/data/staging/{shard_name}"
         local_filelist = await workflow.execute_activity(
             "download_shard_filelist",
-            args=[shard_input.filelist_key, staging_dir],
+            args=[shard_input.filelist_key, staging_dir, shard_input.filelist_md5],
             start_to_close_timeout=timedelta(minutes=5),
             retry_policy=ACTIVITY_RETRY,
         )
@@ -663,6 +668,11 @@ class ShardedDownloadWorkflow:
                 max(1, total_bytes // SHARD_MIN_BYTES),
             )
 
+        # A shard with no files still starts a workflow, occupies a worker and
+        # reports done. Cap the count at the work available so the coverage
+        # check below can treat an empty partition as the bug it would be.
+        num_shards = max(1, min(num_shards, total_files))
+
         staging_dir = f"/data/staging/{task_input.name}"
 
         # Step 4: Partition + upload filelists to BOS (always, even for 1 shard).
@@ -670,7 +680,7 @@ class ShardedDownloadWorkflow:
         try:
             raw_parts = await workflow.execute_activity(
                 "partition_files_greedy",
-                args=[filtered_path, num_shards, staging_dir],
+                args=[filtered_path, num_shards, staging_dir, task_id],
                 task_queue=listing_queue,
                 start_to_close_timeout=timedelta(minutes=10),
                 retry_policy=ACTIVITY_RETRY,
@@ -683,6 +693,34 @@ class ShardedDownloadWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             )
             return TaskResult(status="failed", error=error_msg)
+
+        # The partition must account for every remaining file. Nothing else
+        # downstream would notice if it didn't: zero-file shards return done
+        # immediately, step 8 sees every shard done and reports the task done —
+        # at 0 bytes, indistinguishable from a real completion. The filelist on
+        # the listing worker's disk is keyed by task NAME
+        # (/data/staging/{name}/.filelist.filtered.json) and names are reused
+        # by requirement, so "the file this activity read is the file the
+        # filter wrote" is an assumption, not a guarantee. Fail loudly instead.
+        covered = sum(int(p.get("total_files", 0) or 0) for p in raw_parts)
+        empty = [i for i, p in enumerate(raw_parts)
+                 if not int(p.get("total_files", 0) or 0)]
+        if len(raw_parts) != num_shards or covered != total_files or empty:
+            error_msg = (
+                f"partition does not cover the filelist: {covered} files across "
+                f"{len(raw_parts)} partitions, expected {total_files} across "
+                f"{num_shards}"
+                + (f", empty partitions {empty}" if empty else "")
+                + f" — refusing to dispatch (filtered list {filtered_path} may "
+                  f"belong to another task with the same name)"
+            )
+            await workflow.execute_activity(
+                "report_to_dashboard",
+                args=[task_id, "failed", None, None, None, None, None, error_msg],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            return TaskResult(status="failed", error=error_msg)
+
         partitions = [{**p, "shard_index": i} for i, p in enumerate(raw_parts)]
 
         # Step 5: Create shard rows in SQLite (via activity — R1)
@@ -703,8 +741,17 @@ class ShardedDownloadWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
 
-        # Step 6: Start child workflows on worker queues
-        workers_to_use = idle_workers[:num_shards] if idle_workers else ["download-workers"]
+        # Step 6: Start child workflows on worker queues.
+        # Empty idle pool falls back to the listing worker, not the literal
+        # string "download-workers": that key f-string'd into
+        # `download-download-workers` below, a queue no process polls, so every
+        # child sat RUNNING forever — has_live_workflow stays true, so nothing
+        # reconciles or re-dispatches it. The listing worker is the right host
+        # anyway (it holds the filtered filelist on local disk) and it serves
+        # this task's source by construction, since the coordinator ran on that
+        # source's queue.
+        fallback_key = listing_queue.removeprefix("download-")
+        workers_to_use = idle_workers[:num_shards] if idle_workers else [fallback_key]
         child_handles = []
 
         for i, (shard_id, partition) in enumerate(zip(shard_ids, partitions)):

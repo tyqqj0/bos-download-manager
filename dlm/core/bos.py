@@ -79,10 +79,26 @@ def get_prefix_size(client: BosClient, bucket: str, prefix: str) -> int:
 
 
 def upload_file(client: BosClient, bucket: str, key: str, local_path: str):
-    """Upload a single file to BOS. Uses multipart for large files."""
+    """Upload a single file to BOS. Uses multipart for large files.
+
+    Raises on failure — including the multipart driver's silent one. Every
+    caller in this repo treats "returned without raising" as proof the bytes
+    are on BOS and then deletes its local copy (dlm/temporal/pipeline.py
+    `_upload_one`), so a failure that only shows up in a return value is
+    indistinguishable from success. `put_super_object_from_file` does exactly
+    that: on a failed part it calls `abort_multipart_upload` and
+    `return False` (baidubce/services/bos/bos_client.py:2306-2314) — nothing
+    at the key, no exception. Files over 100 MB take that path, which is why
+    a TB-scale task could report `done` with its bytes credited and BOS
+    holding a fraction of them.
+    """
     size = os.path.getsize(local_path)
     if size > MULTIPART_THRESHOLD:
-        client.put_super_object_from_file(bucket, key, local_path)
+        if client.put_super_object_from_file(bucket, key, local_path) is False:
+            raise RuntimeError(
+                f"multipart upload failed and was aborted on BOS: "
+                f"bos://{bucket}/{key} ({size} bytes) — nothing at the key"
+            )
     else:
         client.put_object_from_file(bucket, key, local_path)
 

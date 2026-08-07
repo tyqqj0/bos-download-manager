@@ -12,9 +12,10 @@ from ..constants import CATEGORIES, PRIORITIES
 @click.option("-p", "--priority", default="P1", type=click.Choice(PRIORITIES), help="优先级")
 @click.option("-n", "--name", default=None, help="自定义目录名")
 @click.option("--size", default=0.0, type=float, help="预估大小 (GB)")
-@click.option("--no-dispatch", is_flag=True, help="只添加到列表，不自动派发")
+@click.option("--no-dispatch", is_flag=True, help="只添加到列表，不自动派发（状态为 paused，用 resume 启动）")
+@click.option("--shards", default=0, type=int, help="分片数（worker 数），0 = 自动；上限为该来源的空闲 worker 数")
 @click.option("--source", default=None, type=click.Choice(["hf", "modelscope"]), help="覆盖自动检测的来源")
-def add_cmd(url_or_repo, category, dtype, priority, name, size, no_dispatch, source):
+def add_cmd(url_or_repo, category, dtype, priority, name, size, no_dispatch, shards, source):
     """添加下载任务。
 
     URL_OR_REPO: HuggingFace/ModelScope URL 或裸 repo_id (org/name)
@@ -27,11 +28,14 @@ def add_cmd(url_or_repo, category, dtype, priority, name, size, no_dispatch, sou
         "type": dtype,
         "priority": priority,
         "no_dispatch": no_dispatch,
+        "shard_count": shards,
     }
     if name:
         body["name"] = name
     if size:
         body["size_gb"] = size
+    if source:
+        body["source"] = source
 
     try:
         data = post("/api/tasks", body)
@@ -50,5 +54,10 @@ def add_cmd(url_or_repo, category, dtype, priority, name, size, no_dispatch, sou
     click.echo(f"  分类:     {task.get('category', category)}")
     click.echo(f"  状态:     {task.get('status', 'queued')}")
     click.echo(f"  优先级:   {task.get('priority', priority)}")
-    if not no_dispatch:
+    if task.get("shard_count"):
+        click.echo(f"  分片数:   {task['shard_count']}")
+    if no_dispatch:
+        click.echo(f"\n  任务已加入队列但未派发（paused）。"
+                   f"用 dlm 网页的 Resume 或 POST /api/queue/resume 启动。")
+    else:
         click.echo(f"\n  任务已加入队列，auto_dispatch 会自动分配到空闲 worker。")

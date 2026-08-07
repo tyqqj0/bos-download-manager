@@ -1,10 +1,14 @@
 """Servers API — Celery worker status."""
 
+import logging
+
 from fastapi import APIRouter, HTTPException
 
 from ..cache import cache
 from ..fleet import TERMINAL_STATUSES
 from . import run_blocking
+
+logger = logging.getLogger("dlm.web")
 
 router = APIRouter(tags=["servers"])
 
@@ -83,25 +87,48 @@ async def worker_heartbeat(body: dict):
 
 @router.post("/servers/{key}/cleanup")
 async def cleanup_server_staging(key: str):
-    """Clean staging directory on a worker for done/failed/revoked tasks.
+    """Clean staging directory on a worker for terminal tasks.
 
-    Only removes staging dirs whose task is done, failed, or revoked.
-    Never touches staging for active (downloading/pending) tasks.
+    Staging is keyed by task name, so a directory is only safe to delete when
+    NO non-terminal task shares that name — see the comment in the body.
     """
     def _do():
-        from ...queue.snapshot import get_all_tasks, init_db
+        from ...queue.snapshot import get_all_tasks, get_shards_by_task, init_db
         from ...core.servers import load_servers
         from ...core.ssh import ssh_exec
 
         init_db()
         tasks = get_all_tasks()
 
-        # Find tasks that are safe to clean (done/failed/revoked)
-        safe_to_clean = [
+        TERMINAL = ("done", "failed", "revoked", "skipped")
+
+        # Staging is keyed by task NAME, not id (STAGING_PATH / name /
+        # shard-N), and a name is not unique: /queue/add permits re-adding a
+        # repo whose previous row is failed/revoked/done, and CLAUDE.md
+        # *requires* a resume to reuse the exact original name. So a per-row
+        # "this task is terminal" check is not enough to make a path safe to
+        # delete — any live task sharing the name is writing to the same
+        # directory, partial files and .progress.json markers included.
+        live_names = {
+            (t.get("name") or "") for t in tasks
+            if t.get("status") not in TERMINAL
+        }
+
+        def runs_here(t) -> bool:
+            """A sharded task's row carries server = NULL; its hosts live on
+            the shard rows, so the task-level server alone matched nothing
+            and this endpoint quietly cleaned nothing on a sharded fleet."""
+            if t.get("server") == key:
+                return True
+            return any(s.get("server") == key
+                       for s in get_shards_by_task(t.get("id") or ""))
+
+        safe_to_clean = sorted({
             t["name"] for t in tasks
-            if t.get("status") in ("done", "failed", "revoked")
-            and t.get("server") == key
-        ]
+            if t.get("status") in TERMINAL
+            and (t.get("name") or "") not in live_names
+            and runs_here(t)
+        })
 
         if not safe_to_clean:
             return {"cleaned": [], "message": "Nothing to clean"}
@@ -115,17 +142,25 @@ async def cleanup_server_staging(key: str):
         import shlex
 
         cleaned = []
+        skipped = []
         for name in safe_to_clean:
-            if not re.match(r'^[A-Za-z0-9_.\-/]+$', name):
-                continue  # skip names with shell metacharacters
+            # No separators, no traversal. shlex.quote stops shell
+            # metacharacters but not path components: a task named `..`
+            # yields `rm -rf '/data/staging/..'` — i.e. rm -rf /data — on
+            # that worker, and the name comes straight from the request body
+            # of /queue/add with no validation anywhere upstream.
+            if not re.match(r'^[A-Za-z0-9_.\-]+$', name) or name.startswith('.'):
+                skipped.append(name)
+                continue
             staging_dir = shlex.quote(f"/data/staging/{name}")
             try:
                 ssh_exec(server.host, server.user, f"rm -rf {staging_dir}")
                 cleaned.append(name)
-            except Exception:
-                pass  # best effort
+            except Exception as e:
+                logger.warning(f"cleanup {key}:{name} failed: {e}")
+                skipped.append(name)
 
-        return {"cleaned": cleaned, "count": len(cleaned)}
+        return {"cleaned": cleaned, "count": len(cleaned), "skipped": skipped}
 
     return await run_blocking(_do)
 

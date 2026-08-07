@@ -73,12 +73,15 @@ def test_start_task_download_routes_sharded_by_default(monkeypatch):
 
     calls = []
 
-    async def fake_sharded(task):
-        calls.append(("sharded", task["id"]))
+    # task_queue is keyword-only in practice: the funnel decides the
+    # coordinator queue from the task's source (fleet.coordinator_queue) so no
+    # call site can get it wrong, so the fakes have to accept and record it.
+    async def fake_sharded(task, task_queue=None):
+        calls.append(("sharded", task["id"], task_queue))
         return "sharded-handle"
 
-    async def fake_pool(task):
-        calls.append(("pool", task["id"]))
+    async def fake_pool(task, task_queue=None):
+        calls.append(("pool", task["id"], task_queue))
         return "pool-handle"
 
     monkeypatch.setattr(tc, "start_sharded_download", fake_sharded)
@@ -88,7 +91,10 @@ def test_start_task_download_routes_sharded_by_default(monkeypatch):
     asyncio.run(tc.start_task_download({"id": "t-b", "dispatch_mode": "sharded"}))
     asyncio.run(tc.start_task_download({"id": "t-c", "dispatch_mode": None}))  # explicit NULL
 
-    assert calls == [("sharded", "t-a"), ("sharded", "t-b"), ("sharded", "t-c")]
+    # hf (the default when no source key is present) -> the shared HK queue
+    assert calls == [("sharded", "t-a", "download-workers"),
+                     ("sharded", "t-b", "download-workers"),
+                     ("sharded", "t-c", "download-workers")]
 
 
 def test_start_task_download_routes_pool_to_pool_starter(monkeypatch):
@@ -96,19 +102,23 @@ def test_start_task_download_routes_pool_to_pool_starter(monkeypatch):
 
     calls = []
 
-    async def fake_sharded(task):
-        calls.append(("sharded", task["id"]))
+    async def fake_sharded(task, task_queue=None):
+        calls.append(("sharded", task["id"], task_queue))
 
-    async def fake_pool(task):
-        calls.append(("pool", task["id"]))
+    async def fake_pool(task, task_queue=None):
+        calls.append(("pool", task["id"], task_queue))
         return "pool-handle"
 
     monkeypatch.setattr(tc, "start_sharded_download", fake_sharded)
     monkeypatch.setattr(tc, "start_pool_download", fake_pool)
 
-    result = asyncio.run(tc.start_task_download({"id": "t-d", "dispatch_mode": "pool"}))
+    result = asyncio.run(tc.start_task_download(
+        {"id": "t-d", "dispatch_mode": "pool", "source": "modelscope"}))
 
-    assert calls == [("pool", "t-d")]
+    # A pool task routes by source exactly like a sharded one: a ModelScope
+    # coordinator on the HK-only queue dies with `No module named 'modelscope'`
+    # whichever mode started it (t-20260806-cbf39e).
+    assert calls == [("pool", "t-d", "download-ms-workers")]
     assert result == "pool-handle"
 
 

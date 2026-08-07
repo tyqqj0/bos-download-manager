@@ -52,6 +52,10 @@ from .activities import (
     record_batches_and_window,
     release_pool_batches,
 )
+# Safe at module scope: dlm.web.fleet imports only os/time and dlm/web/__init__
+# is a bare docstring, so this pulls in no FastAPI. Workflow code cannot import
+# it (determinism sandbox) — this file is the worker entry, not a workflow.
+from ..web.fleet import polled_queues, source_for_worker
 
 
 # Registered on both existing Workers (the coordinator queue and each
@@ -99,22 +103,28 @@ ACTIVITIES = [
 def _pool_source_for_worker(server_key: str) -> str:
     """Which pool queue (source) this worker's third Worker should serve.
 
-    Mirrors `dlm.web.fleet.source_for_worker`'s semantics exactly (BJ nodes
-    -> modelscope, everything else -> hf). Re-derived here rather than
-    imported: this module runs ON the workers, and `dlm.web` pulls in
-    FastAPI/uvicorn — dependencies a bare download worker has no business
-    needing. If fleet's routing rule ever changes, this must change with it.
+    Delegates to `dlm.web.fleet.source_for_worker` rather than re-deriving
+    `startswith("bj")` here. The pool branch duplicated the rule to keep
+    `dlm.web` out of the worker process, but that reasoning does not hold for
+    this one module: `dlm/web/__init__.py` is a bare docstring and fleet.py
+    imports only os/time, so nothing drags in FastAPI/uvicorn — and the shared
+    coordinator queue this process must poll already comes from
+    `fleet.polled_queues`. Two copies of the routing rule is the failure mode
+    that produced the w6 ModelScope listing, so there is one copy.
     """
-    return "modelscope" if server_key.startswith("bj") else "hf"
+    return source_for_worker(server_key)
 
 
-def build_worker_specs(server_key: str, task_queue: str) -> list[dict]:
+def build_worker_specs(server_key: str, task_queue: str | None) -> list[dict]:
     """The task_queue/workflows/activities/concurrency for this process's Workers.
 
-    Three Workers, three jobs:
-      - `task_queue` (default "download-workers"): the shared coordinator
-        queue where `Sharded`/`PoolDownloadWorkflow` coordinators and
-        `DownloadDatasetWorkflow` land.
+    Three jobs, and however many Workers `fleet.polled_queues` says it takes:
+      - the shared coordinator queue(s) from `fleet.polled_queues` — where
+        `Sharded`/`PoolDownloadWorkflow` coordinators and
+        `DownloadDatasetWorkflow` land. `task_queue` is the raw --task-queue
+        argument (None → polled_queues applies the "download-workers"
+        default); polled_queues additionally adds the coordinator queue for
+        this worker's own source, which is why the count is not fixed at two.
       - the worker's personal queue ("download-{server_key}"): activities
         pinned there because they read a filelist the listing worker wrote
         to its own local disk (list_repo_files, filter_filelist_against_bos,
@@ -123,27 +133,30 @@ def build_worker_specs(server_key: str, task_queue: str) -> list[dict]:
         `run_pool_batch` only, `workflows=[]` — this Worker never runs a
         workflow task, only the shared-queue batch executor.
 
-    Why the third one matters: the pool coordinator dispatches batches to
+    Why the pool one matters: the pool coordinator dispatches batches to
     `pool-{hf,ms}` via `workflow.start_activity`, with no `schedule_to_start`
     timeout (by design — see workflows.py's pool section). A deploy that
-    starts Workers for only the first two queues does NOT error: the
-    activity just sits scheduled on a queue nobody polls, bounded only by
-    `schedule_to_close` (48h). Silent stall, not a crash — which is why this
-    registration is pulled into its own testable function rather than left
-    inline in `run_worker`.
+    starts Workers for only the coordinator and personal queues does NOT
+    error: the activity just sits scheduled on a queue nobody polls, bounded
+    only by `schedule_to_close` (48h). Silent stall, not a crash — which is
+    why this registration is pulled into its own testable function rather
+    than left inline in `run_worker`.
 
     A pure function (no Client/Worker objects) so a test can assert the
-    three-queue layout without a live Temporal connection.
+    queue layout without a live Temporal connection.
     """
     personal_queue = f"download-{server_key}"
     pool_queue = pool_task_queue(_pool_source_for_worker(server_key))
 
     specs = []
     seen_queues = set()
-    for queue, max_concurrent_activities in (
-        (task_queue, 1),
-        (personal_queue, 2),
-    ):
+    # fleet.polled_queues, not `task_queue` alone: a bj node passes its own
+    # personal queue as --task-queue, which dedupes against the personal entry
+    # and left it polling no shared coordinator queue at all. Coordinators then
+    # only ever ran on `download-workers` (HK-only), which is how a ModelScope
+    # listing landed on w6 and died with `No module named 'modelscope'`
+    # (t-20260806-cbf39e). The dispatch half is fleet.coordinator_queue.
+    for queue in polled_queues(server_key, task_queue):
         if queue in seen_queues:
             continue
         seen_queues.add(queue)
@@ -151,7 +164,10 @@ def build_worker_specs(server_key: str, task_queue: str) -> list[dict]:
             "task_queue": queue,
             "workflows": WORKFLOWS,
             "activities": ACTIVITIES,
-            "max_concurrent_activities": max_concurrent_activities,
+            # The personal queue carries the listing/partition activities that
+            # read this worker's own disk, so it gets the second slot; a shared
+            # coordinator queue runs one coordinator at a time by design.
+            "max_concurrent_activities": 2 if queue == personal_queue else 1,
         })
 
     if pool_queue not in seen_queues:
@@ -231,7 +247,6 @@ async def run_worker(args):
     logger.info(f"Connecting to Temporal at {args.temporal_host}...")
     client = await Client.connect(args.temporal_host)
 
-    task_queue = args.task_queue or "download-workers"
     personal_queue = f"download-{args.server_key}"
 
     # Export server key so activities can report it
@@ -240,7 +255,10 @@ async def run_worker(args):
 
     # Register activities, workflows, and the pool queue — see
     # build_worker_specs' docstring for why the third (pool) Worker exists.
-    specs = build_worker_specs(args.server_key, task_queue)
+    # args.task_queue (not a local default of "download-workers"): polled_queues
+    # inside build_worker_specs applies the default AND adds the shared
+    # coordinator queue for this worker's source.
+    specs = build_worker_specs(args.server_key, args.task_queue)
     queues = [s["task_queue"] for s in specs]
     logger.info(f"Starting worker: server_key={args.server_key}, queues={queues}")
     logger.info(

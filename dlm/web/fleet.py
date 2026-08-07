@@ -256,6 +256,61 @@ def worker_serves(server_key: str, source: str) -> bool:
     return source_for_worker(server_key) == wanted
 
 
+SHARED_COORDINATOR_QUEUE = "download-workers"
+MS_COORDINATOR_QUEUE = "download-ms-workers"
+
+
+def coordinator_queue(source: str) -> str:
+    """Task queue to start a sharded coordinator on, by task source.
+
+    `download-workers` is polled by the HK workers only — a bj node's
+    `--task-queue download-bjN` dedupes against its personal queue, so it never
+    polled the shared one (dlm/temporal/__main__.py). Starting every
+    coordinator there ran ModelScope listing on an HF node, which on
+    2026-08-06 failed t-20260806-cbf39e (RoboDojo) with
+    `No module named 'modelscope'` once the shared queue happened to hand the
+    activity to w6 — 2 of the 7 HK nodes lack the SDK, so this was a lottery
+    the source routing was already meant to settle. HK is also the wrong side
+    of the network for ModelScope: the same listing call took over 10 minutes
+    from w6 while bj nodes serve it in seconds.
+
+    So ModelScope gets its own shared queue, which every bj node polls. A
+    shared queue rather than one node's personal queue because step 8 of the
+    coordinator runs after every child finishes — possibly days later — and
+    pinning that to a single host makes one node's permanent loss a task that
+    never completes.
+    """
+    if source == "modelscope":
+        return MS_COORDINATOR_QUEUE
+    return SHARED_COORDINATOR_QUEUE
+
+
+def worker_coordinator_queue(server_key: str) -> str:
+    """The shared coordinator queue a given worker must poll — the mirror of
+    coordinator_queue, used at worker startup to register the right queues."""
+    return coordinator_queue(source_for_worker(server_key))
+
+
+def polled_queues(server_key: str, task_queue: str | None = None) -> list[str]:
+    """Every queue a worker process registers a poller on.
+
+    This lives here rather than inline in dlm/temporal/__main__.py so the
+    routing invariant can be tested against the code production runs: the
+    original defect was exactly a worker not polling the queue its
+    dispatcher targets, and a test that re-derived the list from
+    worker_coordinator_queue could not have caught it.
+
+    `task_queue` is the --task-queue argument (a bj node passes its own
+    personal queue, which dedupes away).
+    """
+    queues = [
+        task_queue or SHARED_COORDINATOR_QUEUE,
+        f"download-{server_key}",
+        worker_coordinator_queue(server_key),
+    ]
+    return list(dict.fromkeys(queues))
+
+
 def pending_sources(tasks: list[dict]) -> set[str]:
     """Sources that currently have queued work waiting for a worker."""
     return {(t.get("source") or "hf") for t in tasks if t.get("status") == "pending"}

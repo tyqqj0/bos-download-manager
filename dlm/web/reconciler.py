@@ -55,6 +55,9 @@ async def reconcile() -> dict:
         get_tasks_by_status, update_task_progress, get_shards_by_task,
         complete_task, init_db, _conn,
     )
+    # start_task_download (the funnel), not start_sharded_download +
+    # coordinator_queue at this call site: the queue decision now lives inside
+    # temporal_client, so both dispatch modes route by source from one place.
     from .temporal_client import running_workflows, start_task_download
 
     init_db()
@@ -65,6 +68,7 @@ async def reconcile() -> dict:
         "orphaned": [],
         "redispatched": [],
         "stale": [],
+        "reclaimed_shards": [],
         "errors": [],
     }
 
@@ -75,10 +79,9 @@ async def reconcile() -> dict:
         report["errors"].append(f"Failed to read tasks: {e}")
         return report
 
-    if not downloading:
-        return report
-
-    # Get running workflows from Temporal
+    # Get running workflows from Temporal. Queried before the no-tasks exit
+    # because the shard reclaim below needs it, and the state it repairs is
+    # most likely precisely when nothing is downloading — see reclaim.
     try:
         running_ids = set(await running_workflows())
         report["running_workflows"] = len(running_ids)
@@ -87,6 +90,17 @@ async def reconcile() -> dict:
         return report
 
     now = time.time()
+
+    try:
+        report["reclaimed_shards"] = reclaim_orphaned_shards(running_ids, now)
+    except Exception as e:
+        report["errors"].append(f"Shard reclaim failed: {e}")
+        logger.error(f"Reconciler: shard reclaim failed: {e}")
+
+    if not downloading:
+        return report
+
+    reclaimed_ids = {r["shard_id"] for r in report["reclaimed_shards"]}
 
     for task in downloading:
         task_id = task["id"]
@@ -112,13 +126,39 @@ async def reconcile() -> dict:
                     )
                     continue
                 if len(done_shards) + len(failed_shards) == len(shards) and failed_shards:
-                    complete_task(task_id, "failed")
-                    report.setdefault("auto_failed", []).append(task.get("name", task_id))
-                    logger.warning(
-                        f"Reconciler: marked {task.get('name', task_id)} failed "
-                        f"— {len(failed_shards)}/{len(shards)} shards failed, parent dead"
-                    )
-                    continue
+                    # A shard this cycle's reclaim just failed says nothing
+                    # about the download — its host was freed, and the work is
+                    # resumable (the BOS filter makes a restart lossless). Let
+                    # it fall through to re-dispatch instead of burying a live
+                    # task as failed because its worker was restarted.
+                    #
+                    # Only when EVERY failed shard is one of this cycle's
+                    # reclaims, though. `any()` let a single reclaimed shard
+                    # shield a task whose other seven failed on real download
+                    # errors: the task got re-dispatched, hit the same error,
+                    # and the genuine failure never surfaced. A real failure
+                    # recurs, so burying the task is the honest outcome — it
+                    # stays retryable by hand, and the BOS filter means nothing
+                    # already uploaded is lost.
+                    reclaimed_failures = [
+                        s for s in failed_shards if s.get("id") in reclaimed_ids
+                    ]
+                    if len(reclaimed_failures) == len(failed_shards):
+                        logger.info(
+                            f"Reconciler: {task.get('name', task_id)} has "
+                            f"{len(reclaimed_failures)} reclaimed shard(s) and no "
+                            f"genuine failure — re-dispatching rather than "
+                            f"marking failed"
+                        )
+                    else:
+                        complete_task(task_id, "failed")
+                        report.setdefault("auto_failed", []).append(task.get("name", task_id))
+                        logger.warning(
+                            f"Reconciler: marked {task.get('name', task_id)} failed "
+                            f"— {len(failed_shards)}/{len(shards)} shards failed "
+                            f"({len(reclaimed_failures)} reclaimed), parent dead"
+                        )
+                        continue
 
             report["orphaned"].append({
                 "task_id": task_id,
@@ -172,8 +212,15 @@ async def reconcile() -> dict:
                     # (auto_dispatch_pending below, routes/queue.py's resume).
                     mode = task.get("dispatch_mode") or "sharded"
                     conn2 = _conn()
+                    # retry_count too, not just claimed_at: a re-dispatch IS a
+                    # retry, and the churn guards read that counter
+                    # (alerts.py's repeated-failure alert, doctor's zombie
+                    # check at retry_count >= 8). Leaving it untouched let a
+                    # task be re-dispatched by this path indefinitely with
+                    # every churn detector reading zero.
                     conn2.execute(
-                        "UPDATE tasks SET claimed_at = ? WHERE id = ?",
+                        "UPDATE tasks SET claimed_at = ?, "
+                        "retry_count = COALESCE(retry_count, 0) + 1 WHERE id = ?",
                         (time.time(), task_id),
                     )
                     conn2.commit()
@@ -379,6 +426,82 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
     return alerts
 
 
+SHARD_ORPHAN_GRACE = 900  # 15 min quiet AND no child execution = not coming back
+
+
+def reclaim_orphaned_shards(running_ids, now: float | None = None) -> list[dict]:
+    """Fail shard rows whose child workflow is gone, so their host frees up.
+
+    A `running` shard row is how a host is marked taken: `busy_servers` reads
+    shard ownership as the primary signal, because a sharded task's own row
+    carries `server = NULL`. Nothing wrote that row back if the child died
+    without reporting — an OOM kill, a host reboot, a terminate that raced the
+    report, a worker restarted mid-shard. The row stayed `running` forever, the
+    host read busy forever, and `query_idle_workers` found nothing to dispatch
+    to. Sixteen such rows and the fleet reports zero idle workers while every
+    worker sits doing nothing.
+
+    `reconcile()`'s task loop cannot reach this: it iterates `downloading`
+    tasks, so a row belonging to a task that already went done/failed/revoked
+    is never visited — and that is the common case, since terminating a task's
+    workflows is exactly what leaves its children unable to report. Hence a
+    pass over shard rows rather than tasks, run even when no task is
+    downloading (the total-starvation state has nothing downloading by
+    definition).
+
+    Two conditions, both required:
+      * Temporal has no running `shard-{id}` execution — the authority on
+        whether work is alive, not a timestamp
+      * the row has been quiet for SHARD_ORPHAN_GRACE — covers the window
+        between `create_shards_in_db` and the child appearing in a list scan,
+        and any list lag behind a just-started execution
+
+    Callers must pass ids from a query that SUCCEEDED. An empty set from a
+    failed query would read as "nothing is running" and fail every live shard
+    in the fleet; `reconcile()` returns early on query failure for that reason.
+    """
+    from ..queue.snapshot import get_running_shards, init_db, update_shard_progress
+
+    init_db()
+    now = time.time() if now is None else now
+    cutoff = now - SHARD_ORPHAN_GRACE
+    reclaimed = []
+
+    # include_stopped_tasks=True: this pass REWRITES rows rather than reading
+    # them to decide who is busy, and the rows belonging to a terminal task are
+    # the ones most likely to be stranded (terminating a task's workflows is
+    # what leaves its children unable to report). See get_running_shards.
+    for shard in get_running_shards(include_stopped_tasks=True):
+        shard_id = shard.get("id") or ""
+        if not shard_id or f"shard-{shard_id}" in running_ids:
+            continue
+        updated_at = shard.get("updated_at") or 0
+        if updated_at > cutoff:
+            continue
+
+        quiet = int(now - updated_at)
+        update_shard_progress(
+            shard_id,
+            status="failed",
+            speed_mbps=0,
+            error=(f"orphaned: no running shard-{shard_id} workflow and no "
+                   f"progress for {quiet}s — reclaimed by reconciler"),
+        )
+        reclaimed.append({
+            "shard_id": shard_id,
+            "task_id": shard.get("task_id", ""),
+            "server": shard.get("server", ""),
+            "quiet_seconds": quiet,
+        })
+        logger.warning(
+            f"Reconciler: reclaimed orphaned shard {shard_id} on "
+            f"{shard.get('server') or '?'} (quiet {quiet}s, no child workflow) "
+            f"— its host was counted busy"
+        )
+
+    return reclaimed
+
+
 async def auto_dispatch_pending() -> dict:
     """Auto-dispatch pending tasks to idle workers.
 
@@ -401,7 +524,7 @@ async def auto_dispatch_pending() -> dict:
         # 1. Find alive workers (deduped by freshest heartbeat row)
         from .fleet import (
             alive_workers as compute_alive, busy_servers as compute_busy,
-            worker_serves,
+            coordinator_queue, worker_serves,
         )
 
         now = time.time()
@@ -552,12 +675,22 @@ async def auto_dispatch_pending() -> dict:
                     pool_downloading_counts.get(task.get("source", "hf"), 0) + 1
                 )
 
+            # The source routing decided above has to survive into the
+            # coordinator: started on the shared HK queue, a ModelScope task
+            # lists its files on an HF node (see fleet.coordinator_queue).
+            queue = coordinator_queue(task.get("source", "hf"))
+
             try:
                 await start_task_download(task)
                 report["dispatched"].append({
                     "task": task.get("name", task["id"]),
                     "worker": task_mode,
                     "mode": task_mode,
+                    # Informational only — the authority is the funnel, which
+                    # calls the same coordinator_queue(source). Reported so an
+                    # operator can see the source routing took effect without
+                    # reading Temporal.
+                    "queue": queue,
                 })
                 logger.info(f"Auto-dispatch: {task.get('name')} → {task_mode} coordinator")
             except Exception as e:

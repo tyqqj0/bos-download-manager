@@ -177,10 +177,50 @@ async def start_split_download(task_dict: dict, worker_count: int = 2):
     return handle
 
 
-async def start_sharded_download(task_dict: dict):
-    """Start a ShardedDownloadWorkflow — auto-sharding coordinator."""
+async def queue_poller_count(client, queue: str) -> int | None:
+    """How many workers currently poll `queue` for workflow tasks.
+
+    None means Temporal could not be asked (RPC error, old server) — callers
+    must treat that as "unknown", never as zero.
+    """
+    from temporalio.api.enums.v1 import TaskQueueType
+    from temporalio.api.taskqueue.v1 import TaskQueue
+    from temporalio.api.workflowservice.v1 import DescribeTaskQueueRequest
+
+    try:
+        resp = await client.workflow_service.describe_task_queue(
+            DescribeTaskQueueRequest(
+                namespace=client.namespace,
+                task_queue=TaskQueue(name=queue),
+                task_queue_type=TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW,
+            )
+        )
+        return len(resp.pollers)
+    except Exception as e:  # pragma: no cover - depends on live server
+        logger.warning(f"describe_task_queue({queue}) failed: {e}")
+        return None
+
+
+async def start_sharded_download(task_dict: dict, task_queue: str | None = None):
+    """Start a ShardedDownloadWorkflow — auto-sharding coordinator.
+
+    `task_queue` must be one the source's own workers poll; see
+    fleet.coordinator_queue. Defaults to the shared HK queue, which is correct
+    for every source except ModelScope.
+
+    Refuses to start when the target queue has no pollers. Temporal accepts
+    such a start happily and the execution sits RUNNING forever: nothing
+    reconciles it (has_live_workflow stays true, so reconcile only records it
+    as "stale" and redispatch_orphaned skips it), the task stays `downloading`
+    with zero shards, and auto_dispatch's listing guard blocks every other task
+    of that source for 15 minutes. The reachable trigger is deploy order —
+    restarting dlm-web before deploy-workers.sh has restarted any node of the
+    source, so the new coordinator queue exists in code but nobody polls it
+    yet. Failing here instead leaves the task `pending` for the next 30s cycle.
+    """
     from ..temporal.models import TaskInput
     from ..temporal.workflows import ShardedDownloadWorkflow
+    from .fleet import SHARED_COORDINATOR_QUEUE
 
     client = await connected_client()
     task_input = TaskInput(
@@ -195,14 +235,29 @@ async def start_sharded_download(task_dict: dict):
         shard_count=int(task_dict.get("max_workers") or 0),
     )
 
+    queue = task_queue or SHARED_COORDINATOR_QUEUE
+    pollers = await queue_poller_count(client, queue)
+    if pollers == 0:
+        raise RuntimeError(
+            f"no worker polls coordinator queue {queue!r} — refusing to start "
+            f"{task_dict['id']}, which would hang RUNNING with nothing to "
+            f"reconcile it. Deploy the workers for this source first "
+            f"(bash scripts/deploy-workers.sh), then dlm-web."
+        )
+    # WORKFLOW_ID_PREFIXES, not a literal "sharded-": the cancel/terminate
+    # sweep derives the same ID from this map, and the two drifting apart
+    # would leave a workflow nothing can stop. The value is identical, so
+    # running executions keep their IDs.
     workflow_id = f"{WORKFLOW_ID_PREFIXES['ShardedDownloadWorkflow']}{task_dict['id']}"
     handle = await client.start_workflow(
         ShardedDownloadWorkflow.run,
         task_input,
         id=workflow_id,
-        task_queue="download-workers",
+        task_queue=queue,
     )
-    logger.info(f"Started sharded workflow {workflow_id}")
+    logger.info(
+        f"Started sharded workflow {workflow_id} on queue {queue} "
+        f"(pollers={pollers if pollers is not None else 'unknown'})")
     return handle
 
 
@@ -329,16 +384,22 @@ def _expected_pool_pollers(source: str) -> int:
     return sum(1 for w in workers if worker_serves(w.get("server_key") or "", source))
 
 
-async def start_pool_download(task_dict: dict):
+async def start_pool_download(task_dict: dict, task_queue: str | None = None):
     """Start a PoolDownloadWorkflow — work-stealing coordinator.
 
-    task_queue="download-workers" **explicitly**, matching
-    start_sharded_download: the coordinator itself (list/filter/chunk, then
-    the window loop) runs there, same as ShardedDownloadWorkflow — bj*
-    workers never poll that queue, so an MS pool task's coordinator still
-    lands on w* exactly like the sharded one does. Only the batches run on
-    the shared pool-hf/pool-ms queue (`dlm.temporal.workflows.
-    pool_task_queue`), which this function reads but never rebuilds.
+    `task_queue` is the COORDINATOR's queue (list/filter/chunk, then the
+    window loop) and must be one the task's own source polls — see
+    fleet.coordinator_queue. It defaults to the shared HK queue, which is
+    correct for every source except ModelScope. This used to be
+    "download-workers" **explicitly**, on the reasoning that it matched
+    start_sharded_download; that stopped being true when a ModelScope
+    coordinator on the HK-only queue ran its listing on an HF node and died
+    with `No module named 'modelscope'` (t-20260806-cbf39e), so both paths
+    now take the queue from their one caller, start_task_download.
+
+    Only the BATCHES run on the shared pool-hf/pool-ms queue
+    (`dlm.temporal.workflows.pool_task_queue`), which this function reads but
+    never rebuilds — that is a different queue from this argument.
 
     Mode gate (plan change #2): refuses to start — raising
     PoolPollerGateError rather than falling back to sharded — if that pool
@@ -347,8 +408,10 @@ async def start_pool_download(task_dict: dict):
     """
     from ..temporal.models import TaskInput
     from ..temporal.workflows import PoolDownloadWorkflow, pool_task_queue
+    from .fleet import SHARED_COORDINATOR_QUEUE
 
     source = task_dict.get("source", "hf")
+    coordinator = task_queue or SHARED_COORDINATOR_QUEUE
     client = await connected_client()
 
     queue_name = pool_task_queue(source)
@@ -407,10 +470,10 @@ async def start_pool_download(task_dict: dict):
         PoolDownloadWorkflow.run,
         task_input,
         id=workflow_id,
-        task_queue="download-workers",
+        task_queue=coordinator,
     )
     logger.info(
-        f"Started pool workflow {workflow_id} on queue download-workers "
+        f"Started pool workflow {workflow_id} on queue {coordinator} "
         f"({actual} activity pollers on {queue_name})"
     )
     return handle
@@ -426,12 +489,23 @@ async def start_task_download(task: dict):
     every caller that still doesn't know about the column). An unrecognised
     mode string is an error: silently falling back to sharded would hide a
     caller bug instead of surfacing it.
+
+    This is also the ONE place the coordinator queue is decided. Both modes
+    get `coordinator_queue(source)` rather than the shared HK default: the
+    coordinator runs the repo listing, and a ModelScope listing on an HF node
+    fails outright on 2 of the 7 HK boxes (`No module named 'modelscope'`,
+    t-20260806-cbf39e) and takes 10+ minutes on the rest. Callers pass a task
+    row and nothing else, so there is no per-call-site queue argument left to
+    get wrong.
     """
+    from .fleet import coordinator_queue
+
     mode = task.get("dispatch_mode") or "sharded"
+    queue = coordinator_queue(task.get("source") or "hf")
     if mode == "sharded":
-        return await start_sharded_download(task)
+        return await start_sharded_download(task, task_queue=queue)
     if mode == "pool":
-        return await start_pool_download(task)
+        return await start_pool_download(task, task_queue=queue)
     raise ValueError(f"unknown dispatch_mode={mode!r} for task {task.get('id')}")
 
 

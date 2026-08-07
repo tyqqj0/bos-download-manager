@@ -9,7 +9,8 @@ from .cache import cache
 
 logger = logging.getLogger("dlm.web")
 
-_executor = ThreadPoolExecutor(max_workers=4)
+EXECUTOR_WORKERS = 4
+_executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
 
 DASHBOARD_INTERVAL = 10
 WORKFLOW_SYNC_INTERVAL = 30
@@ -26,6 +27,40 @@ STAGING_GC_INTERVAL = 3600  # decision G — local-disk-only, terminal-tasks-onl
 # different direction, so the loop bounds each stage rather than trusting the
 # callee. Generous: these are normally sub-second.
 STAGE_TIMEOUT = 60
+
+
+async def _blocking_stage(loop, fn, name: str):
+    """Run a blocking stage on the thread pool with a deadline.
+
+    `run_in_executor` carries no timeout of its own, so the three stages that
+    used it bare were the hole left in the bound above. They are not
+    pure-SQLite either: `_poll_transfers` logs into the DCloud API and lists
+    async tasks, so a peer that accepts the connection and never answers parks
+    this `while True` forever — the wedged control plane again, from a third
+    direction.
+
+    One caveat stated plainly, because it bounds what this buys: cancelling
+    the future does NOT stop the thread. The stage is abandoned, not killed,
+    and its pool slot is held for as long as the call hangs. With
+    EXECUTOR_WORKERS slots, a stage that hangs every cycle eventually starves
+    the pool — but by then every cycle times out and says so in the log,
+    instead of the loop going silent on the very first hang, and dispatch and
+    reconcile (which await coroutines, not the pool) keep running throughout.
+
+    Returns None if the stage timed out or raised — callers must not treat
+    that as a result.
+    """
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_executor, fn), timeout=STAGE_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.error(
+            f"{name} exceeded {STAGE_TIMEOUT}s — stage abandoned; its thread is "
+            f"still held (pool has {EXECUTOR_WORKERS} slots)"
+        )
+    except Exception as e:
+        logger.error(f"{name} error: {e}")
+    return None
 
 
 def _build_dashboard() -> dict:
@@ -217,14 +252,15 @@ async def background_scheduler():
         try:
             # Zero stale speeds before building dashboard
             from .reconciler import zero_stale_speeds
-            await loop.run_in_executor(_executor, zero_stale_speeds)
+            await _blocking_stage(loop, zero_stale_speeds, "zero_stale_speeds")
 
-            dashboard = await loop.run_in_executor(_executor, _build_dashboard)
-            cache.set_dashboard(dashboard)
+            dashboard = await _blocking_stage(loop, _build_dashboard, "build_dashboard")
+            if dashboard is not None:
+                cache.set_dashboard(dashboard)
 
             now = time.time()
             if now - last_transfer_poll > TRANSFER_INTERVAL:
-                await loop.run_in_executor(_executor, _poll_transfers)
+                await _blocking_stage(loop, _poll_transfers, "transfer poll")
                 last_transfer_poll = now
 
             # Auto-dispatch pending tasks to idle workers (own 30s cadence —
@@ -296,10 +332,15 @@ async def background_scheduler():
             # over ssh, which the wait_for below still bounds at
             # STAGE_TIMEOUT like every other blocking stage here.
             if now - last_staging_gc > STAGING_GC_INTERVAL:
-                try:
-                    from .reconciler import staging_gc
-                    gc_report = await asyncio.wait_for(
-                        loop.run_in_executor(_executor, staging_gc), timeout=STAGE_TIMEOUT)
+                # _blocking_stage, not a bare run_in_executor + wait_for: the
+                # wrapper is the single place the deadline, the timeout log
+                # line and the "returns None on failure" contract live, and
+                # this stage is the slowest of them (ssh to every server).
+                # test_event_loop_safety pins that no stage in this loop
+                # re-implements it.
+                from .reconciler import staging_gc
+                gc_report = await _blocking_stage(loop, staging_gc, "staging_gc")
+                if gc_report is not None:
                     cache.set("staging_gc_report", gc_report)
                     if gc_report.get("removed"):
                         logger.info(
@@ -308,8 +349,6 @@ async def background_scheduler():
                         )
                     if gc_report.get("errors"):
                         logger.error(f"Staging GC errors: {gc_report['errors']}")
-                except Exception as e:
-                    logger.error(f"Staging GC error: {e}")
                 last_staging_gc = now
 
         except Exception as e:

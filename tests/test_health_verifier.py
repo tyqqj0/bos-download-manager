@@ -32,7 +32,16 @@ def _types(anomalies):
 
 
 def test_module_never_spawns_a_process():
-    """The outage was a fork on the event loop. Nothing here may fork again."""
+    """The outage was a fork on the event loop. Nothing here may fork again.
+
+    Grepping for `subprocess` alone is not enough: every helper in
+    `dlm.core.ssh` reaches `subprocess.run` one frame down (ssh.py:42, :182),
+    so `from ..core.ssh import ssh_exec` forks from the loop thread while
+    this module's own source stays clean. The 2026-07-31 hang came from a
+    fork in the web process; where the `subprocess` token was typed does not
+    change that. So the ssh surface is named explicitly.
+    """
+    import ast
     import inspect
 
     from dlm.web import health_verifier
@@ -41,6 +50,24 @@ def test_module_never_spawns_a_process():
     body = source.split('"""', 2)[-1]  # skip the docstring that explains why
     for forbidden in ("subprocess", "os.system", "os.fork", "os.popen", "os.spawn"):
         assert forbidden not in body, f"{forbidden} reintroduces the 2026-07-31 hang"
+
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            assert not module.endswith("core.ssh") and module != "ssh", (
+                f"imports from {module} — every ssh helper forks via "
+                f"subprocess.run, which is the hang this file exists to prevent"
+            )
+            for alias in node.names:
+                assert not alias.name.startswith("ssh_"), (
+                    f"imports {alias.name}: forks via subprocess.run one frame down"
+                )
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert "core.ssh" not in alias.name, (
+                    f"imports {alias.name}: every helper in it forks"
+                )
 
 
 def test_sharded_work_is_found_through_the_shard_row():

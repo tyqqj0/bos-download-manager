@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import asyncio
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from ...core.naming import shard_row_id
 from ...queue import snapshot
@@ -216,20 +216,83 @@ async def resume_task(body: dict):
 
 @router.post("/queue/retry")
 async def retry_task(body: dict):
-    """Retry a failed task."""
+    """Retry a failed task.
+
+    Also accepts a task marked `done` whose OWN shard rows contradict that
+    claim — a shard row that is not `done` means the coordinator concluded
+    success over a shard that did not succeed. t-20260805-460d45
+    (molmobot-data) was reported done at 0 of 9611 GB on 2026-08-06 with its
+    single shard row reading `failed`; the workflow bug behind it is fixed,
+    but there was no supported way to correct the row it left behind, and
+    hand-editing SQLite is not one.
+
+    The gate is evidence from the task's own shard rows, not an operator
+    override: a genuinely complete task (every shard `done`) is still refused,
+    so this cannot be used to re-download a finished dataset by accident.
+    """
     task_id = body.get("task_id", "")
     if not task_id:
         return {"error": "task_id is required"}
 
     def do_get():
         snapshot.init_db()
-        return snapshot.get_task(task_id)
-    task = await _run_blocking(do_get)
+        task = snapshot.get_task(task_id)
+        shards = snapshot.get_shards_by_task(task_id) if task else []
+        return task, shards
+    task, shards = await _run_blocking(do_get)
 
     if not task:
         return {"error": f"Task {task_id} not found"}
-    if task["status"] not in ("failed", "revoked", "paused"):
+    if task["status"] not in ("failed", "revoked", "paused", "done", "pending"):
         return {"error": f"Cannot retry task in status={task['status']}"}
+    contradicting = [s for s in shards if (s.get("status") or "") != "done"]
+    if task["status"] == "done" and not contradicting:
+        return {"error": (
+            f"Task {task_id} is done and all {len(shards)} shard rows agree — "
+            "refusing to re-download. Add a new task if that is really wanted."
+        )}
+
+    # Terminate before touching the rows, and unconditionally — the way
+    # /queue/reshard does it. Two separate reasons.
+    #
+    # Before the DELETE: `paused` only cancels cooperatively, so shard rows can
+    # still read "running" for minutes while a batch drains. Deleting those rows
+    # without closing their workflows makes the shards invisible to
+    # get_running_shards() — busy_servers then frees hosts that are still
+    # writing to /data/staging, auto_dispatch stacks a second pipeline on them,
+    # and the re-dispatched coordinator collides with the old children on their
+    # deterministic IDs. The rows are also how the children's handles are
+    # enumerated, which they cannot be after the DELETE.
+    #
+    # Unconditionally: terminal rows are NOT evidence the coordinator is
+    # closed. The reconciler's shard reclaim fails rows without touching
+    # `sharded-{id}` (it only matches `shard-*`), and a forced revoke leaves
+    # rows terminal behind a coordinator that is still RUNNING. Gating the
+    # terminate on row status skipped it in exactly those cases: the rows were
+    # deleted, the task set `pending`, and auto_dispatch then hit
+    # WorkflowAlreadyStartedError on the still-taken id — swallowed, leaving a
+    # `downloading` task with zero shard rows and no coordinator, which
+    # reconcile() will not re-dispatch because has_live_workflow() is true.
+    # terminate_workflow_and_wait seeds `sharded-{id}` itself and sweeps for
+    # children by task-id substring, so it does not depend on the rows to find
+    # the coordinator, and it returns True when nothing is open.
+    from ..temporal_client import terminate_workflow_and_wait
+    try:
+        closed = await terminate_workflow_and_wait(task_id)
+    except Exception as exc:
+        # Reaching Temporal is part of the check, not incidental to it: an
+        # unreachable server means "unknown", and unknown has to read as not
+        # closed. Returned rather than raised so the caller gets the reason
+        # instead of a 500 — the state is untouched either way.
+        return {"error": (
+            f"could not reach Temporal to close workflows for {task_id} "
+            f"({type(exc).__name__}: {exc}) — task state unchanged"
+        )}
+    if not closed:
+        return {"error": (
+            f"workflows for {task_id} did not close within timeout — "
+            "task state unchanged, retry later"
+        )}
 
     def do_update():
         retry_count = (task.get("retry_count") or 0) + 1
@@ -238,12 +301,28 @@ async def retry_task(body: dict):
             speed_mbps=0, error=None,
         )
         conn = snapshot._conn()
-        conn.execute("UPDATE tasks SET retry_count = ? WHERE id = ?", (retry_count, task_id))
+        # server released and completed_at cleared for the same reason
+        # /queue/reshard does it: a stale claim or completion timestamp on a
+        # row auto_dispatch is about to pick up describes the previous run.
+        conn.execute(
+            "UPDATE tasks SET retry_count = ?, server = NULL, completed_at = NULL "
+            "WHERE id = ?", (retry_count, task_id))
+        # The re-dispatched coordinator calls create_shards_in_db and gets a
+        # fresh set of rows. Leaving the old ones behind inflates total_shards
+        # so the task can never read 100%, and keeps a `failed` row that the
+        # aggregate would count against a run that is going fine. /queue/
+        # reshard deletes them for exactly this reason; retry did not.
+        conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
         conn.commit()
     await _run_blocking(do_update)
 
     # auto_dispatch will pick this up and assign to an idle worker
-    return {"ok": True, "task_id": task_id, "status": "pending"}
+    return {
+        "ok": True, "task_id": task_id, "status": "pending",
+        "cleared_shard_rows": len(shards),
+        "note": "auto_dispatch restarts it; the BOS resume filter skips files "
+                "already uploaded under this task's prefix",
+    }
 
 
 @router.post("/queue/reorder")
@@ -299,6 +378,9 @@ async def preempt_for_task(body: dict):
     if not urgent_id:
         return {"error": "urgent_task_id is required"}
 
+    # start_task_download, not start_sharded_download + coordinator_queue here:
+    # the queue decision moved inside the funnel (temporal_client), so both
+    # dispatch modes route by source from one place instead of each call site.
     from ..temporal_client import cancel_workflow, start_task_download
 
     def do_read():
@@ -894,7 +976,50 @@ async def query_idle_workers_api(source: str = "hf", exclude_task: str = ""):
                 continue
             idle.append(key)
         return {"workers": idle}
-    return await _run_blocking(do_query)
+
+    result = await _run_blocking(do_query)
+    return {"workers": await _drop_unpolled(result["workers"])}
+
+
+async def _drop_unpolled(keys: list[str]) -> list[str]:
+    """Remove workers whose personal queue nothing polls.
+
+    Heartbeat liveness is not the same question as "will Temporal hand this
+    node work". A worker reports under two hostnames — `{key}@temporal` and
+    `{key}@sidecar` — and `merge_workers` keeps the node alive as long as
+    *either* is fresh, so a Temporal process that died (the observed
+    `No module named 'modelscope'` and OOM cases) leaves a node looking
+    perfectly idle while `download-{key}` has zero pollers. A child shard
+    started there sits RUNNING forever, which makes `has_live_workflow` true,
+    so reconcile only records the task stale and `redispatch_orphaned` skips
+    it: one permanently wedged shard per dispatch, and the coordinator's
+    gather over its children never returns.
+
+    `start_sharded_download` already refuses the coordinator queue for this
+    reason; this is the same gate for the child queues. Failure to *ask*
+    Temporal (None) leaves the worker in the pool — unknown is not zero, or
+    one RPC hiccup empties the fleet.
+    """
+    if not keys:
+        return keys
+    try:
+        from ..temporal_client import connected_client, queue_poller_count
+        client = await connected_client()
+    except Exception as e:  # pragma: no cover - needs a live server
+        logger.warning(f"idle-workers: cannot reach Temporal to check pollers: {e}")
+        return keys
+
+    kept = []
+    for key in keys:
+        pollers = await queue_poller_count(client, f"download-{key}")
+        if pollers == 0:
+            logger.warning(
+                f"idle-workers: dropping {key} — nothing polls download-{key} "
+                f"(heartbeat alive, Temporal worker not running)"
+            )
+            continue
+        kept.append(key)
+    return kept
 
 
 @router.get("/pool/alive-workers")
@@ -1106,15 +1231,41 @@ async def reshard_task(body: dict):
 
 
 @router.delete("/queue/{task_id}")
-async def delete_from_queue(task_id: str):
-    """Cancel workflow and delete task."""
-    from ..temporal_client import cancel_workflow
-    await cancel_workflow(task_id)
+async def delete_from_queue(task_id: str, force: bool = False):
+    """Cancel workflows and delete the task — terminate first, then the rows.
+
+    This used to fire `cancel_workflow` and delete regardless of the outcome.
+    Cancel is a request, not a guarantee: the coordinator may be mid-activity
+    for minutes. Deleting the rows underneath it removes the only handle on
+    that work — `get_running_shards` no longer lists it, so `busy_servers`
+    frees a host that is still writing to /data/staging, and a later
+    terminate cannot find the children it would have reached through those
+    rows. Same contract as DELETE /api/tasks/{id}: 502 and no mutation if the
+    workflows will not close, `?force=true` to delete anyway.
+    """
+    from ..temporal_client import terminate_workflow_and_wait
+
+    closed = False
+    try:
+        closed = await terminate_workflow_and_wait(task_id)
+    except Exception as e:
+        logger.error(f"delete_from_queue {task_id}: terminate failed: {e}")
+        if not force:
+            raise HTTPException(502, (
+                f"could not terminate workflows for {task_id}: {e} — nothing "
+                "deleted. Retry, or pass ?force=true."
+            ))
+    if not closed and not force:
+        raise HTTPException(502, (
+            f"workflows for {task_id} did not close within timeout — nothing "
+            "deleted. Retry, or pass ?force=true."
+        ))
 
     def do_delete():
         snapshot.init_db()
         snapshot.delete_task(task_id)
-        return {"ok": True, "task_id": task_id, "deleted": True}
+        return {"ok": True, "task_id": task_id, "deleted": True,
+                "workflows_closed": closed}
     return await _run_blocking(do_delete)
 
 
