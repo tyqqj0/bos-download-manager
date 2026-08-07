@@ -954,21 +954,30 @@
                     </select>
                 </div>
             </div>
-            <div>
-                <label class="text-xs text-gray-400">Type</label>
-                <select x-model="addForm.type" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
-                    <option value="dataset">Dataset</option>
-                    <option value="model">Model</option>
-                </select>
+            <div class="grid grid-cols-2 gap-3">
+                <div>
+                    <label class="text-xs text-gray-400">Type</label>
+                    <select x-model="addForm.type" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
+                        <option value="dataset">Dataset</option>
+                        <option value="model">Model</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="text-xs text-gray-400">Shards (workers)</label>
+                    <input x-model.number="addForm.shard_count" type="number" min="0" max="16" placeholder="0"
+                           class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
+                    <div class="text-xs text-gray-500 mt-1">0 = auto. Capped at the idle workers for this source.</div>
+                </div>
             </div>
             <div class="flex items-center gap-2">
                 <input type="checkbox" x-model="addForm.no_dispatch" id="no-dispatch">
-                <label for="no-dispatch" class="text-xs text-gray-400">Only queue (don't dispatch)</label>
+                <label for="no-dispatch" class="text-xs text-gray-400">Queue as paused — Resume starts it</label>
             </div>
         </div>
         <div class="flex justify-end gap-2 mt-4">
             <button @click="showAddModal = false" class="px-4 py-2 bg-gray-600 hover:bg-gray-500 rounded text-sm">Cancel</button>
-            <button @click="submitAdd()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm" :disabled="!addForm.url">Add & Dispatch</button>
+            <button @click="submitAdd()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm" :disabled="!addForm.url"
+                    x-text="addForm.no_dispatch ? 'Add (paused)' : 'Add &amp; Dispatch'"></button>
         </div>
         <div x-show="addForm.error" class="mt-2 text-xs text-red-400" x-text="addForm.error"></div>
     </div>

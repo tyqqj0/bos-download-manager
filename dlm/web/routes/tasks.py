@@ -60,6 +60,10 @@ def _task_for_frontend(t: dict) -> dict:
         "transfer_error": t.get("transfer_error"),
         "total_shards": t.get("total_shards", 0) or 0,
         "done_shards": t.get("done_shards", 0) or 0,
+        # What was ASKED for (0 = auto), as opposed to total_shards, which is
+        # how many shard rows the coordinator actually created after capping
+        # the request at the idle same-source workers.
+        "shard_count": t.get("max_workers", 0) or 0,
     }
 
 
@@ -140,21 +144,36 @@ class AddTaskRequest(BaseModel):
     name: Optional[str] = None
     size_gb: float = 0.0
     no_dispatch: bool = False
+    # 0 = auto (coordinator sizes it from total_bytes). The coordinator caps
+    # whatever is asked for at the number of idle same-source workers, so a
+    # request of 8 on a fleet with 4 free hosts yields 4 shards, not a stall.
+    shard_count: int = 0
+    # Override the source parse_repo inferred. `dlm add --source` has always
+    # offered this and the body never carried it, so a bare `org/name` that
+    # lives on ModelScope was silently filed as hf — and hf tasks only ever
+    # dispatch to the HK fleet, which cannot reach ModelScope.
+    source: Optional[str] = None
 
 
 @router.post("/tasks")
 async def add_task(req: AddTaskRequest):
     """Add a new download task — saves to pending, auto_dispatch picks it up."""
     def _do():
+        from ...core.bos import bos_target
         from ...core.parser import parse_repo
         from ...queue.snapshot import get_all_tasks, upsert_task, init_db
         import uuid
         from datetime import datetime, timezone
+        from types import SimpleNamespace
 
         init_db()
         parsed = parse_repo(req.url_or_repo)
         if req.type:
             parsed["type"] = req.type
+        if req.source:
+            if req.source not in ("hf", "modelscope"):
+                return {"error": f"Unknown source: {req.source} (expected hf or modelscope)"}
+            parsed["source"] = req.source
 
         if parsed["source"] == "unknown":
             return {"error": f"Cannot parse source: {req.url_or_repo}"}
@@ -172,12 +191,21 @@ async def add_task(req: AddTaskRequest):
         task_id = f"t-{today}-{uuid.uuid4().hex[:6]}"
         priority_int = PRIORITY_TO_INT.get(req.priority, 5)
 
-        if parsed["type"] == "model":
-            bos_path = f"auwomo-model/{task_name}/"
-        elif req.category and req.category != "other":
-            bos_path = f"auwomo-datasets/raw-data/{req.category}/{task_name}/"
-        else:
-            bos_path = f"auwomo-datasets/raw-data/{task_name}/"
+        # Ask bos_target for the prefix rather than re-deriving it. This used to
+        # build "auwomo-datasets/raw-data/{category}/{name}/" by hand — a bucket
+        # name that does not exist glued to a prefix scheme the uploader
+        # abandoned. Whatever this row says has to be the same prefix the
+        # uploader writes to and the resume filter reads back, so there is
+        # exactly one place that decides it.
+        #
+        # The namespace mirrors the TaskInput start_sharded_download will build
+        # from this row (temporal_client.py) field for field — category passed
+        # through verbatim, "other" included, since bos_target reads any
+        # non-empty category as a path segment and really does write to
+        # other/{name}/.
+        _, bos_path = bos_target(SimpleNamespace(
+            type=parsed["type"], name=task_name, category=req.category,
+        ))
 
         task_meta = {
             "id": task_id,
@@ -187,15 +215,21 @@ async def add_task(req: AddTaskRequest):
             "type": parsed["type"],
             "category": req.category,
             "bos_path": bos_path,
-            "status": "pending",
+            # `paused` is what "queued but not dispatched" means to the rest of
+            # the system: auto_dispatch_pending() claims `pending` rows only,
+            # and /api/queue/resume takes it from paused to pending when the
+            # operator is ready. Writing `pending` here (what this did) meant
+            # no_dispatch was decorative — the next 30s cycle claimed it.
+            "status": "paused" if req.no_dispatch else "pending",
             "priority": priority_int,
             "size_gb": req.size_gb,
             "downloaded_gb": 0,
             "progress_pct": 0,
             "speed_mbps": 0,
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "celery_task_id": task_id,
         }
+        if req.shard_count > 0:
+            task_meta["max_workers"] = req.shard_count
 
         upsert_task(task_meta)
         return {"task": _task_for_frontend(task_meta)}

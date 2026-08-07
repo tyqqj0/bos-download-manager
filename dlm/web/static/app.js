@@ -258,13 +258,17 @@ function app() {
                         type: this.addForm.type,
                         priority: this.addForm.priority,
                         no_dispatch: this.addForm.no_dispatch,
+                        shard_count: Number(this.addForm.shard_count) || 0,
                     })
                 });
                 if (res.ok) {
                     const data = await res.json();
-                    this.showToast(`Added: ${data.task?.name || 'task'}`, 'success');
+                    const paused = data.task?.status === 'paused';
+                    this.showToast(
+                        `Added: ${data.task?.name || 'task'}${paused ? ' (paused)' : ''}`,
+                        'success');
                     this.showAddModal = false;
-                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', no_dispatch: false, parsed: null, error: '' };
+                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', shard_count: 0, no_dispatch: false, parsed: null, error: '' };
                     await this.fetchTasks();
                 } else {
                     const data = await res.json();
