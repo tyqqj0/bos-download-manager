@@ -19,6 +19,7 @@ from .models import (
     ARCHIVABLE_FAIL_REASONS,
     POOL_BATCH_FAIL_MAX,
     POOL_BATCH_MAX_ATTEMPTS,
+    POOL_MAX_BATCHES,
     FileInfo,
     PipelineStats,
     ShardInput,
@@ -904,14 +905,16 @@ async def pool_alive_workers(source: str) -> int:
 BATCH_MAX_FILES = 500
 BATCH_MAX_BYTES = 32 * 1024 ** 3  # 32 GiB
 
-# Mirrors dlm.web.fleet.POOL_MAX_BATCHES. Activities run on workers and must
-# not import dlm.web (coordinator-only, wrong dependency direction) — kept
-# as a chunk_filelist parameter instead of a duplicated worker-side env
-# read, so there is exactly one place (fleet.py) that owns the number and
-# the workflow (which already knows fleet policy) is free to pass it
-# through explicitly. deploy-workers.sh's md5 manifest gate keeps worker and
-# coordinator code — and therefore this default and fleet.py's — in sync.
-POOL_MAX_BATCHES_DEFAULT = 1500
+# Kept as a chunk_filelist parameter rather than read here, so the workflow
+# (which already knows fleet policy) passes it through explicitly. The number
+# itself lives in models.POOL_MAX_BATCHES — the worker-side mirror of
+# dlm.web.fleet.POOL_MAX_BATCHES, since activities must not import dlm.web
+# (coordinator-only, wrong dependency direction).
+#
+# The default exists for direct callers (tests); the workflow MUST still pass
+# the argument — see the call site in workflows.py for why an omitted optional
+# argument silently corrupts `task_input`.
+POOL_MAX_BATCHES_DEFAULT = POOL_MAX_BATCHES
 
 
 def _chunk_files(

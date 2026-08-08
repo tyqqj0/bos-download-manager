@@ -200,7 +200,8 @@ class _PoolActivityStubs:
                                  skipped_gb: float):
         return None
 
-    async def chunk_filelist(self, filelist_path: str, task_input: TaskInput) -> dict:
+    async def chunk_filelist(self, filtered_path: str, task_input: TaskInput,
+                             max_batches: int) -> dict:
         n = self.num_batches
         return {"batch_keys": [f"batchlists/pool-task/batch-{i}.json" for i in range(n)],
                 "counts": [5] * n, "bytes": [100] * n}
@@ -251,8 +252,8 @@ class _PoolActivityStubs:
     async def aggregate_task_from_shards(self, task_id: str):
         return None
 
-    async def report_to_dashboard(self, task_id, status, phase=None, progress=None,
-                                  speed=None, downloaded_gb=None, extra=None,
+    async def report_to_dashboard(self, task_id, status, phase=None, progress_pct=None,
+                                  speed_mbps=None, downloaded_gb=None, server=None,
                                   error=None):
         self.dashboard.append((status, phase, error))
         return None
@@ -635,3 +636,45 @@ def test_verify_missing_files_is_registered_on_the_workers():
 
     names = [getattr(a, "__temporal_activity_definition").name for a in ACTIVITIES]
     assert "verify_missing_files" in names
+
+
+def test_every_stub_matches_the_real_activity_signature():
+    """A stub whose parameters drift from the real activity turns this whole
+    suite into a test of a fiction.
+
+    This is not hypothetical. The first production pool dispatch died on
+    `chunk_filelist` with "'dict' object has no attribute 'name'": the
+    coordinator passed 2 args, the real activity declared 3, and temporalio
+    responds to that mismatch by dropping ALL argument type hints, so
+    `task_input` arrived as a raw dict. Every replay test here passed anyway —
+    the stub also took 2 parameters, so the suite agreed with the buggy call
+    site instead of with the activity being stubbed.
+
+    Parameter COUNT is what is enforced, because that is what temporalio keys
+    on: a stub that agrees with a call site the real activity would reject is
+    the specific lie that hid this bug.
+    """
+    import inspect
+
+    from dlm.temporal import activities as real
+
+    stubs = _PoolActivityStubs()
+    mismatches = []
+    for stub in stubs.activities():
+        name = getattr(stub, "__temporal_activity_definition").name
+        real_fn = getattr(real, name, None)
+        assert real_fn is not None, f"stub {name} has no real activity"
+        # unwrap: @activity.defn keeps the original function on the definition
+        real_params = list(inspect.signature(real_fn).parameters)
+        stub_sig = inspect.signature(getattr(stubs, name))
+        stub_params = list(stub_sig.parameters)
+        # A stub that takes *args absorbs any count, so it cannot disagree.
+        if any(p.kind is inspect.Parameter.VAR_POSITIONAL
+               for p in stub_sig.parameters.values()):
+            continue
+        if len(real_params) != len(stub_params):
+            mismatches.append(
+                f"{name}: stub takes {len(stub_params)} params {tuple(stub_params)} "
+                f"but the activity declares {len(real_params)} {tuple(real_params)}"
+            )
+    assert not mismatches, "\n".join(mismatches)

@@ -317,3 +317,39 @@ def test_the_partition_is_keyed_by_task_id_not_name():
         "coordinator did not pass the task id, so the BOS filelist key falls "
         "back to the reusable task name")
     assert call["staging_dir"].endswith("sharded-task")
+
+
+def test_every_stub_matches_the_real_activity_signature():
+    """Same rule as the pool suite: a stub that disagrees with the activity's
+    parameter list tests the stub, not the system.
+
+    Parameter count is the load-bearing half. temporalio only applies an
+    activity's argument type hints when the declared parameter count equals the
+    number of payloads sent, so a call site that omits an optional argument
+    makes every dataclass parameter arrive as a raw dict — which is how
+    `chunk_filelist` died on the first production pool dispatch while its
+    replay suite stayed green.
+    """
+    import inspect
+
+    from dlm.temporal import activities as real
+
+    stubs = _Stubs()
+    mismatches = []
+    for stub in stubs.activities():
+        name = getattr(stub, "__temporal_activity_definition").name
+        real_fn = getattr(real, name, None)
+        assert real_fn is not None, f"stub {name} has no real activity"
+        real_params = list(inspect.signature(real_fn).parameters)
+        stub_sig = inspect.signature(getattr(stubs, name))
+        stub_params = list(stub_sig.parameters)
+        # A stub that takes *args absorbs any count, so it cannot disagree.
+        if any(p.kind is inspect.Parameter.VAR_POSITIONAL
+               for p in stub_sig.parameters.values()):
+            continue
+        if len(real_params) != len(stub_params):
+            mismatches.append(
+                f"{name}: stub takes {len(stub_params)} params {tuple(stub_params)} "
+                f"but the activity declares {len(real_params)} {tuple(real_params)}"
+            )
+    assert not mismatches, "\n".join(mismatches)

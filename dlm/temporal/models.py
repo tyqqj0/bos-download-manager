@@ -106,6 +106,12 @@ if POOL_BATCH_FAIL_MAX < 0:
         "(0 disables tolerance; negative is meaningless)"
     )
 
+# Most batches one task may chunk into. Mirrors dlm.web.fleet.POOL_MAX_BATCHES,
+# which is the S1-side owner of the policy; this module is the worker-side
+# definition (activities and workflows both run on workers and must not import
+# dlm.web). deploy-workers.sh's md5 manifest keeps the two in sync.
+POOL_MAX_BATCHES = 1500
+
 # Failure reasons that describe the FILE rather than the run — the only ones
 # that belong in the `missing_files` archive, and (see run_pool_batch) the only
 # ones a batch may be forgiven for.
@@ -186,14 +192,13 @@ def task_missing_limit(listed_files: int) -> int:
 #
 # The default is deliberately the largest archive a task that still has a
 # chance at `done` can carry: a batch is forgiven for at most
-# POOL_BATCH_FAIL_MAX files, a task chunks into at most 1500 batches
-# (fleet.POOL_MAX_BATCHES — restated as a literal here rather than imported,
-# because this module is loaded on workers and dlm.web.fleet is S1-side), and
+# POOL_BATCH_FAIL_MAX files, a task chunks into at most POOL_MAX_BATCHES
+# batches, and
 # any batch failing beyond tolerance makes the task `failed` on the
 # failed_batches branch without consulting this scan at all. So a scan larger
 # than this can only belong to a task whose verdict is already decided.
 MISSING_VERIFY_MAX = int(
-    os.environ.get("DLM_MISSING_VERIFY_MAX", str(1500 * POOL_BATCH_FAIL_MAX))
+    os.environ.get("DLM_MISSING_VERIFY_MAX", str(POOL_MAX_BATCHES * POOL_BATCH_FAIL_MAX))
 )
 if MISSING_VERIFY_MAX < 0:
     raise ValueError(

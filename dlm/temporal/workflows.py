@@ -14,6 +14,7 @@ with workflow.unsafe.imports_passed_through():
     from ..core.naming import shard_task_name
     from .models import (
         POOL_BATCH_MAX_ATTEMPTS,
+        POOL_MAX_BATCHES,
         ShardInput,
         ShardResult,
         TaskInput,
@@ -131,9 +132,12 @@ class DownloadDatasetWorkflow:
             return TaskResult(status="failed", error=error_msg)
 
         # 4. Load progress (resume support — each entry = one completed batch)
+        # filelist_md5 passed explicitly (empty = unguarded, this legacy path
+        # has no md5): see the chunk_filelist call site on why an omitted
+        # optional argument turns `task_input` into a dict.
         completed_paths = await workflow.execute_activity(
             "load_progress",
-            args=[task_input],
+            args=[task_input, ""],
             start_to_close_timeout=timedelta(seconds=30),
             task_queue=worker_queue,
         )
@@ -186,7 +190,7 @@ class DownloadDatasetWorkflow:
 
                 await workflow.execute_activity(
                     "save_progress",
-                    args=[task_input.name, all_batch_markers],
+                    args=[task_input.name, all_batch_markers, ""],
                     start_to_close_timeout=timedelta(seconds=30),
                     task_queue=worker_queue,
                 )
@@ -399,7 +403,7 @@ class ShardWorkerWorkflow:
         # Mark shard running + record server
         await workflow.execute_activity(
             "update_shard_status",
-            args=[shard_id, "running"],
+            args=[shard_id, "running", None],
             start_to_close_timeout=timedelta(seconds=30),
         )
         await workflow.execute_activity(
@@ -457,7 +461,7 @@ class ShardWorkerWorkflow:
         if total_files == 0:
             await workflow.execute_activity(
                 "update_shard_status",
-                args=[shard_id, "done"],
+                args=[shard_id, "done", None],
                 start_to_close_timeout=timedelta(seconds=30),
             )
             return ShardResult(shard_id=shard_id, status="done")
@@ -551,7 +555,7 @@ class ShardWorkerWorkflow:
 
         await workflow.execute_activity(
             "update_shard_status",
-            args=[shard_id, "done"],
+            args=[shard_id, "done", None],
             start_to_close_timeout=timedelta(seconds=30),
         )
 
@@ -1011,10 +1015,20 @@ class PoolDownloadWorkflow:
             )
 
         # Step 3: chunk into batches (pinned — reads the filtered filelist)
+        #
+        # max_batches is passed explicitly even though the activity declares a
+        # default. It is NOT optional from a workflow: temporalio drops ALL
+        # argument type hints when the declared parameter count differs from
+        # the number of payloads sent (worker/_activity.py: `elif arg_types is
+        # not None and len(arg_types) != len(start.input): arg_types = None`),
+        # so omitting it delivers `task_input` as a raw dict and the activity
+        # dies on `task_input.name`. Any activity taking a dataclass must be
+        # called with every parameter — tests/test_activity_arity.py enforces
+        # this across this file.
         try:
             chunks = await workflow.execute_activity(
                 "chunk_filelist",
-                args=[filter_result["filtered_path"], task_input],
+                args=[filter_result["filtered_path"], task_input, POOL_MAX_BATCHES],
                 task_queue=listing_queue,
                 start_to_close_timeout=timedelta(minutes=15),
                 heartbeat_timeout=timedelta(minutes=3),
