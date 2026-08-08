@@ -750,6 +750,52 @@ paused 行 + 5 个 failed 行**，这是预期的（它们本就该转 pool）�
 不是新问题。这也说明续传过滤器在**列表阶段**是好的（那次 LIST 发生在 Key 轮换之前），
 坏的是"进程持有旧 Key ⇒ 此后任何新的 LIST 都会挂"，即 R1。
 
+#### Phase 0 期间发现的新阻塞项：G7 在 S1 上不是失败，是**永久挂住**（已修，`938f67e`）
+
+0.6 建好 venv 后第一次在 S1 上跑全量，**suite 卡死**：328 秒无输出、
+`load average 0.02`、进程 `Sl` 状态 —— 不是在算，是在等 I/O。
+用 `-o faulthandler_timeout=25` 打出栈，停在
+`tests/test_failed_details.py::test_access_denied_records_the_file`
+的 `asyncio.run(engine._producer(...))`。
+
+根因是 `pipeline.py:459` 的背压循环**按设计无上界**：
+
+```python
+threshold = _disk_free_threshold_gb()      # max(总量*30%, 20GB)
+while _disk_free_gb() < threshold:         # 单测里没有任何东西会释放磁盘
+    self.stats.paused = True
+    await asyncio.sleep(10)
+```
+
+S1 是 40G 的 `/dev/vda2`、81% 已用 ⇒ 阈值 `max(12, 20) = 20GB`，实际可用 7.4GB，
+`7.4 < 20` 恒真 ⇒ 永不退出。同一个数还会让 `pipeline.py:683` 的紧急磁盘检查
+（`< DISK_FREE_ABSOLUTE_MIN_GB` ⇒ `_StallDetected`）误开火，
+把下载类测试变成"磁盘中止"测试 —— 那是**失败**，比挂住更容易看出来但同样是假信号。
+
+**为什么两个 pipeline 测试文件已有的 `monkeypatch.setattr(pipeline, "STAGING_PATH", tmp_path)` 不管用**：
+它当初是为了解决 dev 机没有 `/data` 导致 `FileNotFoundError`，而 S1 上 `/tmp`
+和 `/data` 是同一个 `/dev/vda2` —— 换了路径，free 还是那 7.4G。
+
+后果直接落在 Phase 2 上：**G7（`deploy-workers.sh:88-103`）不过就不部署**，
+而它既不会过也不会不过。表现是 `bash scripts/deploy-workers.sh` 一直不返回、
+不打任何东西 —— 一个挂住且沉默的部署门。这就是 0.6 必须在 Phase 2 之前做的实际价值：
+它把这个问题暴露在没有任何生产动作发生的时刻。
+
+修法放在 `tests/conftest.py`，与那里已有的两个 autouse 守卫并列
+（它们的动机是同一句话："部署门跑在真机上"）：把 `_disk_free_gb` 钉成常量，
+磁盘从此不是测试输入。想测低磁盘的测试自己再 patch 一次即可（测试体在 fixture 之后执行，值以它为准）。
+
+`tests/test_disk_is_not_a_test_input.py` 钉住它，且**判据在任何主机上都有效**：
+只断言 `>= 1000` 在 dev 机（本地 1,385G 可用）上是**空断言** ——
+守卫删掉后本地照样绿，回归照样发到 S1。所以改为把 `STAGING_PATH`
+指向一个不存在的路径：真实现会在那儿 `shutil.disk_usage` 抛 `FileNotFoundError`，
+常量不在乎。变异验证：删掉守卫该测试即失败。
+
+> 顺带记一笔运维教训：这轮排查里 `pkill -f "pytest tests/"` 把**我自己那条
+> ssh 命令**一起杀了（命令行里含 "pytest tests/"），ssh 直接返回 255。
+> 与 CLAUDE.md 里"用 `ps` 而非 `pgrep -f`"是同一个坑的两面 —— `-f` 匹配全命令行，
+> 会命中发起者自己。改成 `ps -eo pid,args | awk` 取 PID 再逐个 `kill`。
+
 ### Phase 1 —— 暂停两个任务（保住在飞分片的成果）
 
 当前 w2/w3/w4/w6 上有 4 个活分片（RealOmin 1.3G+2.6G、molmobot 5.5G+11G staging）。
