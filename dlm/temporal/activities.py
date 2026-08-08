@@ -724,18 +724,61 @@ async def create_shards_in_db(task_id: str, shard_infos: list[dict]) -> list[str
     data = resp.json()
     if data.get("error"):
         raise RuntimeError(data["error"])
+    if "shard_ids" not in data:
+        # Neither key: not our route answering. A proxy error page or an S1
+        # 500 would otherwise surface as `KeyError: 'shard_ids'`, which reads
+        # like a coordinator bug instead of "the request never landed".
+        raise RuntimeError(
+            f"/api/shards/create returned no shard_ids (HTTP {resp.status_code}): "
+            f"{str(data)[:200]}"
+        )
     return data["shard_ids"]
+
+
+def _log_write_result(resp, what: str) -> None:
+    """Say it out loud when an S1 state write did not actually happen.
+
+    These routes answer **HTTP 200 with `{"error": ...}`** on a rejected write
+    — a missing shard row, a parent task already terminal. Every caller below
+    used to discard the response entirely, so the one observable trace of a
+    lost status write was its absence from SQLite: nothing in the worker log,
+    nothing in the workflow history, and a shard that stays `running` forever
+    in the dashboard while its download has long finished.
+
+    Deliberately log-only, no raise. These calls are fire-and-forget in the
+    workflow (`report_resume_info`, `aggregate_task_from_shards` and friends
+    are dispatched WITHOUT an explicit retry_policy, so they inherit
+    Temporal's unlimited-retry default): raising here would put a coordinator
+    into an endless retry loop over a rejection that will never clear —
+    trading a silent miss for a stalled task. Visibility is the fix; the
+    verdict stays with the operator.
+    """
+    try:
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:
+        logger.error("%s: S1 write failed: %s: %s", what, type(e).__name__, e)
+        return
+    if not isinstance(body, dict):
+        logger.error("%s: unexpected S1 response: %s", what, str(body)[:200])
+        return
+    if body.get("error"):
+        logger.error("%s: S1 rejected the write: %s", what, body["error"])
+    elif body.get("ignored"):
+        # Expected whenever a paused/revoked task's shards report in late.
+        logger.warning("%s: S1 ignored the write (task terminal?)", what)
 
 
 @activity.defn
 async def update_shard_status(shard_id: str, status: str, error: str = None):
     """Update shard status via S1 API."""
     import requests
-    requests.post(
+    resp = requests.post(
         f"{_coordinator()}/api/shards/status",
         json={"shard_id": shard_id, "status": status, "error": error},
         timeout=30,
     )
+    _log_write_result(resp, f"shard {shard_id} -> {status}")
 
 
 @activity.defn
@@ -743,12 +786,13 @@ async def report_shard_progress(shard_id: str, done_files: int = 0,
                                 done_bytes: int = 0, speed_mbps: float = 0):
     """Update shard progress via S1 API."""
     import requests
-    requests.post(
+    resp = requests.post(
         f"{_coordinator()}/api/shard-progress",
         json={"shard_id": shard_id, "done_files": done_files,
               "done_bytes": done_bytes, "speed_mbps": speed_mbps},
         timeout=30,
     )
+    _log_write_result(resp, f"shard {shard_id} progress")
 
 
 @activity.defn
@@ -769,36 +813,52 @@ async def query_idle_workers(source: str, exclude_task: str = "") -> list[str]:
 
 @activity.defn
 async def report_resume_info(task_id: str, skipped_files: int, skipped_gb: float):
-    """Persist BOS resume-filter results on the task row via S1 API."""
+    """Persist BOS resume-filter results on the task row via S1 API.
+
+    This row is the acceptance evidence for "we did not re-download what BOS
+    already has" (requirements A4), so a write that vanishes costs us the
+    ability to tell a working resume filter from a broken one.
+    """
     import requests
-    requests.post(
+    resp = requests.post(
         f"{_coordinator()}/api/shards/resume-info",
         json={"task_id": task_id, "skipped_files": skipped_files,
               "skipped_gb": skipped_gb},
         timeout=30,
     )
+    _log_write_result(
+        resp, f"task {task_id} resume-info ({skipped_files} files, {skipped_gb:.1f} GB)"
+    )
 
 
 @activity.defn
 async def aggregate_task_from_shards(task_id: str):
-    """Aggregate shard progress into task-level via S1 API."""
+    """Aggregate shard progress into task-level via S1 API.
+
+    No-op for pool tasks, which have no shard rows — the pool coordinator
+    still calls it, and S1 answers `{"shards": 0}`. Kept rather than made
+    conditional: the call is in recorded pool histories, and dropping it
+    would break replay for no gain (see requirements R5).
+    """
     import requests
-    requests.post(
+    resp = requests.post(
         f"{_coordinator()}/api/shards/aggregate",
         json={"task_id": task_id},
         timeout=30,
     )
+    _log_write_result(resp, f"task {task_id} aggregate")
 
 
 @activity.defn
 async def assign_shard_server(shard_id: str, server_key: str):
     """Record shard-to-server assignment via S1 API."""
     import requests
-    requests.post(
+    resp = requests.post(
         f"{_coordinator()}/api/shards/assign",
         json={"shard_id": shard_id, "server_key": server_key},
         timeout=30,
     )
+    _log_write_result(resp, f"shard {shard_id} -> server {server_key}")
 
 
 # ── Pool activities (T3) ────────────────────────────────────
