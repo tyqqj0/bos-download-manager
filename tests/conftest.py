@@ -59,6 +59,45 @@ def _never_touch_the_production_alert_log(monkeypatch, tmp_path):
     monkeypatch.setattr(alerts_mod, "_active_alerts", {})
 
 
+@pytest.fixture(autouse=True)
+def _the_hosts_free_disk_is_not_a_test_input(monkeypatch):
+    """Make ambient free disk irrelevant to what the suite reports.
+
+    `pipeline._disk_free_gb()` stats a real filesystem, and two call sites
+    branch on it:
+
+    1. `_producer`'s backpressure loop (`pipeline.py:459`) —
+       `while _disk_free_gb() < threshold: await asyncio.sleep(10)`, where
+       nothing in a unit test will ever free a byte. Below the threshold this
+       does not fail, it **hangs forever**.
+    2. `_wait_with_growth_check`'s emergency check (`pipeline.py:683`) —
+       under `DISK_FREE_ABSOLUTE_MIN_GB` it raises `_StallDetected`, so a
+       download test silently takes the disk-abort branch instead of the one
+       it meant to exercise.
+
+    The threshold is `max(30% of total, 20GB)` and both terms come from
+    whichever machine runs pytest, so the suite's outcome depended on the
+    host. Found the hard way on 2026-08-08: S1 sits at 81% used of a 40G
+    `/dev/vda2` — 7.4G free against a 20G threshold — and
+    `scripts/deploy-workers.sh` gate G7 runs `pytest tests/ -q` on S1 and
+    refuses to deploy until it passes. The suite parked in
+    test_failed_details.py's first `_producer` test at load 0.02 with no
+    output: a deploy gate that hangs forever and prints nothing to explain
+    itself. Locally the same suite is 13.5s.
+
+    Patching `STAGING_PATH` to `tmp_path` — which both pipeline test files
+    already do, for `/data` being absent on a dev box — does not help here:
+    on S1 `/tmp` is that same `/dev/vda2`.
+
+    A test that genuinely wants to exercise low disk re-patches
+    `_disk_free_gb` itself; the test body runs after this fixture, so its
+    value wins (pinned below in tests/test_disk_is_not_a_test_input.py).
+    """
+    from dlm.temporal import pipeline
+
+    monkeypatch.setattr(pipeline, "_disk_free_gb", lambda: 10_000.0)
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     """A fresh, isolated SQLite snapshot DB for one test.

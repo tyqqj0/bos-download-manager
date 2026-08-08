@@ -675,6 +675,81 @@ Phase 2 的 `deploy-workers.sh` 重启就是修复本身。
 对 A1 的直接后果：部署后 16 台的进程侧前缀必须从 `27233f75` 变成 `edccde44`。
 这比"探一次 API 通不通"强得多 —— 它是同一个凭证的身份比对，不依赖任何一次调用的运气。
 
+#### Phase 0.2–0.7 实测（2026-08-08 15:39Z，已完成）
+
+| 步 | 结果 |
+|---|---|
+| 0.2 | `origin/feat/architecture-upgrade` = `ee42862`（补推了 `247410a`、`ee42862` 两个提交） |
+| 0.3 | S1 `hotfix/pipeline-integrity @ 1c5814a` → `feat/architecture-upgrade @ ee42862`。**实测 0 ahead / 98 behind，纯 fast-forward**，所以用 `git merge --ff-only` 而不是 `reset --hard`（后者存在丢弃 S1 本地提交的路径，前者根本不存在这条路径）。事后 `git status --porcelain` 空 |
+| 0.4 | `.env.bak-20260807-173836` → `/root/env-backups/`（`mv -n`，不覆盖）。`$REPO_DIR/.env.bak*` 已为空，`.env` 本身未动 |
+| 0.5 | 见下方两张表 |
+| 0.6 | `/tmp/dlm-test-venv` 建成（python 3.10.12，pytest 9.1.1，**temporalio 1.31.0** 满足 G6 `>=1.30,<2`），占 152M，`/` 仍 81% |
+| 0.7 | **`mask` 失败**：`Failed to mask unit: File /etc/systemd/system/dlm-web-watchdog.timer already exists` —— 单元文件本身就在 `/etc/systemd/system`，mask 要在同一路径建 `/dev/null` 符号链接，必然冲突。改用 **`systemctl disable --now`**：等价且更彻底（`stop` 单独用会留下 `enabled`，一次重启就复活）。实测 `active: inactive / enabled: disabled`，`list-timers --all` 无任何 dlm 定时器 |
+
+> **修订（3.6 的还债命令随之改变）**：原文写 `systemctl unmask ... && systemctl start ...`，
+> 按实测应改为 **`systemctl enable --now dlm-web-watchdog.timer`**。
+> 照原文执行会 unmask 一个从未被 mask 的单元（无害但无效），
+> 并且 `start` 只恢复本次运行、不恢复开机自启 —— 债只还了一半。
+
+**0.5 基线① —— BOS（新 Key 实测，`calendar.timegm`）**
+
+| 前缀 | 需求文档 §0 的锚 | 本次实测 15:39:13Z | 增量 | 最新对象年龄 |
+|---|---|---|---|---|
+| `manipulation/RealOmin/` | 239,663 obj / 15,966.0 GB | **270,923 obj / 17,814.7 GB** | +31,260 / +1,848.7 GB | **15s** |
+| `other/molmobot-data/` | 2,790 obj / 6,222.9 GB | **3,086 obj / 6,861.6 GB** | +296 / +638.7 GB | **12s** |
+
+> **锚点刷新（不是改历史）**：§0 那两个数字是需求定稿时的观测值，此后两个任务一直在上传，
+> 所以它们**已经不能当"字节数不许下降"的比较基准** —— 拿旧数去比，会把 1,848 GB 的正常增长
+> 读成"对不上"。A5 的单调性判定从此以**本表的实测值**为下界，§0 的数字保留为历史刻度。
+> 另外这次 LIST 走了 271 页全部成功，**顺带证明了新 Key 的 LIST 是好的**（S1 侧持有新 Key），
+> 于旧 Key "PUT 活 LIST 死" 形成对照。
+
+**0.5 基线② —— 代码一致性（部署前）**
+
+| 侧 | md5 manifest |
+|---|---|
+| S1（checkout 后的新参考值） | `16d8fdc62945dc7a53d2a3c29bf35348` |
+| 16 台 worker | `3a6ba1c680ea7aa8be828c38104625c0` —— **16/16 完全一致的同一个旧值**，无一台是例外 |
+
+Phase 2 之后 A2 的判定因此变成一句确定的话：16 台必须全部从 `3a6ba1c6…` 变成 `16d8fdc6…`。
+（探测踩过一个坑：`REMOTE_DIR` 不是 `/root/bos-download-manager` 而是
+**`/root/code/bos-download-manager`**，与 S1 同路径；用错路径会让 16 台全报 `UNREACHABLE`，
+看起来像"S1→worker ssh 全挂"，实际是 `cd` 失败。判定 ssh 通不通要看 `hostname` 而不是业务命令。）
+
+**0.5 基线③ —— `dispatch_mode` 快照（关键：这一列现在还不存在）**
+
+`PRAGMA table_info(tasks)` 实测 **34 列，无 `dispatch_mode`、无 `coordinator_phase`**。
+所以 0.5 要求的"`downloading` 行的 `dispatch_mode` 快照"在部署前的正确形态是
+**"该列不存在"**，而不是某个值。3.3 的逐行比对据此改为：
+迁移后两个 `downloading` 行必须读出**迁移默认值 `'sharded'`**（`ALTER TABLE ... DEFAULT 'sharded'`
+会把 139 行存量行物理写成字面量，见 R2 修正），回填（3.2，带 `--exclude-task`）前后**不变**。
+
+切换前的 4 个非终态行（唯一状态源 SQLite）：
+
+| id | status | server | category/name | source |
+|---|---|---|---|---|
+| `t-20260806-319c55` | downloading | NULL | manipulation/RealOmin | hf |
+| `t-20260805-460d45` | downloading | NULL | other/molmobot-data | hf |
+| `t-20260729-581b82` | paused | bj2 | other/RoboMIND2.0-Tienkung-sim | modelscope |
+| `t-migrate-035` | paused | bj3 | manipulation/RoboMIND-V2-Tienkung | modelscope |
+
+全库状态分布：`done 73 / revoked 57 / failed 5 / downloading 2 / paused 2` = 139。
+**注意 3.2 的回填 `WHERE status IN ('pending','paused','failed')` 会命中上表后两个
+paused 行 + 5 个 failed 行**，这是预期的（它们本就该转 pool）；`--exclude-task`
+只排除本次要 reshard 的两个任务。
+
+**§0 的触发原因在切换前仍然成立（分片级实测，不看聚合数字）**
+
+| 任务 | 分片 | 状态 |
+|---|---|---|
+| RealOmin（4 分片，requested=8 got=4） | 0/w1 **failed 19.2h 前**、1/w2 running、2/w4 running、3/w5 **failed 23.8h 前** | 续传跳过 141,261 文件 / 8,641.4 GB |
+| molmobot（3 分片） | 0/w3 running、1/w6 running、2/w7 **failed 12.6h 前** | 续传跳过 500 文件 / 1,164.1 GB |
+
+协调器不重试失败分片（`workflows.py:847`），所以**这两个任务当前的确定结局是
+`failed` 且缺数据**，而 w1/w5/w7 已空转约 20 小时 —— 与 §0 描述的失败模式一致，
+不是新问题。这也说明续传过滤器在**列表阶段**是好的（那次 LIST 发生在 Key 轮换之前），
+坏的是"进程持有旧 Key ⇒ 此后任何新的 LIST 都会挂"，即 R1。
+
 ### Phase 1 —— 暂停两个任务（保住在飞分片的成果）
 
 当前 w2/w3/w4/w6 上有 4 个活分片（RealOmin 1.3G+2.6G、molmobot 5.5G+11G staging）。
