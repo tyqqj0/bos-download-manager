@@ -645,7 +645,7 @@ pool 的批次归属与释放由 `release_pool_batches` 负责，那是模式内
 
 | 步 | 动作 | 门槛 |
 |---|---|---|
-| 0.1 | 本地跑全量测试 | 当前基线 **599 passed**（含 replay；2026-08-08 于 `6067e20` 实测 12.89s）—— 写这份方案时是 453，T1–T7 之后是 599 |
+| 0.1 | 本地跑全量测试 | 当前基线 **671 passed**（含 replay 41；2026-08-08 于 `b7da883` 实测 13.5s）—— 演进：定稿 453 → T1–T7 后 599 → 评审第 1 轮 627 → 迁移/HTTP 审计 671 |
 | 0.2 | 推送 `feat/architecture-upgrade` 到 origin | 需要你点头 —— 这是唯一的对外动作 |
 | 0.3 | S1 `git fetch` → checkout `feat/architecture-upgrade` → 对齐 `origin` | S1 `git rev-parse --short HEAD` == 本地。2026-08-08 实测起点：S1 在 **`hotfix/pipeline-integrity` @ `1c5814a`** —— 是换分支，不是 fast-forward |
 | 0.4 | S1 `.env.bak-*` 移到 `/root/env-backups/` | `ls $REPO_DIR/.env.bak*` 为空。实测当前有 1 个：`.env.bak-20260807-173836`（untracked，是 Key 轮换留下的；里面是旧 Key，别留在 rsync 能碰到的目录） |
