@@ -385,6 +385,38 @@ T4 已判 `failed`），却因为 50 < 100 只发 WARNING。反过来一个 500 
 （这两个套件断言的是"UI 读服务端默认值"而非字面量，预期不受影响 —— 若有断言写死
 `'sharded'` 则该断言本身就是缺陷，一并修）。
 
+#### 实施记录（2026-08-08，已完成）
+
+`tests/test_default_dispatch_mode.py`（21 项）+ `scripts/backfill_dispatch_mode.py`，
+全套件 529 passed（翻转前 508，翻转本身零回归，与本节预测一致）。三处偏离原稿：
+
+1. **不变量测试比第 5 条的写法更强，因为按原稿写出来的测试是**没牙的**。**
+   原稿说"断言两条入口写出的行 == `DEFAULT_DISPATCH_MODE`，且不写死 `'pool'`"。
+   问题：`test_pool_dispatch.py:507` 那条既有测试正是这么写的 ——
+   `monkeypatch.setattr(fleet, "DEFAULT_DISPATCH_MODE", "pool")` 然后断言行是 `pool`。
+   它在默认值还是 `'sharded'` 的年代有意义；默认值翻成 pool 之后，
+   **一条把 `"pool"` 硬编码进 dict 的路由也能让它全绿**。所以新测试对常量的
+   **两个取值都参数化**（`["pool", "sharded"]`）：唯一能同时通过的实现是真的读常量。
+   顺带这也是第 8 节回滚路径（`DLM_DEFAULT_DISPATCH_MODE=sharded`）的唯一测试覆盖。
+2. **加了一条原稿没有的结构测试**，因为"将来谁新增第三条可派发入口却忘了传这个键，
+   测试会红"这句话，行为测试**做不到** —— 没人写过的入口就没人写过它的测试。
+   做法：AST 遍历 `dlm/web/**/*.py` 的每一处 `upsert_task` 调用，
+   把实参名解析回它在同一路由里的 dict 字面量，检查有没有 `dispatch_mode` 键；
+   解析不出字面量的（如从库里读回来的行）算"没写"，逼出显式豁免。
+   豁免表 `EXEMPT_FROM_DISPATCH_MODE = {"register_bos_data", "batch_action"}`，
+   每条附理由；另有一条测试断言豁免表里没有已不存在的路由名（防止过期许可
+   将来悄悄覆盖一个同名的新函数）。
+   **不用"在路由源码里 grep `dispatch_mode` 字符串"**：这三条路由都会为了校验/回显
+   多次提到这个词，真正持久化的那一行被删掉之后 grep 版本照样绿。
+   已做变异验证：删掉 `queue.py` 的 `"dispatch_mode": dispatch_mode,` 一行，该测试转红。
+3. **`batch_action`（`tasks.py:487`，retry 路径）判定为豁免，而非缺陷。**
+   它把**已存在的行**整个 dict 回写，因此保留该任务原本跑的模式。这是对的：
+   一个已经有 sharded 分片行、worker 上还有 sharded staging 的任务，
+   重试时应当按它当初被切分的方式跑，而不是中途被静默改模式。
+   它本来会遗留的那批存量行，由回填脚本覆盖 `failed`/`paused` 一次性解决。
+
+另外顺手修了 `queue.py:76` 的过期 docstring（"grayscale period: sharded"）。
+
 ### T7 —— 让 reconciler 认识 pool（R4 / A6 / A12；**pool 今天就有的 bug**）
 
 **文件**: `dlm/web/reconciler.py`

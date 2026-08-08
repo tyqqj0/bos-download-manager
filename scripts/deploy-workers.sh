@@ -141,6 +141,7 @@ sync_and_check_host() {
             --exclude '__pycache__' \
             --exclude '*.pyc' \
             --exclude '.env' \
+            --exclude '.env.bak*' \
             --exclude 'node_modules' \
             "$REPO_DIR/" "root@$ip:$REMOTE_DIR/"; then
             synced=true

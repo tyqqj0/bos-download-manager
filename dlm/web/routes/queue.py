@@ -73,7 +73,7 @@ async def add_to_queue(body: dict):
         source: str — "hf" or "modelscope"
         shard_count: int (optional) — target shard count (0 = auto). Alias: split_workers.
         dispatch_mode: str (optional) — "sharded" or "pool". Defaults to
-            fleet.DEFAULT_DISPATCH_MODE (grayscale period: "sharded").
+            fleet.DEFAULT_DISPATCH_MODE, which is "pool" as of 2026-08-08.
     """
     from ...core.parser import parse_repo
     from ..fleet import DEFAULT_DISPATCH_MODE, VALID_DISPATCH_MODES

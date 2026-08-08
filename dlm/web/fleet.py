@@ -29,7 +29,23 @@ POOL_MAX_CONCURRENT_TASKS = int(os.environ.get("DLM_POOL_MAX_CONCURRENT_TASKS", 
 # edits, and the four copies had already drifted on WHEN they validate.
 VALID_DISPATCH_MODES = frozenset({"sharded", "pool"})
 
-DEFAULT_DISPATCH_MODE = os.environ.get("DLM_DEFAULT_DISPATCH_MODE", "sharded")
+# Pool is the global default as of 2026-08-08. Stated in code rather than only
+# as a systemd environment variable: "the global default is pool" is a claim
+# about the system, and an env var is invisible in git and lost the next time
+# the unit is reinstalled. Rollback does not need a redeploy — setting
+# DLM_DEFAULT_DISPATCH_MODE=sharded and restarting dlm-web still wins.
+#
+# This governs NEW rows only. SQLite's ALTER TABLE ... ADD COLUMN ... DEFAULT
+# materialises the literal on every pre-existing row, so the migration wrote
+# 'sharded' into the whole backlog and no Python-side default can reach those:
+# pending/paused/failed rows need scripts/backfill_dispatch_mode.py.
+#
+# The `or "sharded"` fallbacks in temporal_client and reconciler are NOT this
+# default and must not be pointed at it — they mean "this row carries no mode,
+# so it predates the column, so run it the old way", which stays true whatever
+# the default for new work becomes.
+
+DEFAULT_DISPATCH_MODE = os.environ.get("DLM_DEFAULT_DISPATCH_MODE", "pool")
 if DEFAULT_DISPATCH_MODE not in VALID_DISPATCH_MODES:
     # Fail at import, not per-request. A typo'd DLM_DEFAULT_DISPATCH_MODE (e.g.
     # "Pool") would otherwise be persisted unvalidated by every /api/tasks add
