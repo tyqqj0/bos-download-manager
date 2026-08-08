@@ -24,6 +24,17 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .models import TaskInput, FileInfo, PipelineStats
+from .models import (
+    FAIL_ACCESS_DENIED,
+    FAIL_DOWNLOAD_RETRIES_EXHAUSTED,
+    FAIL_SIZE_MISMATCH,
+    FAIL_STAGED_FILE_MISSING,
+    FAIL_UNHANDLED_DOWNLOAD_ERROR,
+    FAIL_UPLOAD_CANCELLED,
+    FAIL_UPLOAD_FAILED,
+    FAIL_UPLOAD_RETRIES_EXHAUSTED,
+    FAIL_UPSTREAM_EMPTY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -474,12 +485,14 @@ class PipelineEngine:
                         )
                     except _AccessDenied as e:
                         cancel_event.set()
-                        self.stats.failed_files += 1
+                        self._fail_file(file_info.path, FAIL_ACCESS_DENIED,
+                                        file_info.size)
                         logger.error(str(e))
                         return
                     except _UpstreamEmpty as e:
                         cancel_event.set()
-                        self.stats.failed_files += 1
+                        self._fail_file(file_info.path, FAIL_UPSTREAM_EMPTY,
+                                        file_info.size)
                         self._emit_event("file_failed", {
                             "file": file_info.path,
                             "error": "upstream_empty",
@@ -520,7 +533,8 @@ class PipelineEngine:
                         continue
 
                 # All retries exhausted
-                self.stats.failed_files += 1
+                self._fail_file(file_info.path,
+                                FAIL_DOWNLOAD_RETRIES_EXHAUSTED, file_info.size)
                 logger.error(
                     f"Failed to download {file_info.path} after {MAX_FILE_RETRIES} attempts"
                 )
@@ -539,9 +553,16 @@ class PipelineEngine:
         # Exception subclasses only, so a CancelledError bypasses them and
         # the "all retries exhausted" tail below them is never reached
         # either — so counting it here cannot double-count.
-        for r in results:
+        #
+        # zip(files, results) recovers the identity this site used to lose:
+        # `tasks` is built by one create_task per entry of `files` in order, and
+        # asyncio.gather preserves that order in `results`, so results[i] is
+        # files[i]'s outcome. Without the zip the only thing available was an
+        # exception object, and a file that died here was counted but
+        # unnameable — which made it invisible to the missing-file archive.
+        for f, r in zip(files, results):
             if isinstance(r, (Exception, asyncio.CancelledError)):
-                self.stats.failed_files += 1
+                self._fail_file(f.path, FAIL_UNHANDLED_DOWNLOAD_ERROR, f.size)
                 logger.error(f"Unhandled download error: {r}")
         await queue.put(None)  # signal consumer to stop
 
@@ -722,6 +743,11 @@ class PipelineEngine:
         """
         sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
         pending: set = set()
+        # Which file each in-flight upload task is for. _count_upload_task_
+        # failures needs the identity, and a bare Task does not carry it.
+        # Entries are popped as tasks are counted, so this stays bounded by
+        # MAX_PENDING_UPLOADS rather than growing to the size of the batch.
+        owners: dict = {}
 
         while True:
             # Backpressure: wait for a slot before pulling from queue
@@ -730,7 +756,7 @@ class PipelineEngine:
                     pending, return_when=asyncio.FIRST_COMPLETED
                 )
                 pending -= done
-                self._count_upload_task_failures(done)
+                self._count_upload_task_failures(done, owners)
 
             file_info = await queue.get()
             if file_info is None:
@@ -738,11 +764,12 @@ class PipelineEngine:
 
             task = asyncio.create_task(self._upload_one(file_info, sem))
             pending.add(task)
+            owners[task] = file_info
 
         # Drain remaining uploads
         if pending:
             done, _ = await asyncio.wait(pending)
-            self._count_upload_task_failures(done)
+            self._count_upload_task_failures(done, owners)
 
         self.stats.phase = "done"
 
@@ -754,7 +781,7 @@ class PipelineEngine:
                 except OSError:
                     pass
 
-    def _count_upload_task_failures(self, done: set) -> None:
+    def _count_upload_task_failures(self, done: set, owners: dict) -> None:
         """Classify finished `_upload_one` tasks without re-raising.
 
         Shared by both `_consumer` call sites (the backpressure wait inside
@@ -776,16 +803,28 @@ class PipelineEngine:
         never re-raises), so anything visible here is either cancellation
         or a bug outside its try block — neither already counted — safe to
         count unconditionally without double counting.
+
+        `owners` maps each task back to its FileInfo so the failure can be
+        named, and entries are popped here so the caller's dict stays bounded.
+        A task missing from it is a bug, not a reason to lose the count: fall
+        back to a placeholder path so failed_details keeps matching
+        failed_files.
         """
         for t in done:
+            fi = owners.pop(t, None)
+            path = fi.path if fi is not None else "<unknown-upload>"
+            size = fi.size if fi is not None else 0
             if t.cancelled():
-                self.stats.failed_files += 1
-                logger.error("Upload task cancelled")
+                # Cancellation is orchestration (pause / preempt / reshard), not
+                # "the source lost this file" — counted here so the batch is not
+                # reported clean, but activities.py keeps it out of the archive.
+                self._fail_file(path, FAIL_UPLOAD_CANCELLED, size)
+                logger.error(f"Upload task cancelled: {path}")
                 continue
             exc = t.exception()
             if exc:
-                self.stats.failed_files += 1
-                logger.error(f"Upload task error: {exc}")
+                self._fail_file(path, FAIL_UPLOAD_FAILED, size)
+                logger.error(f"Upload task error for {path}: {exc}")
 
     async def _upload_one(self, fi: FileInfo, sem: asyncio.Semaphore):
         """Upload a single file to BOS with retry.
@@ -801,7 +840,7 @@ class PipelineEngine:
 
         if not local_path.exists():
             logger.warning(f"File not found for upload: {local_path}")
-            self.stats.failed_files += 1
+            self._fail_file(fi.path, FAIL_STAGED_FILE_MISSING, fi.size)
             return
 
         key = self._prefix + fi.path
@@ -822,7 +861,7 @@ class PipelineEngine:
                             f"Pre-upload size check failed for {fi.path}: "
                             f"got {actual_size}, expected {fi.size} — not uploading"
                         )
-                        self.stats.failed_files += 1
+                        self._fail_file(fi.path, FAIL_SIZE_MISMATCH, fi.size)
                         self._emit_event("file_failed", {
                             "file": fi.path,
                             "error": f"size mismatch: got {actual_size}, expected {fi.size}",
@@ -863,7 +902,7 @@ class PipelineEngine:
                     logger.error(
                         f"Upload failed x{MAX_UPLOAD_RETRIES} for {fi.path}: {e}"
                     )
-                    self.stats.failed_files += 1
+                    self._fail_file(fi.path, FAIL_UPLOAD_RETRIES_EXHAUSTED, fi.size)
                     self._emit_event("file_failed", {
                         "file": fi.path,
                         "error": str(e)[:200],
@@ -930,6 +969,26 @@ class PipelineEngine:
             config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
         )
         self._bucket, self._prefix = bos_target(self.task)
+
+    def _fail_file(self, path: str, reason: str, size_bytes: int = 0) -> None:
+        """Count a failed file AND record which file it was.
+
+        Every `failed_files += 1` in this class goes through here, so the
+        invariant len(failed_details) == failed_files holds by construction
+        rather than by nine sites remembering to do both. Before this, the
+        count said a batch lost N files and the identity of those N existed
+        only in a log line on one worker — nothing downstream could archive it.
+
+        `reason` is a short classifier from models.FAIL_*, never exception
+        text: exceptions on this fleet routinely carry KB-scale xet CDN URLs,
+        and those must not reach the database.
+        """
+        self.stats.failed_files += 1
+        self.stats.failed_details.append({
+            "path": path,
+            "reason": reason,
+            "size_bytes": int(size_bytes or 0),
+        })
 
     def _emit_event(self, event_type: str, data: dict):
         """Emit a monitoring event to the event buffer (if available)."""

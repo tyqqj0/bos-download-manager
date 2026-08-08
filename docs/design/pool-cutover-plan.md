@@ -141,6 +141,27 @@ CREATE INDEX IF NOT EXISTS idx_missing_task ON missing_files(task_id);
 
 **不变量**: `len(stats.failed_details) == stats.failed_files`。加一条断言级测试。
 
+> **实施更正（2026-08-08）**：上表有两行标错了，逐行核对源码后发现失败点是 **9 个但分类要 9 个**，
+> 不是原文列的 7 个 reason：
+>
+> | 行 | 原文写的 | 实际是 | 新增 reason |
+> |---|---|---|---|
+> | 482 | "其他下载异常" | `_UpstreamEmpty` —— 源端声明了 size 却传 0 字节 | `upstream_empty` |
+> | 825 | "上传重试耗尽" | 上传前 size 校验不符（866 才是重试耗尽） | `size_mismatch` |
+>
+> 这两个都是**源端永久损坏**的形态（ModelScope 把 RoboDojo 的 depth 当 0 字节发就是
+> `upstream_empty`；RoboDojo 那 103 个 0 字节对象是 `size_mismatch` 拦下来的），
+> 所以两者都必须**进** T3 的 `ARCHIVABLE_FAIL_REASONS` —— 它们恰恰是这张档案最该记的东西。
+> 漏掉会让最典型的缺件类型静默，直接违反 R4。
+>
+> 注意与 R4 已知天花板的区别：**列表阶段**就报 0 字节的文件进不了 filelist（那是天花板）；
+> 这两类是**列表说有、传输时才发现没有**，它们在 filelist 里，能记也必须记。
+>
+> 分类常量放 `dlm/temporal/models.py` 的 `FAIL_*`，而不是散落的字面量 ——
+> `activities.py` 要按子集过滤，两边各写一遍字符串会让一个拼写错误静默地漏记或误记。
+> 另外 `_count_upload_task_failures` 的两处（782/787）拿不到文件身份（参数是 Task 不是
+> FileInfo），加了一个 `owners: dict[Task, FileInfo]`，计数时 pop，所以不随批次增长。
+
 ### T3 —— 批次容忍阈值（R4 / A7）
 
 **文件**: `dlm/temporal/activities.py`（`run_pool_batch`，约 `:1272`）、`dlm/web/fleet.py`（常量）

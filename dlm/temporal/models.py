@@ -41,6 +41,30 @@ class PipelineStats:
     speed_mbps: float = 0
     phase: str = "starting"
     paused: bool = False
+    # Identity of every file counted in failed_files: {path, reason, size_bytes}.
+    # The count alone told us a batch lost N files but never WHICH — that fact
+    # lived in one line of one worker's log, so nothing downstream could record
+    # or act on it. `reason` is a short classifier from FAIL_* below, never
+    # exception text: those carry KB-scale CDN URLs on this fleet.
+    #
+    # Invariant: len(failed_details) == failed_files. default_factory keeps old
+    # activity-result payloads (which have no such key) deserializable on replay.
+    failed_details: list = field(default_factory=list)
+
+
+# Failure classifiers for PipelineStats.failed_details.reason. Named constants
+# rather than inline strings because activities.py filters on a subset of them
+# (only source-permanent failures belong in the missing-file archive) and a
+# typo in either place would silently drop or admit the wrong class.
+FAIL_ACCESS_DENIED = "access_denied"
+FAIL_UPSTREAM_EMPTY = "upstream_empty"
+FAIL_DOWNLOAD_RETRIES_EXHAUSTED = "download_retries_exhausted"
+FAIL_UNHANDLED_DOWNLOAD_ERROR = "unhandled_download_error"
+FAIL_UPLOAD_CANCELLED = "upload_cancelled"
+FAIL_SIZE_MISMATCH = "size_mismatch"
+FAIL_UPLOAD_FAILED = "upload_failed"
+FAIL_UPLOAD_RETRIES_EXHAUSTED = "upload_retries_exhausted"
+FAIL_STAGED_FILE_MISSING = "staged_file_missing"
 
 
 @dataclass
