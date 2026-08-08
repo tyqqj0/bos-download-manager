@@ -18,11 +18,22 @@ S1: Temporal Server (:7233, docker) + FastAPI web (:8080) + SQLite
 [bj1-9]  MS tasks   — poll "download-bjN" only
 ```
 
-- 1 task = N shards = N workers. `ShardedDownloadWorkflow` (coordinator) → lists repo files → **BOS resume filter** (drops files already at target prefix with matching key+size) → greedy partition → `ShardWorkerWorkflow` children on per-worker queues.
+### Pool mode (default since 2026-08-09)
+
+`dispatch_mode` on a task is `pool` (default) or `sharded` (legacy, still supported).
+
+- Pool: `PoolDownloadWorkflow` lists → BOS resume filter → `chunk_filelist` cuts the filtered list into fixed-size batches (max `POOL_MAX_BATCHES`=1500, batch lists on BOS under `download-manager/batchlists/{name}/`) → a window of batches is dispatched to whichever workers are free, widening as batches complete. Batch rows live in the `shards` table.
+- The window starts at 1 and only widens after the first batch reports, so a fresh task looks single-worker for its first batch. That is the designed ramp, not a stall.
+- Pool tasks do **NOT** self-heal: the reconciler deliberately skips orphan re-dispatch for them (a dead coordinator would otherwise be inferred as `done`). `pool_orphaned` / `pool_starved` are the signals; a stuck pool task needs a human.
+- A batch is forgiven up to `POOL_BATCH_FAIL_MAX`=5 permanently-failed files; a task reports `done` with a WARNING if missing files are within `max(10, 0.5% of listed)`, else `failed`. Missing files are queryable, never silent.
+- Restart is lossless at any shard/batch count — the BOS filter re-skips whatever is already uploaded.
+
+- Sharded (legacy): 1 task = N shards = N workers. `ShardedDownloadWorkflow` (coordinator) → lists repo files → **BOS resume filter** (drops files already at target prefix with matching key+size) → greedy partition → `ShardWorkerWorkflow` children on per-worker queues.
 - The coordinator + `list_repo_files`/`filter_filelist_against_bos`/`partition_files_greedy` are pinned to the listing worker's personal queue (the filelist lives on its local disk).
 - Shards download to `/data/staging/{task}/shard-N/` but upload to the task's FLAT BOS prefix (never `shard-N/` keys).
 - Batch resume markers (`.progress.json`) are md5-guarded against the shard filelist — a re-partition invalidates them; the BOS filter makes any restart lossless.
-- `auto_dispatch_pending()` runs every 30s: claims a pending task (status only, `server=NULL`), starts one sharded coordinator per source per cycle. Source routing: `modelscope → bj*`, `hf → w*`. Guard: a source with a coordinator still in listing phase (downloading task, zero shard rows, fresh `claimed_at`) is skipped.
+- `auto_dispatch_pending()` runs every 30s: claims a pending task (status only, `server=NULL`), starts one coordinator per source per cycle. Source routing: `modelscope → bj*`, `hf → w*`. Guard: a source with a coordinator still in listing phase (downloading task, zero shard rows, fresh `claimed_at`) is skipped.
+
 - Speed metrics measure download activity (staging growth + uploads), not uploads alone.
 - Progress reports can NOT resurrect paused/preempted/revoked/done tasks (guard in `/api/task-progress`).
 
@@ -40,7 +51,7 @@ SSH from S1 to all workers with pubkey. From dev machine, use S1 as jump host; `
 ## Common Commands
 
 ```bash
-# Tests (152 as of 2026-08-07). No venv is checked in and neither the dev box
+# Tests (696 as of 2026-08-09). No venv is checked in and neither the dev box
 # nor S1 has pytest installed; build a throwaway one:
 python3.12 -m venv /tmp/dlm-test-venv
 /tmp/dlm-test-venv/bin/pip install pytest fastapi temporalio bce-python-sdk \
@@ -62,13 +73,18 @@ systemctl status dlm-web dlm-web-watchdog.timer
 
 # Worker restart: ALWAYS via deploy-workers.sh, never ad-hoc ssh setsid (dies with the session)
 
-# Create a task with a specific shard count + queue jump
+# Create a task. Under pool mode (the default) the batch count is automatic —
+# shard_count only applies to dispatch_mode=sharded.
 curl -X POST http://154.85.43.52:8080/api/queue/add -H 'Content-Type: application/json' \
   -d '{"repo_id":"org/name","name":"X","category":"manipulation","source":"modelscope","priority":0,"shard_count":6}'
 
-# Change shard count (lossless restart — BOS filter skips uploaded files)
+# Change shard count (sharded only; lossless restart — BOS filter skips uploaded files)
 curl -X POST http://154.85.43.52:8080/api/queue/reshard -H 'Content-Type: application/json' \
   -d '{"task_id":"t-...","shard_count":8}'
+
+# Re-dispatch a failed/revoked/paused task (reshard REFUSES failed). Terminates
+# workflows first, drops stale batch rows, keeps name/category + dispatch_mode.
+curl -X POST .../api/queue/retry -d '{"task_id":"t-..."}'
 
 # Pause (resumable) / resume / revoke
 curl -X POST .../api/queue/pause  -d '{"task_id":"t-..."}'
@@ -87,6 +103,7 @@ curl .../api/dashboard ; curl .../api/tasks/{id}/shards ; curl .../api/doctor
 - **No mixed code versions**: before any batch operation, verify all workers match S1 (deploy script's md5 manifest). SQLite is the single state source.
 - Task `name` + `category` determine the BOS prefix — a resume task MUST reuse the exact original name/category or the resume filter matches nothing.
 - Workflow code (`workflows.py`) must stay deterministic; restarting workers is only replay-safe if workflow definitions are unchanged since the running workflows started.
+- **Every activity call must pass every declared parameter** — never rely on an activity's default from a workflow. temporalio drops ALL argument type hints when the parameter count differs from the payload count, so one omitted optional argument delivers a `TaskInput` dataclass as a raw dict and the activity dies on `.name`. This broke the first pool dispatch (`chunk_filelist`). Enforced by `tests/test_activity_arity.py`; replay stubs must match the real signatures (a 2-vs-3 stub kept 33 replay tests green through it).
 
 ## Code Structure
 
