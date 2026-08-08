@@ -148,6 +148,17 @@ TERMINAL_STATUSES = ("paused", "preempted", "revoked", "skipped", "failed", "don
 # absence from TERMINAL_STATUSES.
 GC_REMOVABLE_STATUSES = ("done", "failed", "revoked", "skipped")
 
+# The states in which a task's coordinator actually reached a verdict, so its
+# missing-file archive describes a settled outcome rather than work in flight.
+# A third set rather than a reuse of either above, because it answers a third
+# question: `paused` and `preempted` are terminal for scheduling and resumable
+# in fact — their archived rows are files the NEXT round will very likely
+# fetch, and alerting on them would cry loss over a task that is merely
+# stopped. `revoked`/`skipped` never finalize either (nobody asked for those
+# files any more). Only `done` and `failed` passed through
+# PoolDownloadWorkflow._finalize and have a ceiling recorded to judge by.
+FINALIZED_STATUSES = ("done", "failed")
+
 
 def has_live_workflow(task_id: str, running_ids) -> bool:
     """Whether any running workflow belongs to this task.

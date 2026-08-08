@@ -653,3 +653,255 @@ def test_a_coordinator_error_body_is_raised_not_swallowed(monkeypatch):
     env = ActivityEnvironment()
     with pytest.raises(RuntimeError, match="no such task"):
         asyncio.run(env.run(activities.verify_missing_files, task, 10))
+
+
+# ── T5: alerts and /api/doctor ──────────────────────────────────────────
+#
+# The record from T1/T4 is only half of "缺件不静默": an archive nobody is told
+# to read is still silence. These pin the telling — and pin that it uses the
+# SAME ceiling the verdict used, because a threshold that disagrees with the
+# verdict is worse than none (it calls normal tasks critical and critical tasks
+# normal, in that order).
+
+
+def _finished(db, task_id="t-mf", status="done", count=0, limit=0,
+             completed_at="2026-08-08T00:00:00+00:00"):
+    _task(db, task_id, status=status)
+    conn = db._conn()
+    conn.execute(
+        "UPDATE tasks SET missing_files_count = ?, missing_files_limit = ?, "
+        "completed_at = ? WHERE id = ?",
+        (count, limit, completed_at, task_id))
+    conn.commit()
+    return db.get_task(task_id)
+
+
+def _alerts(tasks, now=None):
+    from dlm.web.alerts import check_alerts
+    return check_alerts(tasks=tasks, workers=[])
+
+
+def _of_type(alerts, atype):
+    return [a for a in alerts if a["type"] == atype]
+
+
+def test_a_done_task_with_missing_files_warns(db):
+    t = _finished(db, count=3, limit=10)
+    out = _of_type(_alerts([t]), "missing_files")
+
+    assert len(out) == 1
+    assert out[0]["severity"] == "warning"
+    assert out[0]["missing_files_count"] == 3
+    assert "3 file(s)" in out[0]["message"]
+    assert "/api/tasks/t-mf/missing-files" in out[0]["message"], \
+        "an alert that does not say where to look is a dead end"
+
+
+def test_over_the_ceiling_is_critical(db):
+    t = _finished(db, status="failed", count=50, limit=10)
+    out = _of_type(_alerts([t]), "missing_files_many")
+
+    assert len(out) == 1
+    assert out[0]["severity"] == "critical"
+    assert "50 > 10" in out[0]["message"]
+
+
+def test_a_task_never_gets_both_alerts(db):
+    """Two alerts for one condition doubles every incident-log line and makes
+    the dashboard count wrong."""
+    t = _finished(db, status="failed", count=50, limit=10)
+    out = _alerts([t])
+    assert _of_type(out, "missing_files") == []
+
+
+def test_the_ceiling_is_the_tasks_own_not_a_constant(db):
+    """The failure this guards is subtle and two-directional. A hardcoded
+    threshold (the original design said 100) would rate a 300-file task that
+    lost 50 — already `failed` by T4 — as merely a WARNING, and a 5M-file task
+    that lost 120 — entirely normal, reported `done` — as CRITICAL."""
+    small = _finished(db, "t-small", status="failed", count=50, limit=10)
+    huge = _finished(db, "t-huge", count=120, limit=25000)
+    out = _alerts([small, huge])
+
+    assert [a["task_id"] for a in _of_type(out, "missing_files_many")] == ["t-small"]
+    assert [a["task_id"] for a in _of_type(out, "missing_files")] == ["t-huge"]
+
+
+def test_a_count_equal_to_the_ceiling_is_only_a_warning(db):
+    """`done` at exactly the ceiling is what T4 reports, so CRITICAL here would
+    contradict the verdict on the boundary itself."""
+    t = _finished(db, count=10, limit=10)
+    out = _alerts([t])
+    assert len(_of_type(out, "missing_files")) == 1
+    assert _of_type(out, "missing_files_many") == []
+
+
+def test_a_task_with_no_recorded_ceiling_warns_and_says_so(db):
+    """`limit == 0` means the task never went through T4's finalize (an older
+    row, or a re-check that never ran). Its count cannot be judged — but it can
+    still be reported, and the alert must not silently imply it was judged."""
+    t = _finished(db, count=999, limit=0)
+    out = _of_type(_alerts([t]), "missing_files")
+
+    assert len(out) == 1
+    assert out[0]["severity"] == "warning"
+    assert "no ceiling recorded" in out[0]["message"]
+    assert _of_type(_alerts([t]), "missing_files_many") == []
+
+
+def test_a_task_with_no_missing_files_is_silent(db):
+    t = _finished(db, count=0, limit=10)
+    out = _alerts([t])
+    assert _of_type(out, "missing_files") == []
+    assert _of_type(out, "missing_files_many") == []
+
+
+@pytest.mark.parametrize("status", ["downloading", "pending"])
+def test_an_unfinished_task_does_not_alert(status, db):
+    """Rows accumulate while a task runs — every batch that gives up on a file
+    writes one. Alerting mid-flight would fire on files the next round fetches."""
+    t = _finished(db, status=status, count=5, limit=10)
+    assert _of_type(_alerts([t]), "missing_files") == []
+
+
+@pytest.mark.parametrize("status", ["paused", "preempted", "revoked", "skipped"])
+def test_a_stopped_but_unfinalized_task_does_not_alert(status, db):
+    """These are in TERMINAL_STATUSES but never reached _finalize: paused and
+    preempted are this project's resumable states, and nobody wants the files
+    of a revoked task. Gating on the broader set would alert on all four."""
+    t = _finished(db, status=status, count=5, limit=10)
+    out = _alerts([t])
+    assert _of_type(out, "missing_files") == []
+    assert _of_type(out, "missing_files_many") == []
+
+
+def test_the_gate_uses_the_shared_finalized_status_set(db):
+    """Pins the import, not a copy: a local tuple here would drift from
+    fleet.py the first time someone adds a status."""
+    import dlm.web.alerts as alerts_mod
+    from dlm.web.fleet import FINALIZED_STATUSES
+
+    assert FINALIZED_STATUSES == ("done", "failed")
+    src = (alerts_mod.__file__ or "")
+    with open(src) as fh:
+        body = fh.read()
+    assert "FINALIZED_STATUSES" in body
+    assert 'status") not in ("done", "failed")' not in body
+
+
+def test_an_old_loss_stops_warning_but_stays_on_the_record(db):
+    """An alert that can never resolve accumulates until the list is unreadable.
+    The WARNING has a shelf life; the record does not — it stays in the table,
+    in /api/doctor, and in the transition line already written to the alert
+    log."""
+    import time as _time
+
+    from dlm.web.alerts import MISSING_ALERT_WINDOW_S
+
+    old = _time.time() - MISSING_ALERT_WINDOW_S - 3600
+    from datetime import datetime, timezone
+    stamp = datetime.fromtimestamp(old, timezone.utc).isoformat(timespec="seconds")
+    t = _finished(db, count=3, limit=10, completed_at=stamp)
+
+    assert _of_type(_alerts([t]), "missing_files") == []
+    assert db.get_task("t-mf")["missing_files_count"] == 3
+
+
+def test_an_old_loss_over_the_ceiling_still_alerts(db):
+    """No window on the CRITICAL: it is rare by construction, and it means
+    something bigger than a few dead upstream files went wrong."""
+    t = _finished(db, status="failed", count=50, limit=10,
+                  completed_at="2020-01-01T00:00:00+00:00")
+    assert len(_of_type(_alerts([t]), "missing_files_many")) == 1
+
+
+def test_an_unparseable_completion_time_keeps_the_warning(db):
+    """Ambiguity must not buy silence — that is the failure mode."""
+    t = _finished(db, count=3, limit=10, completed_at="not a timestamp")
+    assert len(_of_type(_alerts([t]), "missing_files")) == 1
+
+
+# ── T5: /api/doctor exposure ────────────────────────────────────────────
+
+
+def _stub_doctor_temporal(monkeypatch, running=None):
+    import dlm.web.temporal_client as tc
+
+    async def fake_running(client=None):
+        return running or {}
+
+    monkeypatch.setattr(tc, "running_workflows", fake_running)
+
+
+def test_doctor_reports_the_missing_files_of_finalized_tasks(db, monkeypatch):
+    from dlm.web.routes import doctor
+
+    _stub_doctor_temporal(monkeypatch)
+    _finished(db, "t-few", count=3, limit=10)
+    _finished(db, "t-many", status="failed", count=50, limit=10)
+    _finished(db, "t-clean", count=0, limit=10)
+
+    out = asyncio.run(doctor.diagnose())
+    by_id = {m["task_id"]: m for m in out["missing_files"]}
+
+    assert set(by_id) == {"t-few", "t-many"}
+    assert by_id["t-few"]["over_ceiling"] is False
+    assert by_id["t-many"]["over_ceiling"] is True
+    assert by_id["t-many"]["missing_files_count"] == 50
+
+
+def test_missing_files_never_make_the_doctor_unhealthy(db, monkeypatch):
+    """`healthy` is scripts/deploy-workers.sh's deploy gate. A settled loss is
+    permanent, so counting it as an issue would pin the gate red forever — one
+    dead upstream file would block every future deploy. Notification is the
+    alert engine's job; this section is the record."""
+    from dlm.web.routes import doctor
+
+    _stub_doctor_temporal(monkeypatch)
+    _finished(db, "t-many", status="failed", count=5000, limit=10)
+
+    out = asyncio.run(doctor.diagnose())
+
+    assert out["missing_files"], "the loss must still be reported"
+    assert out["total_issues"] == 0
+    assert out["healthy"] is True
+
+
+@pytest.mark.parametrize("status", ["downloading", "paused", "revoked"])
+def test_doctor_ignores_tasks_that_never_finalized(status, db, monkeypatch):
+    from dlm.web.routes import doctor
+
+    _stub_doctor_temporal(monkeypatch)
+    _finished(db, "t-mid", status=status, count=5, limit=0)
+
+    out = asyncio.run(doctor.diagnose())
+    assert out["missing_files"] == []
+
+
+def test_doctor_reports_the_loss_with_no_time_limit(db, monkeypatch):
+    """The alert WARNING expires after a week so the alert list stays readable;
+    this section is where the record has to remain findable afterwards."""
+    from dlm.web.routes import doctor
+
+    _stub_doctor_temporal(monkeypatch)
+    _finished(db, "t-old", count=3, limit=10,
+              completed_at="2020-01-01T00:00:00+00:00")
+
+    out = asyncio.run(doctor.diagnose())
+    assert [m["task_id"] for m in out["missing_files"]] == ["t-old"]
+
+
+def test_the_dashboard_carries_the_alert(db, monkeypatch):
+    """The last hop, untested until now: check_alerts' output has to reach
+    `summary["alerts"]`, which is what /api/dashboard serves and what the web UI
+    renders. An alert the engine computes and nobody forwards is the same
+    silence as no alert at all — and this covers every alert type, not just
+    this feature's two."""
+    from dlm.web import scheduler
+
+    _finished(db, "t-dash", count=3, limit=10)
+
+    summary = scheduler._build_dashboard()
+
+    assert any(a["type"] == "missing_files" and a["task_id"] == "t-dash"
+               for a in summary["alerts"])

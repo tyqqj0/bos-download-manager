@@ -28,6 +28,43 @@ INFO = "info"           # resolved or informational
 # De-duplication state: tracks active alerts to only log transitions
 _active_alerts: dict[str, dict] = {}  # key → alert dict
 
+# How long a finished task's missing files stay on the WARNING list.
+#
+# Missing files are permanent by nature (a dead upstream file stays dead), and
+# an alert that can never resolve accumulates: after a few months of normal
+# operation the dashboard's alert list would be mostly historical losses, with
+# the one worker that went offline five minutes ago buried among them. That is
+# how an alert channel stops being read.
+#
+# So the WARNING is a notification with a shelf life, while the RECORD is
+# permanent and lives in three places that do not expire: the `missing_files`
+# table, /api/doctor's `missing_files` section, and the transition line this
+# alert already wrote to /data/dlm-alerts.log. The over-ceiling CRITICAL has
+# no window — by construction it is rare, and it means something went wrong
+# beyond a few dead files.
+MISSING_ALERT_WINDOW_S = 7 * 86400
+
+
+def _finalized_within(task: dict, window_s: float, now: float) -> bool:
+    """Whether this task finished recently enough to still be worth notifying.
+
+    Fails toward True — an unparseable or absent `completed_at` keeps the
+    alert. Staying silent is the failure mode this whole feature exists to
+    prevent, so ambiguity must not buy silence.
+    """
+    stamp = task.get("completed_at")
+    if not stamp:
+        return True
+    try:
+        from datetime import datetime, timezone
+
+        when = datetime.fromisoformat(str(stamp))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return (now - when.timestamp()) <= window_s
+    except Exception:
+        return True
+
 # Alert logger with file handler
 _alert_logger: Optional[logging.Logger] = None
 
@@ -194,6 +231,74 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 "task_name": t.get("name", ""),
                 "retry_count": t.get("retry_count", 0),
                 "message": f"Task {t.get('name', '')} failed {t.get('retry_count', 0)} times",
+            }
+
+    # WARNING/CRITICAL: files this task listed that never reached BOS.
+    #
+    # T4 already decided done-vs-failed by the task's own ceiling; this is the
+    # other half of R4 ("缺件不静默"). A `done` task that quietly forgave a few
+    # permanently-missing files is otherwise visible only to someone who
+    # thinks to GET /api/tasks/{id}/missing-files — and nobody GETs an
+    # endpoint they have no reason to suspect.
+    #
+    # Gated on FINALIZED_STATUSES, not the broader TERMINAL_STATUSES: a paused
+    # or preempted task's archived rows are files the next round will most
+    # likely fetch, and those two states never went through _finalize, so they
+    # carry no ceiling to judge against either.
+    from .fleet import FINALIZED_STATUSES
+
+    for t in tasks:
+        count = t.get("missing_files_count") or 0
+        if count <= 0 or t.get("status") not in FINALIZED_STATUSES:
+            continue
+        task_id = t.get("id", "")
+        name = t.get("name") or task_id
+        # `limit` is what T4's finalize recorded — the SAME number its verdict
+        # used, which is the point of storing it. A hardcoded threshold here
+        # would contradict the verdict in both directions: a 300-file task
+        # losing 50 (ceiling 10, already `failed`) would rate only a WARNING,
+        # while a 5M-file task losing 120 (ceiling 25000, entirely normal)
+        # would scream CRITICAL. `limit == 0` means the task never finalized
+        # under T4 — an older task row, or one whose re-check never ran — so
+        # its count cannot be judged, only reported.
+        limit = t.get("missing_files_limit") or 0
+        detail = (f"{count} file(s) never reached BOS. "
+                  f"GET /api/tasks/{task_id}/missing-files for the list "
+                  f"(path, reason, size, batch, worker).")
+        if limit > 0 and count > limit:
+            new_alerts[f"missing_files_many:{task_id}"] = {
+                "severity": CRITICAL,
+                "type": "missing_files_many",
+                "task_id": task_id,
+                "task_name": t.get("name", ""),
+                "missing_files_count": count,
+                "missing_files_limit": limit,
+                "message": (
+                    f"Task {name} is over its missing-file ceiling "
+                    f"({count} > {limit}). {detail} This is not the handful of "
+                    f"dead upstream files the ceiling exists to forgive — "
+                    f"check whether one source, one worker, or one credential "
+                    f"is behind them before re-dispatching."
+                ),
+            }
+        else:
+            # One alert per task, not both: the CRITICAL already carries the
+            # count, and a duplicate would double every incident-log line.
+            if not _finalized_within(t, MISSING_ALERT_WINDOW_S, now):
+                continue
+            new_alerts[f"missing_files:{task_id}"] = {
+                "severity": WARNING,
+                "type": "missing_files",
+                "task_id": task_id,
+                "task_name": t.get("name", ""),
+                "missing_files_count": count,
+                "missing_files_limit": limit,
+                "message": (
+                    f"Task {name} finished {t.get('status', '')} with {detail}"
+                    + ("" if limit else " (no ceiling recorded — this task did"
+                                        " not finalize under the missing-file"
+                                        " re-check)")
+                ),
             }
 
     # WARNING: worker holds no work while work is queued for its source.

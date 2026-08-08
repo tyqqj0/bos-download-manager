@@ -413,6 +413,45 @@ T4 已判 `failed`），却因为 50 < 100 只发 WARNING。反过来一个 500 
 同时把 `pool_orphaned` / `pool_starved`（`reconciler.py` 的 T9 patrol 已产出）
 确认能到 `/api/dashboard` —— 见第 7 节 R-1，这两个告警是 pool 唯一的"卡住"信号。
 
+#### 实施记录（2026-08-08，已完成）
+
+改动文件：
+- `dlm/web/fleet.py`：`FINALIZED_STATUSES = ("done", "failed")`（第三个状态集合）。
+- `dlm/web/alerts.py`：`missing_files`（WARNING）/ `missing_files_many`（CRITICAL）两条规则
+  + `MISSING_ALERT_WINDOW_S` + `_finalized_within()`。
+- `dlm/web/routes/doctor.py`：`missing_files` 段（**不计入 `total_issues`**）。
+- 测试：`tests/test_missing_files.py` +24（合计 70）；全套 575 → 599 passed。
+
+偏离/补充方案的地方（3 处）：
+
+1. **门槛用新的 `FINALIZED_STATUSES`，不是 `TERMINAL_STATUSES`。** 方案表格写的是
+   "已终态（done/failed）"，但代码里现成的 `TERMINAL_STATUSES` 还含
+   `paused`/`preempted`/`revoked`/`skipped` —— 前两个是本项目的**可续传**状态，
+   它们的缺件行大概率下一轮就补上；后两个根本没人要那些文件。四者都没走过
+   `_finalize`，也就没有上限可判。`fleet.py` 里本来已经因为
+   "TERMINAL vs GC_REMOVABLE 混用过一次造成数据丢失"而并列两个集合，
+   这是同一个理由的第三个集合。
+2. **WARNING 有 7 天保质期，CRITICAL 没有。** 方案没提这件事，但缺件天生永久
+   （上游死文件不会自己活过来），而永不 resolve 的告警会堆积 ——
+   几个月后仪表盘的告警列表会以历史损失为主，5 分钟前掉线的那台 worker 埋在里面。
+   那正是告警渠道失效的方式。所以**通知**有窗口、**记录**没有：
+   记录在 `missing_files` 表、`/api/doctor` 的 `missing_files` 段、
+   以及告警首次触发时已经写进 `/data/dlm-alerts.log` 的那行里，三处都不过期。
+   `completed_at` 解析不出来时**保留**告警（歧义不能换来沉默）。
+3. **`/api/doctor` 报但不计入 `total_issues`。** `healthy` 是
+   `scripts/deploy-workers.sh` 的部署门（T10）。已经落定的损失是永久的，
+   计进去等于让一个上游死文件永久卡住此后**所有**部署。
+   通知归告警引擎，这一段只负责"查得到"。
+
+另外补了方案第 7 节 R-1 要求的确认：`check_alerts` → `summary["alerts"]` →
+`/api/dashboard` 这最后一跳此前没有任何测试，现在钉住了 —— 覆盖的是全部告警类型，
+不只是这两条。
+
+验证方式：6 个变异逐一确认有测试挂掉 —— 门槛换成 `TERMINAL_STATUSES` → 4 条挂；
+阈值写死 100 → 2 条挂；`limit == 0` 也参与判档 → 1 条挂；去掉保质期 → 1 条挂；
+两条告警同时发 → 2 条挂；把缺件计进 `total_issues` → 1 条挂。
+改完用 `diff -q` 确认 `alerts.py` / `doctor.py` 字节级还原。
+
 ### T6 —— 全局默认翻转 + 存量回填 + 部署脚本排除（R2 / A3、B2、B3）
 
 **文件**: `dlm/web/fleet.py:32`、`scripts/deploy-workers.sh:143`、新脚本 `scripts/backfill_dispatch_mode.py`

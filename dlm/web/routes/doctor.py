@@ -166,6 +166,28 @@ async def diagnose():
     # Idle only counts as an ISSUE when work is queued for that worker's source.
     starved_idle = [c for c in candidates if c["starved"]]
 
+    # 8. Missing files — what finalized tasks listed but never got onto BOS.
+    #    Reported, deliberately NOT counted in total_issues: a settled loss is
+    #    permanent, so counting it would pin `healthy` to false forever, and
+    #    `healthy` is what scripts/deploy-workers.sh reads as its deploy gate
+    #    (T10). A dead upstream file must not be able to block every future
+    #    deploy. The alert engine is the channel that actually notifies —
+    #    same numbers, with de-dupe and severity.
+    from ..fleet import FINALIZED_STATUSES
+
+    missing_files = [
+        {"task_id": t["id"], "name": t.get("name", ""),
+         "status": t.get("status", ""),
+         "missing_files_count": t.get("missing_files_count") or 0,
+         "missing_files_limit": t.get("missing_files_limit") or 0,
+         "over_ceiling": bool((t.get("missing_files_limit") or 0) > 0
+                              and (t.get("missing_files_count") or 0)
+                              > (t.get("missing_files_limit") or 0))}
+        for t in tasks
+        if (t.get("missing_files_count") or 0) > 0
+        and t.get("status") in FINALIZED_STATUSES
+    ]
+
     total_issues = (
         len(offline_workers) + len(stuck) + len(failed_repeat)
         + len(orphaned) + len(disk_full) + len(starved_idle)
@@ -183,6 +205,7 @@ async def diagnose():
         ],
         "disk_full": disk_full,
         "failed_repeat": failed_repeat,
+        "missing_files": missing_files,
         "reconciler": reconciler_report,
         "idle_worker_detail": idle_report,
     }
