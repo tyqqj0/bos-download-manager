@@ -197,7 +197,16 @@ async def task_progress(body: dict):
             # the verdict promised existed only in the alert. Absent or null
             # phase still clears the column, which is what every sharded and
             # legacy terminal report sends.
-            complete_task(task_id, status, phase=body.get("phase"))
+            complete_task(task_id, status, phase=body.get("phase"),
+                          # A `done` report carrying no error means this run had
+                          # none — the row must not keep the previous run's
+                          # failure string. /queue/retry clears it at
+                          # re-dispatch, but a task retried BEFORE that fix
+                          # shipped is already downloading with a stale error,
+                          # and nothing else would ever empty the column.
+                          # Only `done`: a `failed` report with no error text is
+                          # better served by a stale reason than by none.
+                          clear_error=(status == "done" and not body.get("error")))
             return {"ok": True, "completed": status}
 
         kwargs = {}

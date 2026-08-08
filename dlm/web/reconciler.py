@@ -145,7 +145,9 @@ async def reconcile() -> dict:
                 done_shards = [s for s in shards if s.get("status") == "done"]
                 failed_shards = [s for s in shards if s.get("status") == "failed"]
                 if len(done_shards) == len(shards):
-                    complete_task(task_id, "done")
+                    # Every shard succeeded, so whatever error the row carries
+                    # belongs to an earlier run (see complete_task).
+                    complete_task(task_id, "done", clear_error=True)
                     report.setdefault("auto_completed", []).append(task.get("name", task_id))
                     logger.info(
                         f"Reconciler: auto-completed {task.get('name', task_id)} "

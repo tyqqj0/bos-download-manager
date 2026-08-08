@@ -258,8 +258,20 @@ def update_task_progress(task_id: str, progress_pct: float = None,
                          speed_mbps: float = None, downloaded_gb: float = None,
                          phase: str = None, server: str = None,
                          status: str = None, error: str = None,
-                         error_class: str = None, **extra):
-    """Update progress fields for a running task (called by workers)."""
+                         error_class: str = None, clear_error: bool = False,
+                         **extra):
+    """Update progress fields for a running task (called by workers).
+
+    Every field is skipped when None, so a caller can update one column
+    without knowing the rest — which leaves no way to say "set error back to
+    empty": `error=None` is indistinguishable from "not passing error". Both
+    /queue/retry and /queue/resume passed `error=None` intending to clear,
+    and silently didn't, so a re-dispatched task carried the failure string
+    from its previous run while downloading fine. That makes the dashboard
+    lie, which is worse than the original failure. `clear_error=True` is the
+    explicit form; it also clears error_class, since the two are written
+    together and a stale class keeps alerting on a run that has no error.
+    """
     conn = _conn()
     sets = ["updated_at = ?"]
     vals = [time.time()]
@@ -288,13 +300,23 @@ def update_task_progress(task_id: str, progress_pct: float = None,
     if error_class is not None:
         sets.append("error_class = ?")
         vals.append(error_class)
+    if clear_error:
+        if error is not None or error_class is not None:
+            raise ValueError(
+                "update_task_progress: clear_error=True together with "
+                f"error={error!r}/error_class={error_class!r} — the caller is "
+                "asking to both set and clear the failure. Pick one."
+            )
+        sets.append("error = NULL")
+        sets.append("error_class = NULL")
 
     vals.append(task_id)
     conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
     conn.commit()
 
 
-def complete_task(task_id: str, status: str = "done", phase: Optional[str] = None):
+def complete_task(task_id: str, status: str = "done", phase: Optional[str] = None,
+                  clear_error: bool = False):
     """Mark task as completed or failed.
 
     `phase` defaults to clearing the column: a finished task must not keep
@@ -303,14 +325,23 @@ def complete_task(task_id: str, status: str = "done", phase: Optional[str] = Non
     note ("3 file(s) missing, within ceiling 10 — GET ...") is written for a
     `done` row and used to be wiped by this UPDATE, so the second tier of the
     missing-file verdict was honest only in the alert channel (review GAP-3).
+
+    `clear_error` empties error/error_class. It is a caller's decision rather
+    than an automatic consequence of status="done", because a `done` report MAY
+    legitimately carry an error string (the T4 verdict forgives a few missing
+    files and still says done), and this function runs after the route has
+    already written it. Callers that know the run succeeded on its own terms —
+    a completion report with no error, the reconciler's all-shards-done
+    inference — pass True so the row does not keep the previous run's failure.
     """
     conn = _conn()
     now = time.time()
     from datetime import datetime, timezone
     completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    error_sql = ", error = NULL, error_class = NULL" if clear_error else ""
     conn.execute(
         "UPDATE tasks SET status = ?, completed_at = ?, updated_at = ?, "
-        "speed_mbps = 0, phase = ? WHERE id = ?",
+        f"speed_mbps = 0, phase = ?{error_sql} WHERE id = ?",
         (status, completed_at, now, phase, task_id),
     )
     conn.commit()

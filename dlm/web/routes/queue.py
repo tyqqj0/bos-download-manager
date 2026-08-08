@@ -206,7 +206,8 @@ async def resume_task(body: dict):
         return {"error": f"Cannot resume task in status={task['status']}"}
 
     def do_update():
-        snapshot.update_task_progress(task_id, status="pending", phase="resuming", speed_mbps=0, error=None)
+        snapshot.update_task_progress(task_id, status="pending", phase="resuming",
+                                      speed_mbps=0, clear_error=True)
         snapshot.delete_shards_by_task(task_id)
     await _run_blocking(do_update)
 
@@ -298,7 +299,7 @@ async def retry_task(body: dict):
         retry_count = (task.get("retry_count") or 0) + 1
         snapshot.update_task_progress(
             task_id, status="pending", phase="retrying",
-            speed_mbps=0, error=None,
+            speed_mbps=0, clear_error=True,
         )
         conn = snapshot._conn()
         # server released and completed_at cleared for the same reason
