@@ -142,6 +142,58 @@ async def get_task(task_id: str):
     return result
 
 
+@router.get("/tasks/{task_id}/missing-files")
+async def list_task_missing_files(task_id: str):
+    """Files that entered this task's filelist and never reached BOS.
+
+    NOT a complete inventory of what the dataset is missing. Files the source
+    reports as 0 bytes are dropped during listing (the HF and ModelScope list
+    activities both require a positive size), so they never enter a filelist
+    and cannot be recorded here — ModelScope's RoboDojo depth files are
+    exactly that shape. An empty list means "nothing we tried to transfer was
+    lost", not "nothing is missing".
+    """
+    def _do():
+        from ...queue.snapshot import get_task, init_db, list_missing_files
+        init_db()
+        if not get_task(task_id):
+            return None
+        rows = list_missing_files(task_id)
+        return {"task_id": task_id, "count": len(rows), "files": rows}
+
+    result = await run_blocking(_do)
+    if result is None:
+        raise HTTPException(404, f"Task {task_id} not found")
+    return result
+
+
+class ClearMissingFilesRequest(BaseModel):
+    paths: list[str]
+
+
+@router.delete("/tasks/{task_id}/missing-files")
+async def clear_task_missing_files(task_id: str, req: ClearMissingFilesRequest):
+    """Drop rows a re-check proved present on BOS after all.
+
+    Exists because the re-check runs as a worker activity, and workers cannot
+    touch SQLite — every piece of worker-side state travels over HTTP. Without
+    this endpoint clear_missing_files() would be reachable only from S1, and
+    the activity that does the verifying could not act on its own result.
+    """
+    def _do():
+        from ...queue.snapshot import clear_missing_files, get_task, init_db
+        init_db()
+        if not get_task(task_id):
+            return None
+        remaining = clear_missing_files(task_id, req.paths)
+        return {"ok": True, "cleared": len(req.paths), "remaining": remaining}
+
+    result = await run_blocking(_do)
+    if result is None:
+        raise HTTPException(404, f"Task {task_id} not found")
+    return result
+
+
 class AddTaskRequest(BaseModel):
     url_or_repo: str
     category: str = "other"

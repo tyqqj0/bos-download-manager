@@ -110,6 +110,32 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_shards_task ON shards(task_id);
         CREATE INDEX IF NOT EXISTS idx_shards_server ON shards(server);
         CREATE INDEX IF NOT EXISTS idx_shards_status ON shards(status);
+
+        -- Archive of files that entered a task's filelist but never made it
+        -- to BOS. Deliberately NOT the `events` table: that one is a 24-hour
+        -- rolling monitoring buffer (servers.py DELETEs rows older than 86400
+        -- on every event), so a task that runs 10 hours and then sits failed
+        -- for two days would have no record left. This is the only answer to
+        -- "which files is dataset X missing", so it outlives the task's run.
+        --
+        -- Keyed on (task_id, file_path) rather than a rowid: the same file
+        -- fails repeatedly across a batch's attempts and its re-dispatch
+        -- round, and the useful fact is "this file is missing, tried N times",
+        -- not N duplicate rows.
+        CREATE TABLE IF NOT EXISTS missing_files (
+            task_id     TEXT NOT NULL,
+            file_path   TEXT NOT NULL,
+            batch_index INTEGER,
+            server      TEXT,
+            reason      TEXT,
+            size_bytes  INTEGER DEFAULT 0,
+            attempts    INTEGER DEFAULT 1,
+            first_seen  REAL,
+            last_seen   REAL,
+            PRIMARY KEY (task_id, file_path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_missing_task ON missing_files(task_id);
     """)
     conn.commit()
 
@@ -131,6 +157,16 @@ def init_db():
         # than clearing it. Use a named terminal phase, not None, to say "done".
         ("dispatch_mode", "TEXT", "'sharded'"),
         ("coordinator_phase", "TEXT", "NULL"),
+        # Denormalised COUNT(*) of this task's missing_files rows. Not
+        # redundant: alerts are purely DB-derived — check_alerts(tasks, workers)
+        # runs every 10s on get_all_tasks(), which is a bare SELECT * FROM
+        # tasks, so a joined count is not something it can see. As a column,
+        # SELECT * carries it for free at zero extra queries per tick. The one
+        # shape to avoid is a per-task count_missing_files() inside
+        # check_alerts: get_all_tasks() returns every historical task, making
+        # that O(all tasks) queries every 10 seconds.
+        # Every writer below keeps this in step with the actual row count.
+        ("missing_files_count", "INTEGER", "0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")
@@ -410,8 +446,107 @@ def delete_task(task_id: str):
     """Remove a task from the snapshot."""
     conn = _conn()
     conn.execute("DELETE FROM shards WHERE task_id = ?", (task_id,))
+    # The ONLY path allowed to drop missing_files rows wholesale. Keeping them
+    # past the task they point at would leave orphans keyed on a dead id, and
+    # nothing can act on those. Every other cleanup path — complete_task,
+    # staging gc, reconcile, reshard, resume, retry, doctor — must leave this
+    # table alone: it is the archive of which files a dataset is missing, and
+    # the task reaching a terminal state is precisely when someone wants it.
+    conn.execute("DELETE FROM missing_files WHERE task_id = ?", (task_id,))
     conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     conn.commit()
+
+
+# ── Missing-file archive ────────────────────────────────────
+#
+# Scope boundary, worth knowing before treating a query result as complete:
+# these are files that entered a task's filelist and then failed to reach BOS.
+# Files the SOURCE reports as 0 bytes never enter a filelist at all — the
+# listing activities require a truthy/positive size — so they cannot appear
+# here. An empty result therefore does not mean "nothing is missing".
+
+
+def record_missing_files(task_id: str, rows: list) -> int:
+    """Upsert missing-file rows for a task; returns the task's new total.
+
+    Each row: {path, reason?, size_bytes?, batch_index?, server?}. Idempotent
+    per (task_id, path) — a repeat sighting bumps `attempts` and refreshes
+    `last_seen`/`reason`/`server`/`batch_index` (latest attempt is the useful
+    one) while preserving `first_seen`. Callers report on every attempt
+    unconditionally, so re-upserting the same file up to six times over a
+    batch's retry budget is the expected traffic, not a bug.
+    """
+    conn = _conn()
+    now = time.time()
+    for row in rows:
+        path = row.get("path") or row.get("file_path")
+        if not path:
+            continue
+        conn.execute(
+            "INSERT INTO missing_files "
+            "(task_id, file_path, batch_index, server, reason, size_bytes, "
+            " attempts, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?) "
+            "ON CONFLICT(task_id, file_path) DO UPDATE SET "
+            "  attempts = attempts + 1, "
+            "  last_seen = excluded.last_seen, "
+            "  reason = excluded.reason, "
+            "  server = excluded.server, "
+            "  batch_index = excluded.batch_index, "
+            "  size_bytes = MAX(size_bytes, excluded.size_bytes)",
+            (task_id, path, row.get("batch_index"), row.get("server"),
+             row.get("reason"), int(row.get("size_bytes") or 0), now, now),
+        )
+    total = _sync_missing_count(conn, task_id)
+    conn.commit()
+    return total
+
+
+def list_missing_files(task_id: str) -> list:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM missing_files WHERE task_id = ? ORDER BY file_path",
+        (task_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_missing_files(task_id: str) -> int:
+    conn = _conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM missing_files WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def clear_missing_files(task_id: str, paths: list) -> int:
+    """Drop specific rows a re-check proved present on BOS; returns new total.
+
+    Path-scoped by design: the re-check verifies files one by one, and a
+    wholesale clear would erase the rows it could not verify along with the
+    ones it could.
+    """
+    conn = _conn()
+    for path in paths:
+        conn.execute(
+            "DELETE FROM missing_files WHERE task_id = ? AND file_path = ?",
+            (task_id, path),
+        )
+    total = _sync_missing_count(conn, task_id)
+    conn.commit()
+    return total
+
+
+def _sync_missing_count(conn, task_id: str) -> int:
+    """Point tasks.missing_files_count at the real row count. Caller commits."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM missing_files WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    total = int(row["n"]) if row else 0
+    conn.execute(
+        "UPDATE tasks SET missing_files_count = ? WHERE id = ?", (total, task_id)
+    )
+    return total
 
 
 # ── Shard CRUD ──────────────────────────────────────────────

@@ -203,6 +203,54 @@ async def task_progress(body: dict):
     return await run_blocking(_do)
 
 
+MISSING_FILES_REPORT_MAX = 1000
+
+
+@router.post("/missing-files")
+async def report_missing_files(body: dict):
+    """Worker-side report of files that failed permanently in a batch.
+
+    Body: task_id, batch_index?, server?, files: [{path, reason, size_bytes}].
+
+    No auth, matching every other worker→S1 endpoint. That is a deliberate
+    consistency choice rather than an oversight — a lone authenticated
+    endpoint here would break the uniform worker contract without closing
+    the surface.
+    """
+    def _do():
+        from ...queue.snapshot import init_db, get_task, record_missing_files
+        init_db()
+        task_id = body.get("task_id")
+        if not task_id:
+            return {"error": "task_id required"}
+
+        # Same durability guard as /task-progress: a zombie activity belonging
+        # to a task an operator revoked must not keep writing rows against it.
+        task = get_task(task_id)
+        if task and task.get("status") in TERMINAL_STATUSES:
+            return {"ok": True, "ignored": f"task is {task['status']}"}
+
+        files = body.get("files") or []
+        if not isinstance(files, list):
+            return {"error": "files must be a list"}
+        # A batch caps at 500 files, so anything near this ceiling is a bug or
+        # a bad actor, not a real report. Refuse rather than truncate: a
+        # silently truncated archive is worse than a visible rejection.
+        if len(files) > MISSING_FILES_REPORT_MAX:
+            raise HTTPException(
+                status_code=413,
+                detail=f"too many files ({len(files)} > {MISSING_FILES_REPORT_MAX})",
+            )
+
+        rows = [dict(f, batch_index=body.get("batch_index"),
+                     server=body.get("server"))
+                for f in files if isinstance(f, dict)]
+        total = record_missing_files(task_id, rows)
+        return {"ok": True, "recorded": len(rows), "task_missing_total": total}
+
+    return await run_blocking(_do)
+
+
 @router.post("/events")
 async def receive_events(body: dict):
     """Batch receive monitoring events from workers. Stores in events table and updates metrics."""
