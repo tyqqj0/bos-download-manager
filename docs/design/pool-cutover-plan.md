@@ -642,6 +642,28 @@ pool 的批次归属与释放由 `release_pool_batches` 负责，那是模式内
 | 0.6 | **在 S1 上建一次性 pytest venv** | `deploy-workers.sh:88-103` 的 G7 门槛在 `python3 -m pytest --version` 失败时**硬中止部署**，而 S1 没装 pytest（CLAUDE.md 明确记着"两边都没有"）。按 CLAUDE.md 的配方建 `/tmp/dlm-test-venv` 并确认 `pytest --version` 在 G7 实际调用的解释器下可用，否则 Phase 2 第一条命令就会失败 |
 | 0.7 | **临时 mask web watchdog** | `dlm-web-watchdog.timer` 每 30s 探 `/api/dashboard`，wedged 就重启 web。Phase 3.1 手动重启 web 与它撞车会造成两次重启叠加、`init_db()` 迁移期间的窗口更难判读。`systemctl mask dlm-web-watchdog.timer`，Phase 3 完成后立刻 unmask（写进收尾清单，别忘） |
 
+#### Phase 0 前置实测（2026-08-08，只读，已完成）
+
+新 Key 的落地状态已量到位，A1 的"部署前"基线因此有了确定值：
+
+| 项 | 结果 |
+|---|---|
+| 17 台 `$REMOTE_DIR/.env` 的 `BAIDU_AK` | **全部相同的新值**（sha256 前缀 `edccde44`）—— 轮换已覆盖 17/17 |
+| 16 台 worker 进程 `/proc/<pid>/environ` 的 `BAIDU_AK` | **全部相同的旧值**（`27233f75`）—— 16/16 都还是陈的 |
+| S1 `dlm-web`（pid 250543，08-07 17:41 启动） | 已是新值 `edccde44` —— 控制面不需要额外处理 |
+
+原因不是部署漏了谁，而是 `dlm/core/config.py:load_config()` 调的
+`load_dotenv(env_path)` **默认不覆盖已存在的环境变量**：worker 由启动脚本带着
+`BAIDU_AK` 进环境，此后进程活多久就用多久的旧值，重复调 `load_config()` 也换不掉。
+所以「重启 worker 才生效」不是经验之谈，是 dotenv 的语义。
+
+这解释了 `t-20260808-93e25c`（fastumi100k）为什么以 `BOS resume filter failed` 失败：
+旧 Key 只剩 PUT/HEAD，LIST 全挂，而续传过滤器要 LIST。**不需要代码修复**，
+Phase 2 的 `deploy-workers.sh` 重启就是修复本身。
+
+对 A1 的直接后果：部署后 16 台的进程侧前缀必须从 `27233f75` 变成 `edccde44`。
+这比"探一次 API 通不通"强得多 —— 它是同一个凭证的身份比对，不依赖任何一次调用的运气。
+
 ### Phase 1 —— 暂停两个任务（保住在飞分片的成果）
 
 当前 w2/w3/w4/w6 上有 4 个活分片（RealOmin 1.3G+2.6G、molmobot 5.5G+11G staging）。
@@ -670,7 +692,9 @@ G6 每台 `temporalio>=1.30,<2`；结尾 md5 manifest 17/17。
 
 部署后立即验：
 - A1：17 台 `ps -eo etimes,args` 的 etimes < 部署耗时（当前是 ~33 小时，必须归零）；
-  17 台用**进程实际持有的凭证**分别探 LIST / HEAD / `does_bucket_exist` 三项
+  **凭证身份比对**（Phase 0 实测给出的基线）：16 台 worker 进程 `/proc/<pid>/environ`
+  的 `BAIDU_AK` sha256 前缀必须由 `27233f75` 变为 `edccde44`；
+  再用**进程实际持有的凭证**分别探 LIST / HEAD / `does_bucket_exist` 三项
   （旧 Key 的特征是 PUT/HEAD 活而 LIST 死，一次调用不算）
 - A2：md5 manifest 17/17 匹配，且不再等于旧值 `3a6ba1c6…`
 - 迁移落地：`PRAGMA table_info(tasks)` 出现 `dispatch_mode` 与 `coordinator_phase`
