@@ -127,6 +127,52 @@ ARCHIVABLE_FAIL_REASONS = frozenset({
 })
 
 
+# ── Task-level missing-file ceiling (T4) ─────────────────────────────────
+#
+# Per-batch tolerance (above) must not add up to a task-level lie: 5 forgiven
+# files × up to 1500 batches is 7500 missing files, which is not "a few". So
+# the coordinator applies its own ceiling at finalize time:
+#
+#     limit = max(TASK_MISSING_ABS, listed_files * TASK_MISSING_RATIO)
+#
+# at or under it the task reports `done` (with a WARNING alert and the files
+# queryable); over it the task reports `failed`.
+#
+# Two terms because either alone misjudges one end of the fleet's range. The
+# ratio keeps a 5-million-file dataset from failing over 120 files nobody would
+# call broken; the absolute floor keeps a 200-file task from failing over a
+# single file (0.5% of 200 is 1). Same reason POOL_BATCH_FAIL_MAX is absolute:
+# the sizes here span four orders of magnitude.
+#
+# Lives here rather than in workflows.py because a workflow module must not
+# read os.environ under the replay sandbox, and models is imported inside
+# `workflow.unsafe.imports_passed_through()`.
+TASK_MISSING_ABS = int(os.environ.get("DLM_TASK_MISSING_ABS", "10"))
+TASK_MISSING_RATIO = float(os.environ.get("DLM_TASK_MISSING_RATIO", "0.005"))
+if TASK_MISSING_ABS < 0 or TASK_MISSING_RATIO < 0:
+    raise ValueError(
+        f"DLM_TASK_MISSING_ABS={TASK_MISSING_ABS} / "
+        f"DLM_TASK_MISSING_RATIO={TASK_MISSING_RATIO} must both be >= 0"
+    )
+
+
+def task_missing_limit(listed_files: int) -> int:
+    """How many missing files this task may carry and still report `done`.
+
+    Deliberately a plain function of one number so the workflow can call it
+    inside `run()` (no I/O, no clock, no env read at call time — replay-safe)
+    and the alerting side can reproduce the same value from what was stored.
+
+    `listed_files` must be the LISTING count, not the number of files this run
+    actually dispatched. The dispatched count is what the BOS resume filter
+    left over, so on a task resuming at 99% it would be a few hundred — and
+    0.5% of that rounds to 0, quietly turning the ratio term off exactly where
+    a big dataset needs it most.
+    """
+    return max(TASK_MISSING_ABS, int(max(0, listed_files) * TASK_MISSING_RATIO))
+
+
+
 @dataclass
 class TaskResult:
     """Output from the download workflow."""

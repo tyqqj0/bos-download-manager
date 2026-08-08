@@ -12,7 +12,14 @@ from temporalio.workflow import ActivityCancellationType
 
 with workflow.unsafe.imports_passed_through():
     from ..core.naming import shard_task_name
-    from .models import POOL_BATCH_MAX_ATTEMPTS, TaskInput, TaskResult, ShardInput, ShardResult
+    from .models import (
+        POOL_BATCH_MAX_ATTEMPTS,
+        ShardInput,
+        ShardResult,
+        TaskInput,
+        TaskResult,
+        task_missing_limit,
+    )
 
 
 BATCH_SIZE = 500  # files per pipeline batch (Temporal checkpoint boundary)
@@ -969,13 +976,10 @@ class PoolDownloadWorkflow:
             return await self._fail(task_id, str(e)[:500])
 
         listing_queue = filelist_result.get("worker_queue", "download-workers")
-        if filelist_result.get("count", 0) == 0:
-            await workflow.execute_activity(
-                "report_to_dashboard",
-                args=[task_id, "done", "empty repo", 100, 0, 0, None, None],
-                start_to_close_timeout=timedelta(seconds=30),
-            )
-            return TaskResult(status="done")
+        listed_count = filelist_result.get("count", 0)
+        if listed_count == 0:
+            return await self._finalize(task_input, listed_count=0,
+                                        phase="empty repo")
 
         # Step 2: BOS-aware resume filter (pinned to the listing worker)
         try:
@@ -1000,14 +1004,11 @@ class PoolDownloadWorkflow:
         )
 
         if filter_result["remaining_files"] == 0:
-            await workflow.execute_activity(
-                "report_to_dashboard",
-                args=[task_id, "done",
-                      f"all {skipped_files} files already on BOS", 100, 0,
-                      round(skipped_gb, 2), None, None],
-                start_to_close_timeout=timedelta(seconds=30),
+            return await self._finalize(
+                task_input, listed_count=listed_count,
+                phase=f"all {skipped_files} files already on BOS",
+                total_gb=round(skipped_gb, 2),
             )
-            return TaskResult(status="done")
 
         # Step 3: chunk into batches (pinned — reads the filtered filelist)
         try:
@@ -1031,13 +1032,11 @@ class PoolDownloadWorkflow:
         batch_bytes = chunks["bytes"]
         num_batches = len(batch_keys)
         if num_batches == 0:
-            await workflow.execute_activity(
-                "report_to_dashboard",
-                args=[task_id, "done", "nothing left to download", 100, 0,
-                      round(skipped_gb, 2), None, None],
-                start_to_close_timeout=timedelta(seconds=30),
+            return await self._finalize(
+                task_input, listed_count=listed_count,
+                phase="nothing left to download",
+                total_gb=round(skipped_gb, 2),
             )
-            return TaskResult(status="done")
 
         # Step 4: batch rows. Idempotent — a retry re-sends the identical
         # body and resets any row a dead attempt left running.
@@ -1088,7 +1087,8 @@ class PoolDownloadWorkflow:
         # reconciler exists to mop up, reached by a routine hiccup.
         try:
             outcome = await self._run_window_loop(
-                task_input, shard_ids, batch_keys, list(range(num_batches))
+                task_input, shard_ids, batch_keys, list(range(num_batches)),
+                False,
             )
         except asyncio.CancelledError:
             raise
@@ -1114,7 +1114,14 @@ class PoolDownloadWorkflow:
             )
             try:
                 retry_outcome = await self._run_window_loop(
-                    task_input, shard_ids, batch_keys, sorted(outcome["failed"])
+                    task_input, shard_ids, batch_keys, sorted(outcome["failed"]),
+                    # Last chance for these batches: a batch that still cannot
+                    # fetch a file after this round will never fetch it, so
+                    # this is the round where a permanently-missing file is
+                    # allowed to be recorded and forgiven instead of taking the
+                    # whole task down. Derived from the loop's own position in
+                    # `run()`, not from a clock or a query — replay-safe.
+                    True,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1136,24 +1143,110 @@ class PoolDownloadWorkflow:
         )
 
         if retried_failures:
-            return await self._fail(
-                task_id,
-                f"{len(retried_failures)}/{num_batches} batches failed after retry",
+            return await self._finalize(
+                task_input, listed_count=listed_count,
+                failed_batches=len(retried_failures), num_batches=num_batches,
                 files_uploaded=outcome["uploaded_files"],
                 bytes_uploaded=outcome["uploaded_bytes"],
             )
 
-        total_gb = outcome["uploaded_bytes"] / (1024 ** 3)
-        await workflow.execute_activity(
-            "report_to_dashboard",
-            args=[task_id, "done", None, 100, 0, round(total_gb, 2), None, None],
-            start_to_close_timeout=timedelta(seconds=30),
-        )
-        return TaskResult(
-            status="done",
+        return await self._finalize(
+            task_input, listed_count=listed_count,
+            total_gb=round(outcome["uploaded_bytes"] / (1024 ** 3), 2),
             files_uploaded=outcome["uploaded_files"],
             bytes_uploaded=outcome["uploaded_bytes"],
         )
+
+    async def _finalize(
+        self,
+        task_input: TaskInput,
+        listed_count: int,
+        phase: Optional[str] = None,
+        total_gb: float = 0,
+        failed_batches: int = 0,
+        num_batches: int = 0,
+        files_uploaded: int = 0,
+        bytes_uploaded: int = 0,
+    ) -> TaskResult:
+        """The task's one and only terminal verdict: re-check the missing-file
+        archive against BOS, then report `done` or `failed` by the ceiling.
+
+        Every path out of `run()` that reaches a terminal status goes through
+        here — including the three trivial ones (empty repo, everything already
+        on BOS, nothing left after chunking). Those three cannot have missing
+        files, so routing them here buys nothing today; it buys that nobody
+        adding the fourth early-return has to notice this exists. Reporting
+        `done` from a branch that skipped the re-check is the single failure
+        mode T4 is about, and it is invisible when it happens.
+
+        The verdict (2026-08-08 requirement revision — a few missing files are
+        normal on this fleet and must not block the transfer that follows):
+
+        | failed batches | missing after re-check | status |
+        |---|---|---|
+        | 0    | 0            | `done`   |
+        | 0    | 0 < N ≤ ceil | `done`, phase says so, alert WARNING |
+        | 0    | N > ceiling  | `failed` |
+        | M>0  | any          | `failed` |
+        """
+        task_id = task_input.id
+        limit = task_missing_limit(listed_count)
+
+        # The re-check also persists `limit` (see the activity): alerting needs
+        # the same number the verdict used, and cannot derive it later.
+        try:
+            remaining = await workflow.execute_activity(
+                "verify_missing_files",
+                args=[task_input, limit],
+                start_to_close_timeout=timedelta(minutes=20),
+                heartbeat_timeout=timedelta(minutes=5),
+                retry_policy=ACTIVITY_RETRY,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # No verdict without this: `done` would be the silent report the
+            # whole task exists to prevent, and there is no local fallback —
+            # the archive lives in S1's SQLite. `failed` here costs a retry
+            # whose BOS resume filter skips everything already uploaded; it
+            # does not cost data.
+            return await self._fail(
+                task_id, f"missing-file re-check failed: {str(e)[:300]}",
+                files_uploaded=files_uploaded, bytes_uploaded=bytes_uploaded,
+            )
+
+        if failed_batches:
+            return await self._fail(
+                task_id,
+                f"{failed_batches}/{num_batches} batches failed after retry"
+                + (f"; {remaining} file(s) recorded missing" if remaining else ""),
+                files_uploaded=files_uploaded, bytes_uploaded=bytes_uploaded,
+            )
+
+        if remaining > limit:
+            return await self._fail(
+                task_id,
+                f"{remaining} missing file(s) over this task's ceiling of "
+                f"{limit} ({listed_count} files listed) — "
+                f"GET /api/tasks/{task_id}/missing-files",
+                files_uploaded=files_uploaded, bytes_uploaded=bytes_uploaded,
+            )
+
+        if remaining:
+            # Said out loud in the task's own phase text, not only in the alert:
+            # the dashboard row is where anyone looks first, and "done" with no
+            # qualifier is what made this loss invisible before.
+            note = (f"{remaining} file(s) missing, within ceiling {limit} — "
+                    f"GET /api/tasks/{task_id}/missing-files")
+            phase = f"{phase}; {note}" if phase else note
+
+        await workflow.execute_activity(
+            "report_to_dashboard",
+            args=[task_id, "done", phase, 100, 0, total_gb, None, None],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        return TaskResult(status="done", files_uploaded=files_uploaded,
+                          bytes_uploaded=bytes_uploaded)
 
     async def _fail(self, task_id: str, error: str, files_uploaded: int = 0,
                     bytes_uploaded: int = 0) -> TaskResult:
@@ -1193,6 +1286,7 @@ class PoolDownloadWorkflow:
         shard_ids: list,
         batch_keys: list,
         pending: list,
+        tolerate_missing: bool,
     ) -> dict:
         """Keep up to `window` batches in flight until `pending` is drained.
 
@@ -1201,6 +1295,13 @@ class PoolDownloadWorkflow:
         "uploaded_bytes": int}`. `stopped` means a batch reported that the
         parent task is no longer runnable — the caller must not report a
         terminal status of its own.
+
+        `tolerate_missing` is passed straight through to every batch: False on
+        the first pass, True on the re-dispatch round. No default, so a new
+        call site has to decide rather than inherit — getting it wrong in
+        either direction is silent (True everywhere throws away the round that
+        cures a poisoned worker; False everywhere leaves the original bug in
+        place).
         """
         task_id = task_input.id
         queue = pool_task_queue(task_input.source)
@@ -1224,7 +1325,12 @@ class PoolDownloadWorkflow:
                     idx = remaining.pop(0)
                     in_flight[idx] = workflow.start_activity(
                         "run_pool_batch",
-                        args=[task_input, idx, batch_keys[idx]],
+                        # min_free_gb stays None (the activity computes its own
+                        # coexistence floor); positional because Temporal
+                        # activity args are a list, so tolerate_missing cannot
+                        # be passed without it.
+                        args=[task_input, idx, batch_keys[idx], None,
+                              tolerate_missing],
                         task_queue=queue,
                         schedule_to_close_timeout=POOL_BATCH_SCHEDULE_TO_CLOSE,
                         start_to_close_timeout=POOL_BATCH_START_TO_CLOSE,

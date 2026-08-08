@@ -194,6 +194,35 @@ async def clear_task_missing_files(task_id: str, req: ClearMissingFilesRequest):
     return result
 
 
+class MissingLimitRequest(BaseModel):
+    limit: int
+
+
+@router.post("/tasks/{task_id}/missing-limit")
+async def set_task_missing_limit(task_id: str, req: MissingLimitRequest):
+    """Record the missing-file ceiling the coordinator judged this task by.
+
+    Separate from the DELETE above because it is a different fact with a
+    different lifetime: the DELETE retracts rows a re-check disproved, while
+    this stores the threshold that made `done`-with-gaps a deliberate verdict
+    rather than a silent one. Alerting reads it straight off the task row (see
+    the `missing_files_limit` comment in snapshot.py) — it has no other way to
+    learn the listing file count the limit was derived from.
+    """
+    def _do():
+        from ...queue.snapshot import get_task, init_db, set_missing_limit
+        init_db()
+        if not get_task(task_id):
+            return None
+        count = set_missing_limit(task_id, req.limit)
+        return {"ok": True, "limit": max(0, req.limit), "missing_files_count": count}
+
+    result = await run_blocking(_do)
+    if result is None:
+        raise HTTPException(404, f"Task {task_id} not found")
+    return result
+
+
 class AddTaskRequest(BaseModel):
     url_or_repo: str
     category: str = "other"

@@ -333,3 +333,323 @@ def test_the_clear_endpoint_404s_for_an_unknown_task(db):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(task_routes.clear_task_missing_files("t-ghost", req))
     assert exc.value.status_code == 404
+
+
+# ── T4: POST /api/tasks/{id}/missing-limit ──────────────────────────────
+#
+# The ceiling has to be stored, not just used: alerting runs off the task row
+# long after the coordinator's listing count is gone (see T5).
+
+
+def test_the_limit_endpoint_stores_the_ceiling_and_returns_the_count(db):
+    _task(db)
+    db.record_missing_files("t-mf", [_f("a/1.bin"), _f("a/2.bin")])
+    req = task_routes.MissingLimitRequest(limit=17)
+    result = asyncio.run(task_routes.set_task_missing_limit("t-mf", req))
+
+    assert result == {"ok": True, "limit": 17, "missing_files_count": 2}
+    row = db._conn().execute(
+        "SELECT missing_files_limit FROM tasks WHERE id='t-mf'").fetchone()
+    assert row["missing_files_limit"] == 17
+
+
+def test_the_limit_endpoint_404s_for_an_unknown_task(db):
+    req = task_routes.MissingLimitRequest(limit=5)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(task_routes.set_task_missing_limit("t-ghost", req))
+    assert exc.value.status_code == 404
+
+
+def test_a_negative_limit_is_clamped_rather_than_stored(db):
+    """A stored negative would make T5's `count > limit` rule fire on every
+    task, and `limit > 0` (its "was finalized" test) is the wrong shape for it."""
+    _task(db)
+    db.set_missing_limit("t-mf", -3)
+    row = db._conn().execute(
+        "SELECT missing_files_limit FROM tasks WHERE id='t-mf'").fetchone()
+    assert row["missing_files_limit"] == 0
+
+
+def test_an_unfinalized_task_has_a_zero_ceiling(db):
+    """T5 reads `limit == 0` as "never finalized" and stays quiet. A default of
+    anything else would have unfinished tasks alerting."""
+    _task(db)
+    row = db._conn().execute(
+        "SELECT missing_files_limit FROM tasks WHERE id='t-mf'").fetchone()
+    assert row["missing_files_limit"] == 0
+
+
+# ── T4: task_missing_limit — the two-term ceiling ───────────────────────
+
+
+def test_the_ceiling_is_the_larger_of_the_floor_and_the_ratio():
+    from dlm.temporal.models import (TASK_MISSING_ABS, TASK_MISSING_RATIO,
+                                     task_missing_limit)
+
+    # Small task: the ratio term is under the floor, so the floor governs —
+    # 0.5% of 200 files is 1, which would fail a task over a single bad file.
+    assert task_missing_limit(200) == TASK_MISSING_ABS
+    # Large task: the ratio governs, because 10 out of a million is not a
+    # meaningful bound on what a fleet-wide problem can lose.
+    assert task_missing_limit(1_000_000) == int(1_000_000 * TASK_MISSING_RATIO)
+
+
+def test_the_ceiling_never_goes_negative_on_a_nonsense_count():
+    from dlm.temporal.models import TASK_MISSING_ABS, task_missing_limit
+    assert task_missing_limit(0) == TASK_MISSING_ABS
+    assert task_missing_limit(-5) == TASK_MISSING_ABS
+
+
+# ── T4: verify_missing_files — BOS is the only truth ───────────────────
+#
+# The dangerous direction is one-way: clearing a row that is genuinely missing
+# destroys the only record that it was ever lost. Keeping a row that is
+# actually present costs a false WARNING, or at worst one resume-filtered
+# retry. So every uncertainty below must resolve toward "still missing".
+
+
+class _Meta:
+    def __init__(self, size):
+        self.content_length = size
+
+
+class _Head:
+    def __init__(self, size):
+        self.metadata = _Meta(size)
+
+
+class _Bos:
+    def __init__(self, existing):
+        self.existing = existing
+        self.looked_up = []
+
+    def get_object_meta_data(self, bucket, key):
+        self.looked_up.append(key)
+        if key not in self.existing:
+            raise RuntimeError(f"404: {key}")
+        size = self.existing[key]
+        if isinstance(size, Exception):
+            raise size
+        return _Head(size)
+
+
+class _Resp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def _run_verify(rows, existing, monkeypatch, task=None, limit=10):
+    """Drive the activity against a fake coordinator + fake BOS.
+
+    Returns (result, bos, calls) where calls is [(verb, url, body)] in order.
+    """
+    from temporalio.testing import ActivityEnvironment
+
+    from dlm.temporal import activities
+    from dlm.temporal.models import TaskInput
+
+    task = task or TaskInput(id="t-mf", name="X", repo_id="org/r", source="hf",
+                             type="dataset", category="manipulation")
+    bos = _Bos(existing)
+    calls = []
+    kept = {"count": len(rows)}
+
+    def fake_get(url, timeout=None):
+        calls.append(("GET", url, None))
+        return _Resp({"count": len(rows), "files": rows})
+
+    def fake_delete(url, json=None, timeout=None):
+        calls.append(("DELETE", url, json))
+        kept["count"] = len(rows) - len(json["paths"])
+        return _Resp({"ok": True, "cleared": len(json["paths"]),
+                      "remaining": kept["count"]})
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append(("POST", url, json))
+        return _Resp({"ok": True, "limit": json["limit"],
+                      "missing_files_count": kept["count"]})
+
+    monkeypatch.setattr("requests.get", fake_get)
+    monkeypatch.setattr("requests.delete", fake_delete)
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(
+        "dlm.core.config.load_config",
+        lambda: {"BAIDU_AK": "ak", "BAIDU_SK": "sk", "BOS_ENDPOINT": "https://x"})
+    monkeypatch.setattr("dlm.core.bos.create_bos_client",
+                        lambda ak, sk, endpoint: bos)
+    monkeypatch.setenv("DLM_COORDINATOR", "http://s1:8080")
+
+    env = ActivityEnvironment()
+    result = asyncio.run(env.run(activities.verify_missing_files, task, limit))
+    return result, bos, calls
+
+
+def _cleared(calls):
+    return [b["paths"] for v, _, b in calls if v == "DELETE"]
+
+
+def test_a_file_on_bos_at_the_recorded_size_is_cleared(monkeypatch):
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+    remaining, bos, calls = _run_verify(
+        rows, {"manipulation/X/a/1.bin": 100}, monkeypatch)
+
+    assert _cleared(calls) == [["a/1.bin"]]
+    assert remaining == 0
+
+
+def test_a_file_on_bos_at_the_wrong_size_is_kept(monkeypatch):
+    """An interrupted upload leaves a short object. Existence alone would read
+    that as delivery and erase the record — both resume filters compare
+    key + size for exactly this reason."""
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+    remaining, bos, calls = _run_verify(
+        rows, {"manipulation/X/a/1.bin": 99}, monkeypatch)
+
+    assert _cleared(calls) == []
+    assert remaining == 1
+
+
+def test_a_head_that_raises_keeps_its_row(monkeypatch):
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+    remaining, bos, calls = _run_verify(
+        rows, {"manipulation/X/a/1.bin": RuntimeError("BOS 503")}, monkeypatch)
+
+    assert _cleared(calls) == []
+    assert remaining == 1
+
+
+def test_a_row_with_no_recorded_size_is_kept_unchecked(monkeypatch):
+    """Without a size there is nothing to compare, so the row cannot be
+    cleared safely — and there is no point spending the HEAD."""
+    rows = [{"file_path": "a/1.bin", "size_bytes": 0}]
+    remaining, bos, calls = _run_verify(
+        rows, {"manipulation/X/a/1.bin": 100}, monkeypatch)
+
+    assert bos.looked_up == []
+    assert _cleared(calls) == []
+    assert remaining == 1
+
+
+def test_only_the_verified_paths_are_cleared(monkeypatch):
+    rows = [
+        {"file_path": "ok.bin", "size_bytes": 100},
+        {"file_path": "short.bin", "size_bytes": 100},
+        {"file_path": "gone.bin", "size_bytes": 100},
+    ]
+    remaining, bos, calls = _run_verify(rows, {
+        "manipulation/X/ok.bin": 100,
+        "manipulation/X/short.bin": 5,
+    }, monkeypatch)
+
+    assert _cleared(calls) == [["ok.bin"]]
+    assert remaining == 2
+
+
+def test_a_dataset_with_no_category_is_skipped_wholesale(monkeypatch):
+    """`bos_target` silently drops a path segment for a falsy category
+    (bos.py:29), so every HEAD would run against a prefix that is probably not
+    this task's — and a coincidental hit there would clear a real record."""
+    from dlm.temporal.models import TaskInput
+
+    task = TaskInput(id="t-mf", name="X", repo_id="org/r", source="hf",
+                     type="dataset", category="")
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+    remaining, bos, calls = _run_verify(rows, {"X/a/1.bin": 100}, monkeypatch,
+                                        task=task)
+
+    assert bos.looked_up == []
+    assert _cleared(calls) == []
+    assert remaining == 1
+
+
+def test_a_model_task_is_checked_even_with_no_category(monkeypatch):
+    """Model prefixes are `{name}/` and never involve category, so the guard
+    above must not sweep them up — a model task's rows would then never clear."""
+    from dlm.temporal.models import TaskInput
+
+    task = TaskInput(id="t-mf", name="Qwen", repo_id="org/r", source="hf",
+                     type="model", category="")
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+    remaining, bos, calls = _run_verify(rows, {"Qwen/a/1.bin": 100}, monkeypatch,
+                                        task=task)
+
+    assert bos.looked_up == ["Qwen/a/1.bin"]
+    assert _cleared(calls) == [["a/1.bin"]]
+    assert remaining == 0
+
+
+@pytest.mark.parametrize("rows", [[], [{"file_path": "a/1.bin", "size_bytes": 100}]])
+def test_the_ceiling_is_recorded_on_every_path(rows, monkeypatch):
+    """Including the skip paths and the nothing-to-do path: T5 cannot tell
+    "finalized with no losses" from "never finalized" without this write."""
+    remaining, bos, calls = _run_verify(rows, {}, monkeypatch, limit=42)
+
+    posts = [(u, b) for v, u, b in calls if v == "POST"]
+    assert posts == [("http://s1:8080/api/tasks/t-mf/missing-limit", {"limit": 42})]
+
+
+def test_no_rows_means_no_bos_calls_at_all(monkeypatch):
+    remaining, bos, calls = _run_verify([], {}, monkeypatch)
+    assert bos.looked_up == []
+    assert remaining == 0
+    assert [v for v, _, _ in calls] == ["GET", "POST"]
+
+
+def test_the_returned_count_comes_from_the_database_not_arithmetic(monkeypatch):
+    """The coordinator's verdict and the dashboard row must not be able to
+    disagree, so the number returned is whatever SQLite says after the clear —
+    not `len(rows) - len(present)` computed on the worker."""
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+
+    from temporalio.testing import ActivityEnvironment
+
+    from dlm.temporal import activities
+    from dlm.temporal.models import TaskInput
+
+    monkeypatch.setattr("requests.get", lambda url, timeout=None: _Resp(
+        {"count": 1, "files": rows}))
+    monkeypatch.setattr("requests.delete",
+                        lambda url, json=None, timeout=None: _Resp(
+                            {"ok": True, "cleared": 1, "remaining": 0}))
+    # The DB has a row the worker never saw (another batch reported one while
+    # this pass was running); the activity must report 7, not 0.
+    monkeypatch.setattr("requests.post", lambda url, json=None, timeout=None: _Resp(
+        {"ok": True, "limit": json["limit"], "missing_files_count": 7}))
+    monkeypatch.setattr(
+        "dlm.core.config.load_config",
+        lambda: {"BAIDU_AK": "ak", "BAIDU_SK": "sk", "BOS_ENDPOINT": "https://x"})
+    monkeypatch.setattr("dlm.core.bos.create_bos_client",
+                        lambda ak, sk, endpoint: _Bos({"manipulation/X/a/1.bin": 100}))
+    monkeypatch.setenv("DLM_COORDINATOR", "http://s1:8080")
+
+    task = TaskInput(id="t-mf", name="X", repo_id="org/r", source="hf",
+                     type="dataset", category="manipulation")
+    env = ActivityEnvironment()
+    assert asyncio.run(env.run(activities.verify_missing_files, task, 10)) == 7
+
+
+def test_a_coordinator_error_body_is_raised_not_swallowed(monkeypatch):
+    """A silent failure here means the ceiling never lands and the coordinator
+    reports `done` off a count nobody can audit."""
+    from temporalio.testing import ActivityEnvironment
+
+    from dlm.temporal import activities
+    from dlm.temporal.models import TaskInput
+
+    monkeypatch.setattr("requests.get", lambda url, timeout=None: _Resp(
+        {"count": 0, "files": []}))
+    monkeypatch.setattr("requests.post", lambda url, json=None, timeout=None: _Resp(
+        {"error": "no such task"}))
+    monkeypatch.setenv("DLM_COORDINATOR", "http://s1:8080")
+
+    task = TaskInput(id="t-mf", name="X", repo_id="org/r", source="hf",
+                     type="dataset", category="manipulation")
+    env = ActivityEnvironment()
+    with pytest.raises(RuntimeError, match="no such task"):
+        asyncio.run(env.run(activities.verify_missing_files, task, 10))

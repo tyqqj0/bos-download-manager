@@ -344,6 +344,49 @@ replay 测试全绿。
 > 重新导出该 history → 确认 `tests/test_pool_workflow_replay.py` 绿。
 > **sharded 的夹具一个都不许动** —— 那是回滚路径的保护网。
 
+#### 实施记录（2026-08-08，已完成）
+
+改动文件：
+- `dlm/temporal/models.py`：`TASK_MISSING_ABS` / `TASK_MISSING_RATIO`（默认 10 / 0.005，
+  env 可调，负值 import 期即报错）+ `task_missing_limit(listed_files)`。
+- `dlm/queue/snapshot.py`：`tasks.missing_files_limit INTEGER DEFAULT 0` 迁移 + `set_missing_limit()`。
+- `dlm/web/routes/tasks.py`：`POST /api/tasks/{id}/missing-limit`。
+- `dlm/temporal/activities.py`：`verify_missing_files(task_input, limit)`。
+- `dlm/temporal/__main__.py`：进 import 列表与 `ACTIVITIES`。
+- `dlm/temporal/workflows.py`：`_finalize()` + 四条终态路径全部改走它；
+  `_run_window_loop(..., tolerate_missing)` 第 5 个**必填**位置参数。
+- 测试：`tests/test_missing_files.py` +15、`tests/test_pool_workflow_replay.py` +10，
+  夹具 `pool-t-pool-1.json` 重录；全套 557 → 575 passed。
+
+偏离方案的地方（4 处，都是实现时才看清的）：
+
+1. **`missing_files_limit` 列 + 写入路径落在 T4，不是 T5。** 方案把这列排给了 T5 的迁移，
+   但只有 `_finalize` 拿得到列表阶段的总文件数，也只有它算得出上限；等到 T5 告警去读任务行时
+   那个分母早就没了。所以列、`set_missing_limit()`、`POST /missing-limit` 一起在这里落地，
+   T5 只剩纯告警逻辑。
+2. **activity 签名是 `(task_input, limit)`，顺手把上限落库。** 本来是 `(task_input)`。
+   多一个 HTTP 往返不值得，而复核这一步天然就是"任务收尾"的唯一时刻。
+   代价：`limit` 的取值判断留在 workflow（确定性安全），activity 只负责写。
+3. **`_finalize` 连 `failed_batches` 那一档也一起判。** 否则失败路径不会复核、不会写上限，
+   T5 的 CRITICAL 规则（`count > limit > 0`）对"重派后仍失败"的任务永远触发不了 ——
+   而那恰恰是最需要说清丢了什么的一档。
+4. **类别为空的跳过规则要放过 model 任务。** 方案只说"`category` 为空就跳过"，
+   但 `bos.py:25` 对 `type == "model"` 直接返回 `{name}/`，根本不看 `category` ——
+   照方案写会让所有模型任务的缺件行永远清不掉。守卫改成
+   `type == "model" or bool(category)`。
+
+另外一处方案没规定、需要记下的判断：**`verify_missing_files` 自己失败 ⇒ 报 `failed`，
+不报 `done`。** 复核挂了就没有任何判档依据，而档案在 S1 的 SQLite 里、worker 侧没有兜底副本；
+此时报 `done` 正是 T4 要消灭的那种静默。`failed` 的代价是一次续传重试
+（BOS 过滤器会跳过已传文件），不是数据。
+
+验证方式（不是"绿了就算"）：对 5 个判定条件逐个做变异测试，确认各有测试挂掉 ——
+去掉 size 比较（退化成只比存在性）→ 2 条挂；去掉 model 豁免 → 1 条挂；
+放行 `size_bytes <= 0` 的行 → 1 条挂；空档案时不写上限 → 3 条挂；
+以及 workflow 侧 `tolerate_missing` 与上限判档各自的用例。改完 `activities.py`
+用 `diff -q` 确认字节级还原。夹具重录复用测试模块自己的 `_PoolActivityStubs`
+（4 批次、其中 1 个首轮失败），录制脚本是一次性的、没有入库 —— 夹具因此不可能和 harness 漂移。
+
 ### T5 —— 告警与仪表盘暴露（R4 / R8）
 
 **文件**: `dlm/web/alerts.py`、`dlm/web/routes/doctor.py`
@@ -363,6 +406,9 @@ T4 已判 `failed`），却因为 50 < 100 只发 WARNING。反过来一个 500 
 `tasks` 表再加一列 `missing_files_limit INTEGER DEFAULT 0`，和
 `missing_files_count` 同一次 additive 迁移。`SELECT *` 免费带给 `check_alerts`，
 比较就是 `count > limit and limit > 0`（`limit=0` 表示"这任务还没收尾"⇒ 不评 CRITICAL）。
+
+> **这一列已经在 T4 落地了**（列、`set_missing_limit()`、`POST /missing-limit`、
+> 收尾时的写入），原因见 T4 的实施记录偏离 1。T5 只剩上表两条告警规则本身。
 
 同时把 `pool_orphaned` / `pool_starved`（`reconciler.py` 的 T9 patrol 已产出）
 确认能到 `/api/dashboard` —— 见第 7 节 R-1，这两个告警是 pool 唯一的"卡住"信号。

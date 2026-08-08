@@ -51,6 +51,7 @@ from .activities import (
     create_pool_batches_in_db,
     record_batches_and_window,
     release_pool_batches,
+    verify_missing_files,
 )
 # Safe at module scope: dlm.web.fleet imports only os/time and dlm/web/__init__
 # is a bare docstring, so this pulls in no FastAPI. Workflow code cannot import
@@ -97,6 +98,7 @@ ACTIVITIES = [
     create_pool_batches_in_db,
     record_batches_and_window,
     release_pool_batches,
+    verify_missing_files,
 ]
 
 

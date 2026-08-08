@@ -1590,3 +1590,132 @@ async def release_pool_batches(task_id: str) -> int:
     if data.get("error"):
         raise RuntimeError(f"releasing batches of {task_id} failed: {data['error']}")
     return int(data.get("released", 0))
+
+
+@activity.defn
+async def verify_missing_files(task_input: TaskInput, limit: int) -> int:
+    """Re-check this task's archived missing files against BOS; return what is
+    still missing, and record the ceiling the coordinator will judge that by.
+
+    Called from the pool coordinator's finalize step, before it decides between
+    `done` and `failed`. BOS is the only truth about what landed, and the
+    archive is deliberately written optimistically — every failed attempt
+    upserts a row, including attempts whose file a LATER batch or round then
+    uploaded successfully. Without this pass a task could report `failed` over
+    files that are sitting in the bucket.
+
+    Cheap enough to do one HEAD per row: missing files are a rare event
+    (tens, not millions — a task with millions of them fails on the ceiling
+    long before anyone cares about the round trips).
+
+    Fail-open toward "still missing", in every direction:
+      * A row is cleared ONLY if BOS has that key with the exact recorded
+        size. Existence alone would accept a truncated object left by an
+        interrupted upload as proof of delivery — the one way this activity
+        could erase a real missing-file record. Both resume filters compare
+        key + size for the same reason.
+      * A row whose recorded `size_bytes` is <= 0 cannot be size-checked, so
+        it is kept.
+      * A HEAD that raises keeps its row.
+      * A dataset task with no `category` is skipped wholesale: `bos_target`
+        silently drops a path segment for a falsy category (bos.py:29), so
+        every HEAD would run against a prefix that is probably not this
+        task's. (Model tasks are unaffected — their prefix is `{name}/` and
+        does not involve `category` at all.)
+
+    Returns the task's remaining missing-file count as SQLite sees it, so the
+    coordinator's verdict and the row the dashboard shows cannot disagree.
+    """
+    import requests
+    from ..core.bos import bos_target, create_bos_client
+    from ..core.config import load_config
+
+    base = _coordinator()
+    task_id = task_input.id
+
+    resp = await asyncio.to_thread(
+        lambda: requests.get(f"{base}/api/tasks/{task_id}/missing-files", timeout=60)
+    )
+    resp.raise_for_status()
+    listing = resp.json()
+    rows = listing.get("files") or []
+
+    def _record_limit() -> int:
+        r = requests.post(
+            f"{base}/api/tasks/{task_id}/missing-limit",
+            json={"limit": int(limit)},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        if body.get("error"):
+            raise RuntimeError(
+                f"recording missing-file limit for {task_id} failed: {body['error']}"
+            )
+        return int(body.get("missing_files_count", 0))
+
+    checkable = bool(rows) and (
+        task_input.type == "model" or bool(task_input.category)
+    )
+    if not checkable:
+        if rows:
+            logger.warning(
+                "Skipping missing-file re-check for %s: dataset task with no "
+                "category, so its BOS prefix cannot be computed safely; "
+                "keeping all %d row(s)",
+                task_id, len(rows),
+            )
+        return await asyncio.to_thread(_record_limit)
+
+    def _verify() -> list[str]:
+        config = load_config()
+        bos = create_bos_client(
+            config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
+        )
+        bucket, prefix = bos_target(task_input)
+
+        def _present(row: dict) -> tuple[str, bool]:
+            path = row.get("file_path") or ""
+            expected = int(row.get("size_bytes") or 0)
+            if not path or expected <= 0:
+                return path, False
+            try:
+                meta = bos.get_object_meta_data(bucket, prefix + path)
+                return path, int(meta.metadata.content_length) == expected
+            except Exception:
+                return path, False
+
+        present: list[str] = []
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            for path, ok in pool.map(_present, rows):
+                if ok:
+                    present.append(path)
+        return present
+
+    activity.heartbeat(f"re-checking {len(rows)} missing file(s) of {task_id}")
+    present = await asyncio.to_thread(_verify)
+
+    if present:
+        logger.info(
+            "Missing-file re-check for %s: %d/%d row(s) are on BOS after all",
+            task_id, len(present), len(rows),
+        )
+
+        def _clear() -> int:
+            r = requests.delete(
+                f"{base}/api/tasks/{task_id}/missing-files",
+                json={"paths": present},
+                timeout=60,
+            )
+            r.raise_for_status()
+            body = r.json()
+            if body.get("error"):
+                raise RuntimeError(
+                    f"clearing verified files of {task_id} failed: {body['error']}"
+                )
+            return int(body.get("remaining", 0))
+
+        await asyncio.to_thread(_clear)
+
+    return await asyncio.to_thread(_record_limit)
+

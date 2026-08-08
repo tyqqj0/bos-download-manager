@@ -132,7 +132,8 @@ class _PoolActivityStubs:
 
     def __init__(self, num_batches=4, fail_always=(), fail_first_round=(),
                  windows=None, remaining_files=10, listing_queue="pool-test",
-                 batch_seconds=0.05):
+                 batch_seconds=0.05, missing_after_verify=0,
+                 verify_raises=False):
         # The workflow pins filter/chunk to the listing worker's personal
         # queue (those activities read the filelist off its local disk), so
         # the stub must name a queue this test's worker actually polls —
@@ -144,7 +145,11 @@ class _PoolActivityStubs:
         self.fail_first_round = set(fail_first_round)
         self.windows = list(windows or [])
         self.remaining_files = remaining_files
+        self.missing_after_verify = missing_after_verify
+        self.verify_raises = verify_raises
         self.batch_calls = []          # (batch_index,) in dispatch order
+        self.tolerated = []            # (batch_index, tolerate_missing) per call
+        self.verified = []             # limits passed to verify_missing_files
         self.recorded = []             # results lists passed to bookkeeping
         self.released = []             # task_ids passed to release
         self.dashboard = []            # (status, phase)
@@ -173,6 +178,7 @@ class _PoolActivityStubs:
             _stub("run_pool_batch", self.run_pool_batch),
             _stub("record_batches_and_window", self.record_batches_and_window),
             _stub("release_pool_batches", self.release_pool_batches),
+            _stub("verify_missing_files", self.verify_missing_files),
             _stub("aggregate_task_from_shards", self.aggregate_task_from_shards),
             _stub("report_to_dashboard", self.report_to_dashboard),
         ]
@@ -205,8 +211,10 @@ class _PoolActivityStubs:
     # -- the loop ------------------------------------------------------
 
     async def run_pool_batch(self, task_input: TaskInput, batch_index: int,
-                             filelist_key: str) -> dict:
+                             filelist_key: str, min_free_gb=None,
+                             tolerate_missing=False) -> dict:
         self.batch_calls.append(batch_index)
+        self.tolerated.append((batch_index, tolerate_missing))
         self._live += 1
         self.max_concurrent = max(self.max_concurrent, self._live)
         try:
@@ -230,6 +238,12 @@ class _PoolActivityStubs:
     async def release_pool_batches(self, task_id: str) -> int:
         self.released.append(task_id)
         return 3
+
+    async def verify_missing_files(self, task_input: TaskInput, limit: int) -> int:
+        self.verified.append(limit)
+        if self.verify_raises:
+            raise ApplicationError("coordinator unreachable", non_retryable=True)
+        return self.missing_after_verify
 
     async def aggregate_task_from_shards(self, task_id: str):
         return None
@@ -397,9 +411,11 @@ def test_batch_reporting_ignored_stops_the_loop_without_claiming_done():
 
     real_batch = stubs.run_pool_batch
 
-    async def stop_after_first(task_input, batch_index, filelist_key):
+    async def stop_after_first(task_input, batch_index, filelist_key,
+                               min_free_gb=None, tolerate_missing=False):
         if batch_index == 0:
-            return await real_batch(task_input, batch_index, filelist_key)
+            return await real_batch(task_input, batch_index, filelist_key,
+                                    min_free_gb, tolerate_missing)
         stubs.batch_calls.append(batch_index)
         return {"ignored": True}
 
@@ -436,3 +452,138 @@ def test_bookkeeping_failure_fails_the_task_instead_of_stranding_it():
     assert result.status == "failed"
     assert "pool dispatch failed" in result.error
     assert any(s == "failed" for s, _, _ in stubs.dashboard)
+
+
+# ── 3. T4: honest finalize (missing-file ceiling) ────────────────────
+#
+# The failure mode these exist for is narrow and invisible: a task reports
+# `done` while files it listed are not on BOS, and nothing anywhere says so.
+# Every test below is either "the verdict follows the ceiling" or "the
+# re-check actually ran on this path".
+
+
+def test_the_last_round_is_the_only_one_that_tolerates_missing_files():
+    """Round 1 must NOT forgive: a batch that failed here still gets a whole
+    second dispatch round, which is what cures a poisoned worker. Only that
+    second round may write a file off as permanently missing."""
+    stubs = _PoolActivityStubs(num_batches=3, fail_first_round=[1])
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "done"
+    assert [(i, t) for i, t in stubs.tolerated if t] == [(1, True)], \
+        "only the re-dispatch round may write a file off as permanently missing"
+    # batch 1 is dispatched twice: intolerant first, tolerant on the retry
+    assert [t for i, t in stubs.tolerated if i == 1] == [False, True]
+
+
+def test_a_task_with_no_redispatch_round_never_tolerates():
+    stubs = _PoolActivityStubs(num_batches=4)
+    asyncio.run(_run_pool_workflow(stubs))
+    assert stubs.tolerated == [(i, False) for i, _ in stubs.tolerated]
+
+
+def test_missing_files_within_the_ceiling_still_report_done():
+    """The 2026-08-08 semantics: a few permanently-missing files are normal on
+    this fleet, so the task completes (and the transfer that follows can run).
+    Honesty is carried by the record and the phase text, not by refusing to
+    finish."""
+    stubs = _PoolActivityStubs(num_batches=2, missing_after_verify=3)
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "done"
+    done_phases = [p for s, p, _ in stubs.dashboard if s == "done"]
+    assert done_phases and "3 file(s) missing" in done_phases[0]
+    assert "missing-files" in done_phases[0], \
+        "the phase must say where to look, not just that something is missing"
+
+
+def test_missing_files_over_the_ceiling_fail_the_task():
+    """The ceiling is what keeps per-batch tolerance from adding up to a
+    task-level lie (5 forgiven files × 1500 batches is not "a few")."""
+    stubs = _PoolActivityStubs(num_batches=2, missing_after_verify=999)
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "failed"
+    assert "999 missing file(s) over this task's ceiling" in result.error
+    assert "missing-files" in result.error
+
+
+def test_the_ceiling_comes_from_the_listing_count():
+    """`task_missing_limit` is fed the LISTING count (100 in these stubs), not
+    the post-resume-filter count — on a task resuming at 99% the latter would
+    shrink the ratio term to nothing."""
+    from dlm.temporal.models import task_missing_limit
+
+    stubs = _PoolActivityStubs(num_batches=2)
+    asyncio.run(_run_pool_workflow(stubs))
+
+    assert stubs.verified == [task_missing_limit(100)]
+
+
+def test_a_failed_recheck_never_reports_done():
+    """No verdict is possible without the archive, and `done` would be exactly
+    the silent report this task exists to prevent. Failing costs a retry whose
+    resume filter skips everything already uploaded; it does not cost data."""
+    stubs = _PoolActivityStubs(num_batches=2, verify_raises=True)
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "failed"
+    assert "missing-file re-check failed" in result.error
+    assert not any(s == "done" for s, _, _ in stubs.dashboard)
+
+
+def test_a_task_that_fails_on_batches_still_records_its_missing_files():
+    """M>0 fails regardless of N — but the re-check still runs, so the ceiling
+    lands in the task row and the archive is pruned of files a later round
+    actually uploaded. Alerting has nothing else to work from."""
+    stubs = _PoolActivityStubs(num_batches=3, fail_always=[2],
+                               missing_after_verify=4)
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "failed"
+    assert "1/3 batches failed after retry" in result.error
+    assert "4 file(s) recorded missing" in result.error
+    assert len(stubs.verified) == 1
+
+
+@pytest.mark.parametrize("kwargs,expected_phase", [
+    ({"num_batches": 0, "remaining_files": 0}, "all 3 files already on BOS"),
+    ({"num_batches": 0, "remaining_files": 5}, "nothing left to download"),
+])
+def test_the_trivial_done_paths_go_through_the_recheck_too(kwargs, expected_phase):
+    """These three paths cannot have missing files today, so routing them
+    through the re-check buys nothing now — it buys that the next person who
+    adds an early `return done` does not have to know about any of this. A
+    `done` reported from a branch that skipped the re-check is the exact
+    failure mode, and it is invisible when it happens."""
+    stubs = _PoolActivityStubs(**kwargs)
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "done"
+    assert len(stubs.verified) == 1
+    assert any(p and expected_phase in p for _, p, _ in stubs.dashboard)
+
+
+def test_the_empty_repo_path_goes_through_the_recheck_too():
+    stubs = _PoolActivityStubs(num_batches=0)
+
+    async def empty_listing(task_input):
+        return {"path": "/tmp/fl.json", "count": 0, "total_bytes": 0,
+                "worker_queue": stubs.listing_queue}
+
+    stubs.list_repo_files = empty_listing
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "done"
+    assert len(stubs.verified) == 1
+    assert any(p == "empty repo" for _, p, _ in stubs.dashboard)
+
+
+def test_verify_missing_files_is_registered_on_the_workers():
+    """It is called only at the very end of a pool task, so an unregistered
+    activity would surface hours in, on the one step that decides whether the
+    task tells the truth."""
+    from dlm.temporal.__main__ import ACTIVITIES
+
+    names = [getattr(a, "__temporal_activity_definition").name for a in ACTIVITIES]
+    assert "verify_missing_files" in names

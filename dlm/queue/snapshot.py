@@ -167,6 +167,18 @@ def init_db():
         # that O(all tasks) queries every 10 seconds.
         # Every writer below keeps this in step with the actual row count.
         ("missing_files_count", "INTEGER", "0"),
+        # The ceiling the coordinator judged this task's missing files by
+        # (`task_missing_limit(listed_files)` — see dlm/temporal/models.py),
+        # written once at finalize. Stored rather than recomputed because the
+        # inputs are gone by then: it is a function of the LISTING file count,
+        # which lives on a worker's disk during the run and nowhere after it,
+        # while alerting runs off `SELECT * FROM tasks` every 10s. Without the
+        # column, alerts would need a second, necessarily different, threshold
+        # — and the absurd window that follows is the whole reason it exists: a
+        # 300-file task missing 50 is already `failed` by the coordinator's
+        # max(10, 0.5%), but a hardcoded 100 in alerts would call it a WARNING.
+        # 0 means "not finalized yet" ⇒ no CRITICAL verdict is possible.
+        ("missing_files_limit", "INTEGER", "0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")
@@ -532,6 +544,25 @@ def clear_missing_files(task_id: str, paths: list) -> int:
             "DELETE FROM missing_files WHERE task_id = ? AND file_path = ?",
             (task_id, path),
         )
+    total = _sync_missing_count(conn, task_id)
+    conn.commit()
+    return total
+
+
+def set_missing_limit(task_id: str, limit: int) -> int:
+    """Record the missing-file ceiling this task was judged by; returns its
+    current missing count.
+
+    Written by the coordinator at finalize (over HTTP — the workflow's
+    verifying activity runs on a worker, which cannot touch SQLite). Alerting
+    compares `missing_files_count > missing_files_limit > 0`, so a task that
+    never finalized keeps 0 and is never called CRITICAL on a stale threshold.
+    """
+    conn = _conn()
+    conn.execute(
+        "UPDATE tasks SET missing_files_limit = ? WHERE id = ?",
+        (max(0, int(limit)), task_id),
+    )
     total = _sync_missing_count(conn, task_id)
     conn.commit()
     return total
