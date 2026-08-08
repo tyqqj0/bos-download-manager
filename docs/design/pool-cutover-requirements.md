@@ -232,8 +232,16 @@ env 在 exec 时读取，`dlm/core/config.py::load_config` 用的 `load_dotenv` 
 ### A2 —— 代码 17/17 一致
 
 - 部署脚本输出的 md5 版本清单 17/17 全部匹配
-- 17/17 台 `git rev-parse --short HEAD` 相同，且等于本次部署的提交
+- S1 侧记录本次部署的提交（`git rev-parse --short HEAD`），并与 md5 清单一起留档
 - 部署前已确认无主机存在未提交的本地修改（否则会被 rsync 静默覆盖）
+
+> **修订（2026-08-08）**：原文第二条写"17/17 台 `git rev-parse --short HEAD` 相同"，
+> **不可满足**。`deploy-workers.sh` 的 rsync 带 `--exclude '.git'`（脚本 140 行），
+> worker 上根本没有 git 仓库（或只剩某次旧 clone 的残留），在 worker 上跑
+> `git rev-parse` 要么报错要么给出一个与实际部署代码无关的旧提交 ——
+> 拿它当验收会得到一个看起来通过、实际什么都没验的门。
+> **md5 清单才是唯一可信的一致性证据**：它按 rsync 能搬的文件逐个哈希，
+> `--delete` 成功后两侧目录树完全相同。提交号只在 S1 一侧有意义，用于留档回溯。
 
 ### A3 —— 全局默认确实是 pool（三类行都验）
 
@@ -280,8 +288,17 @@ env 在 exec 时读取，`dlm/core/config.py::load_config` 用的 `load_dotenv` 
 
 - 代码层：死代码清单已给出 keep/delete 决策与理由；replay 测试在清理后依然全绿
 - 运行时层：清理的 staging 目录清单与"仍在运行的分片"清单**无交集**（清理前后各记录一次）
-- 全量测试通过（当前基线 453 passed）
-- replay 测试（`tests/test_workflow_replay.py`、`tests/test_pool_workflow_replay.py`，当前 27 passed）通过
+- 全量测试通过（**部署前基线 627 passed**，2026-08-08 于 `17a7ff6` 实测）。
+  演进：需求定稿当天 453 → T1–T7 pool 改动完成 599 → 评审第 1 轮修复 627
+- replay 测试（`tests/test_workflow_replay.py`、`tests/test_pool_workflow_replay.py`，
+  **当前 41 passed**）通过 —— 这两个文件回放 `tests/fixtures/histories/` 里录下的 7 份
+  真实历史，是 R5 "清理不许破坏 replay" 的唯一证据
+
+> **修订（2026-08-08）**：原文写的 "453 passed" / "27 passed" 是需求文档定稿当天的数字，
+> 到代码完成时已过时。**过时的基线比没有基线更糟**：验收时跑出 627 会被读成"多了 174 条，
+> 有人塞了东西"，或者反过来，真的掉了测试也看不出来。数字随每次提交变，
+> 所以这里同时记下取数的提交号；验收时以"跑一次 == 记录值，且无 failed/error"为准，
+> 而不是记死某个数。
 
 ### A9 —— 两个任务在 pool 下真的在下
 
@@ -306,7 +323,8 @@ env 在 exec 时读取，`dlm/core/config.py::load_config` 用的 `load_dotenv` 
 
 ### A12 —— 观测期通过
 
-- 部署后持续观测，期间：无新增死批次累积到任务失败、BOS 单调增长、无告警
+- 部署后持续观测，期间：无新增死批次累积到任务失败、BOS 单调增长、
+  **无"非预期"告警**（见下方修订）
 - **pool 任务不会自愈,所以观测期是硬要求而非可选**：`reconciler.reconcile()` 的孤儿重派
   分支对 pool 任务**显式 `continue` 跳过**（`reconciler.py:183` 附近，"decision C"）——
   理由是第二个 `PoolDownloadWorkflow` 会重跑 list→filter→chunk 并撞上批次不匹配从而卡死
@@ -314,6 +332,21 @@ env 在 exec 时读取，`dlm/core/config.py::load_config` 用的 `load_dotenv` 
   `pool_orphaned` / `pool_starved` 告警等人处理。
   所以验收必须包含：确认这两个告警确实会出现在 `/api/dashboard`，并在观测期内实际盯它们。
 - 观测结论如实汇报：包括"哪些指标我没能验证"
+
+> **修订（2026-08-08）**：第一条原文写"无告警"，与 R4 修订后的语义**直接冲突** ——
+> R4 规定缺件数在 `0 < N ≤ 上限` 时任务照报 `done` 且**必发 WARNING**，A6 更把
+> "报了 done 但没有告警"列为唯一的失败形态。若 A12 按字面执行，
+> 一个正确工作的系统（有几个源端坏文件 + 一条如实的 WARNING）会被判为观测期不通过，
+> 而把 WARNING 消掉才能"通过"—— 正好奖励了 R4 要消灭的静默。
+>
+> 修订为按告警类型判定：
+>
+> | 告警 | 观测期判定 |
+> |---|---|
+> | 缺件 WARNING（`0 < N ≤ 上限`） | **预期**，出现即说明记账链路通了；记录缺件数与任务，不算不通过 |
+> | `pool_orphaned` / `pool_starved` | **非预期**，出现即人工介入（pool 任务不自愈，见上） |
+> | 缺件 CRITICAL（`N > 上限`）、任务 `failed` | **非预期**，停下查因 |
+> | BOS 字节数下降 | 事故，走第 5 节回滚 |
 
 ### A13 —— #83 有明确结论
 
