@@ -15,7 +15,15 @@ from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from ..core.naming import shard_row_id, split_shard_name
-from .models import TaskInput, FileInfo, PipelineStats, ShardInput
+from .models import (
+    ARCHIVABLE_FAIL_REASONS,
+    POOL_BATCH_FAIL_MAX,
+    POOL_BATCH_MAX_ATTEMPTS,
+    FileInfo,
+    PipelineStats,
+    ShardInput,
+    TaskInput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -637,6 +645,73 @@ def _coordinator():
     return _COORDINATOR_URL
 
 
+def _report_missing_files(
+    task_id: str, batch_index: int, server_key: str, details: list
+) -> bool:
+    """Archive permanently-failed files against the task. Returns whether it
+    landed — never raises.
+
+    Workers cannot touch SQLite (that is S1's, and `activities.py` imports
+    nothing from `dlm.queue.snapshot`), so the archive is written over HTTP
+    like every other worker→S1 write.
+
+    Returning a bool rather than raising, and the caller's use of it, is the
+    whole point: the caller only forgives a batch when this returned True.
+    Tolerating a batch whose dropped files were never recorded is precisely
+    the silent loss the archive exists to prevent — worse than today's
+    behaviour, because today the batch at least fails loudly. So a coordinator
+    hiccup costs us the forgiveness, not the record.
+
+    Idempotent at the far end on (task_id, file_path): reporting on every
+    attempt bumps `attempts` instead of duplicating rows, which is why this is
+    called unconditionally rather than only when the batch is about to be
+    forgiven.
+    """
+    if not details:
+        return True
+    import requests
+
+    try:
+        resp = requests.post(
+            f"{_coordinator()}/api/missing-files",
+            json={
+                "task_id": task_id,
+                "batch_index": batch_index,
+                "server": server_key,
+                "files": [
+                    {"path": d.get("path"), "reason": d.get("reason"),
+                     "size_bytes": d.get("size_bytes") or 0}
+                    for d in details
+                ],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:
+        logger.error(
+            "Missing-file archive POST failed for %s batch %s (%d files): %s: %s",
+            task_id, batch_index, len(details), type(e).__name__, e,
+        )
+        return False
+
+    if body.get("error"):
+        logger.error(
+            "Missing-file archive rejected for %s batch %s: %s",
+            task_id, batch_index, body["error"],
+        )
+        return False
+    if body.get("ignored"):
+        # The parent task is paused/revoked/done. Nothing was written and
+        # nothing should be — but the caller must not read that as "recorded".
+        logger.warning(
+            "Missing-file archive ignored for %s batch %s: %s",
+            task_id, batch_index, body["ignored"],
+        )
+        return False
+    return True
+
+
 @activity.defn
 async def create_shards_in_db(task_id: str, shard_infos: list[dict]) -> list[str]:
     """Create shard rows via S1 API. Returns shard IDs."""
@@ -1073,6 +1148,7 @@ async def run_pool_batch(
     batch_index: int,
     filelist_key: str,
     min_free_gb: Optional[int] = None,
+    tolerate_missing: bool = False,
 ) -> dict:
     """Download+upload one pool batch's files to the task's flat BOS prefix.
 
@@ -1128,6 +1204,14 @@ async def run_pool_batch(
          preserves staging for a possible resume) before its own re-raise —
          this mirrors `run_pipeline_batch`, which adds no CancelledError
          handling of its own either; that behavior lives in the engine.
+
+    `tolerate_missing` (T3) relaxes step 5's all-or-nothing rule, and ONLY on
+    the last attempt of the last re-dispatch round: a batch carrying at most
+    POOL_BATCH_FAIL_MAX permanently-failed files, all of them already written
+    to the `missing_files` archive, is judged complete instead of failing the
+    task. The coordinator owns this flag — the worker cannot know whether
+    another round is coming. Default False, which is byte-for-byte today's
+    behaviour.
 
     Returns (on a real run) `{"ignored": False, downloaded_files,
     uploaded_files, uploaded_bytes, skipped_files, skipped_bytes,
@@ -1273,11 +1357,76 @@ async def run_pool_batch(
         stats = await engine.run(files)
 
         if stats.failed_files > 0:
-            raise RuntimeError(
-                f"{server_key}: pool batch {batch_index} of {task_input.name} "
-                f"incomplete: {stats.failed_files}/{stats.total_files} files "
-                f"failed (downloaded={stats.downloaded_files}, "
-                f"uploaded={stats.uploaded_files})"
+            # (1) Archive first, unconditionally — decoupled from the tolerance
+            #     decision on purpose. Putting this inside the "we are about to
+            #     forgive it" branch would mean the two cases that most need
+            #     evidence — a first-attempt failure, and a batch over the
+            #     ceiling that ends up failing the whole task — leave no record
+            #     at all. "Which files are missing" is the only useful thing to
+            #     know about a task that ends `failed`.
+            archivable = [d for d in stats.failed_details
+                          if d.get("reason") in ARCHIVABLE_FAIL_REASONS]
+            recorded = await asyncio.to_thread(
+                _report_missing_files, task_input.id, batch_index, server_key,
+                archivable,
+            )
+
+            # (2) Then decide. Four conditions, each closing a different hole:
+            #
+            #   tolerate_missing  — the coordinator's call, not the worker's:
+            #       it is only true on the final re-dispatch round, so a
+            #       first-round batch still fails and still gets its second
+            #       round on (probably) a different worker. A poisoned worker
+            #       is exactly what that round cures, and forgiving early
+            #       throws it away.
+            #   final_attempt     — same argument one level down, across this
+            #       round's own retries.
+            #   fully archivable  — every failure is a file-level fact we just
+            #       wrote down. Cancelled uploads and missing staged files are
+            #       deliberately NOT archivable (they are orchestration and
+            #       local disk state), so a batch whose failures are those
+            #       cannot be forgiven: forgiving it would drop files with no
+            #       record anywhere, which is worse than failing loudly.
+            #   <= ceiling        — the tolerance must not degenerate into
+            #       "never fails". A systemic fault takes out far more than
+            #       POOL_BATCH_FAIL_MAX files and still raises.
+            final_attempt = activity.info().attempt >= POOL_BATCH_MAX_ATTEMPTS
+            fully_archivable = len(archivable) == stats.failed_files
+            tolerable = (
+                tolerate_missing
+                and final_attempt
+                and recorded
+                and fully_archivable
+                and stats.failed_files <= POOL_BATCH_FAIL_MAX
+            )
+
+            if not tolerable:
+                # Message names which condition held it back — from a Temporal
+                # failure list, "incomplete: 3/500 failed" alone cannot
+                # distinguish "will retry" from "over the ceiling, task is
+                # doomed", and those call for opposite responses.
+                raise RuntimeError(
+                    f"{server_key}: pool batch {batch_index} of {task_input.name} "
+                    f"incomplete: {stats.failed_files}/{stats.total_files} files "
+                    f"failed (downloaded={stats.downloaded_files}, "
+                    f"uploaded={stats.uploaded_files}); not tolerated "
+                    f"[tolerate_missing={tolerate_missing}, "
+                    f"attempt={activity.info().attempt}/{POOL_BATCH_MAX_ATTEMPTS}, "
+                    f"archived={recorded}, "
+                    f"archivable={len(archivable)}/{stats.failed_files}, "
+                    f"ceiling={POOL_BATCH_FAIL_MAX}]"
+                )
+
+            # Forgiven: the batch is judged complete and the coordinator moves
+            # on. Every file we gave up on is in `missing_files` and shows up
+            # in the task's alert and its /missing-files listing — the batch is
+            # passed, the loss is not hidden.
+            logger.warning(
+                "Pool batch %s of %s tolerated with %d permanently-failed "
+                "file(s) on attempt %d/%d (archived; reasons: %s)",
+                batch_index, task_input.name, stats.failed_files,
+                activity.info().attempt, POOL_BATCH_MAX_ATTEMPTS,
+                sorted({d.get("reason") for d in archivable}),
             )
     except asyncio.CancelledError:
         raise

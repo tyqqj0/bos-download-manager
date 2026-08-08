@@ -24,7 +24,18 @@ import pytest
 
 from dlm.core.naming import shard_row_id
 from dlm.temporal import activities
-from dlm.temporal.models import PipelineStats, TaskInput
+from dlm.temporal.models import (
+    FAIL_ACCESS_DENIED,
+    FAIL_DOWNLOAD_RETRIES_EXHAUSTED,
+    FAIL_SIZE_MISMATCH,
+    FAIL_STAGED_FILE_MISSING,
+    FAIL_UPLOAD_CANCELLED,
+    FAIL_UPSTREAM_EMPTY,
+    POOL_BATCH_FAIL_MAX,
+    POOL_BATCH_MAX_ATTEMPTS,
+    PipelineStats,
+    TaskInput,
+)
 from dlm.temporal.pipeline import PipelineEngine
 
 
@@ -465,3 +476,310 @@ def test_failure_also_cleans_up_batch_staging_dir(pool_batch_env, monkeypatch, t
     with pytest.raises(RuntimeError):
         _run_activity(activities.run_pool_batch, _task_input(name="fail-task"), 0, "k")
     assert not (tmp_path / "fail-task" / "pool-batch-0").exists()
+
+
+# ── T3: missing-file tolerance ──────────────────────────────────────────
+#
+# Until T3 a single unfetchable file killed its batch, and three killed the
+# shard — the whole reason RoboDojo/RoboMIND-class tasks end `failed` with 99%
+# of their bytes on BOS. The rule now is "forgive a few permanently-missing
+# files, but only once every retry is spent, and only for files we have
+# written down". Each test below pins one of the conditions that make up
+# "only", because every one of them is a way for the tolerance to either
+# never fire (leaving the bug in place) or fire too eagerly (dropping files
+# with nobody the wiser).
+
+
+def _engine_failing_with(*reasons, failed_count=None):
+    """A PipelineEngine whose run() reports one failed file per reason.
+
+    `failed_count` overrides the count independently of the details, which is
+    how a real cancellation-heavy batch looks: `failed_files` counts things
+    `failed_details` classifies as non-archivable, so count and archivable
+    length are genuinely allowed to diverge.
+    """
+    class _E(_FakePipelineEngine):
+        async def run(self, files):
+            stats = await super().run(files)
+            stats.failed_details = [
+                {"path": f"gone-{i}.bin", "reason": reason, "size_bytes": 100 + i}
+                for i, reason in enumerate(reasons)
+            ]
+            stats.failed_files = (
+                len(reasons) if failed_count is None else failed_count
+            )
+            stats.uploaded_files = max(0, len(files) - stats.failed_files)
+            return stats
+
+    return _E
+
+
+def _run_activity_on_attempt(attempt, coro_fn, *args, **kwargs):
+    """Same as `_run_activity` but with `activity.info().attempt` pinned.
+
+    The attempt number is the only way the activity can know whether it still
+    has retries left, and every "not yet / now" assertion below turns on it.
+    """
+    import dataclasses
+
+    from temporalio.testing import ActivityEnvironment
+
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, attempt=attempt)
+
+    async def main():
+        return await env.run(coro_fn, *args, **kwargs)
+
+    return asyncio.run(main())
+
+
+def test_retry_ceiling_matches_the_workflow_policy():
+    """Drift guard for the pair that has to agree: the RetryPolicy decides how
+    many attempts a batch gets, and the activity decides "am I on my last one"
+    from POOL_BATCH_MAX_ATTEMPTS. If they diverge the tolerance either fires an
+    attempt early (throwing away the retry that might land on a healthy
+    worker) or never fires at all — and neither shows up as an error anywhere."""
+    from dlm.temporal.models import POOL_BATCH_MAX_ATTEMPTS
+    from dlm.temporal.workflows import POOL_BATCH_RETRY
+
+    assert POOL_BATCH_RETRY.maximum_attempts == POOL_BATCH_MAX_ATTEMPTS
+
+
+def test_tolerate_missing_defaults_to_false(pool_batch_env, monkeypatch):
+    """The default must be the old all-or-nothing behaviour: only the
+    coordinator's final re-dispatch round opts in (T4), so a batch invoked the
+    way every other caller invokes it — three positional args — still fails on
+    one missing file, on any attempt."""
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_UPSTREAM_EMPTY))
+
+    with pytest.raises(RuntimeError, match="tolerate_missing=False"):
+        _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS,
+                                 activities.run_pool_batch, _task_input(), 1, "k")
+
+
+@pytest.mark.parametrize("attempt", [1, POOL_BATCH_MAX_ATTEMPTS - 1])
+def test_a_non_final_attempt_is_never_tolerated(pool_batch_env, monkeypatch, attempt):
+    """With retries left, fail — the retry is the cheapest fix available. Most
+    "missing" files are a flaky mirror or a poisoned worker, and this round is
+    what cures them; forgiving early converts a recoverable file into a
+    permanent hole in the dataset."""
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_UPSTREAM_EMPTY))
+
+    with pytest.raises(RuntimeError,
+                       match=f"attempt={attempt}/{POOL_BATCH_MAX_ATTEMPTS}"):
+        _run_activity_on_attempt(attempt, activities.run_pool_batch,
+                                 _task_input(), 1, "k", None, True)
+
+
+def test_final_attempt_within_the_ceiling_is_forgiven(pool_batch_env, monkeypatch):
+    """The whole point of T3: last attempt, two source-missing files, archive
+    landed — the batch is judged complete and reports `done`, so the task
+    finishes instead of dying at 99%."""
+    calls = pool_batch_env
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_UPSTREAM_EMPTY, FAIL_ACCESS_DENIED))
+
+    result = _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS,
+                                      activities.run_pool_batch,
+                                      _task_input(), 4, "k", None, True)
+
+    assert result["ignored"] is False
+    done = [b for u, b in calls
+            if u.endswith("/api/shards/status") and b.get("status") == "done"]
+    assert len(done) == 1
+
+
+def test_the_forgiven_batch_archives_exactly_what_it_gave_up_on(pool_batch_env, monkeypatch):
+    """`missing_files` is the only record that survives the run, so its body is
+    load-bearing: identity, reason and size per file, plus which task and which
+    batch/worker produced them (that is how an operator tells "the source lost
+    it" from "this one worker cannot reach it")."""
+    calls = pool_batch_env
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_UPSTREAM_EMPTY, FAIL_SIZE_MISMATCH))
+
+    _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS, activities.run_pool_batch,
+                             _task_input(task_id="t-arch"), 6, "k", None, True)
+
+    archive = _calls_by_path(calls, "/api/missing-files")
+    assert len(archive) == 1
+    _, body = archive[0]
+    assert body["task_id"] == "t-arch"
+    assert body["batch_index"] == 6
+    assert body["server"] == "w9"
+    assert body["files"] == [
+        {"path": "gone-0.bin", "reason": FAIL_UPSTREAM_EMPTY, "size_bytes": 100},
+        {"path": "gone-1.bin", "reason": FAIL_SIZE_MISMATCH, "size_bytes": 101},
+    ]
+
+
+def test_the_archive_is_written_even_when_the_batch_is_not_forgiven(pool_batch_env, monkeypatch):
+    """Archiving is deliberately not gated on the tolerance decision. The two
+    cases that most need evidence are exactly the ones that keep failing — a
+    first-attempt loss, and a batch over the ceiling that takes the task down
+    with it. "Which files are missing" is the only useful thing to know about a
+    task that ends `failed`."""
+    calls = pool_batch_env
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_DOWNLOAD_RETRIES_EXHAUSTED))
+
+    with pytest.raises(RuntimeError):
+        _run_activity_on_attempt(1, activities.run_pool_batch,
+                                 _task_input(), 2, "k", None, True)
+
+    archive = _calls_by_path(calls, "/api/missing-files")
+    assert len(archive) == 1
+    assert [f["path"] for f in archive[0][1]["files"]] == ["gone-0.bin"]
+
+
+def test_over_the_ceiling_still_raises(pool_batch_env, monkeypatch):
+    """The tolerance must not degenerate into "batches never fail". A systemic
+    fault — credentials rotated, mirror down, disk gone — takes out far more
+    than POOL_BATCH_FAIL_MAX files, and that must stay loud."""
+    calls = pool_batch_env
+    over = POOL_BATCH_FAIL_MAX + 1
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(*[FAIL_UPSTREAM_EMPTY] * over))
+
+    with pytest.raises(RuntimeError, match=f"ceiling={POOL_BATCH_FAIL_MAX}"):
+        _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS, activities.run_pool_batch,
+                                 _task_input(), 3, "k", None, True)
+
+    # …and it still recorded all of them before deciding.
+    assert len(_calls_by_path(calls, "/api/missing-files")[0][1]["files"]) == over
+
+
+def test_the_ceiling_is_read_from_the_module_not_hardcoded(pool_batch_env, monkeypatch):
+    """A batch that is over the shipped ceiling is forgiven once the ceiling is
+    raised — i.e. the comparison really consults POOL_BATCH_FAIL_MAX, which is
+    what makes the env var below reach the decision."""
+    over = POOL_BATCH_FAIL_MAX + 1
+    monkeypatch.setattr(activities, "POOL_BATCH_FAIL_MAX", over)
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(*[FAIL_UPSTREAM_EMPTY] * over))
+
+    result = _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS,
+                                      activities.run_pool_batch,
+                                      _task_input(), 3, "k", None, True)
+    assert result["ignored"] is False
+
+
+def _load_models_module(monkeypatch, name, **env):
+    """Import dlm/temporal/models.py as a fresh, throwaway module under `env`.
+
+    Deliberately not `importlib.reload(models)`: that would rebind the
+    dataclasses every other module already holds references to, so a
+    surviving reference (PipelineStats in this very file) would stop being
+    the class the activity type-checks against.
+    """
+    import importlib.util
+    import sys
+
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    path = Path(activities.__file__).parent / "models.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    # @dataclass resolves annotations through sys.modules[cls.__module__];
+    # an unregistered module makes that lookup return None. monkeypatch
+    # unregisters it again afterwards, so the real `dlm.temporal.models`
+    # every other test holds stays the only registered one.
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_ceiling_is_env_adjustable(monkeypatch):
+    """Operators can widen or disable the tolerance without a code deploy —
+    0 restores the pre-T3 all-or-nothing behaviour, which is the documented
+    rollback if forgiveness turns out to hide something."""
+    assert _load_models_module(monkeypatch, "_models_wide",
+                               DLM_POOL_BATCH_FAIL_MAX="42").POOL_BATCH_FAIL_MAX == 42
+    assert _load_models_module(monkeypatch, "_models_off",
+                               DLM_POOL_BATCH_FAIL_MAX="0").POOL_BATCH_FAIL_MAX == 0
+
+
+def test_a_nonsense_ceiling_fails_at_import(monkeypatch):
+    """Read at import so a typo surfaces in the worker's startup log, not
+    hours into a batch — and a negative value is a config error, not a
+    silently-never-tolerate setting."""
+    with pytest.raises(ValueError):
+        _load_models_module(monkeypatch, "_models_bad",
+                            DLM_POOL_BATCH_FAIL_MAX="-1")
+    with pytest.raises(ValueError):
+        _load_models_module(monkeypatch, "_models_typo",
+                            DLM_POOL_BATCH_FAIL_MAX="five")
+
+
+@pytest.mark.parametrize("reply", [
+    pytest.param(_FakeResponse(None, status_ok=False), id="http-error"),
+    pytest.param(_FakeResponse({"error": "no such task"}), id="body-error"),
+    pytest.param(_FakeResponse({"ignored": True}), id="ignored"),
+])
+def test_an_unrecorded_loss_is_never_forgiven(pool_batch_env, monkeypatch, reply):
+    """If the archive did not land, forgiving the batch would drop files with
+    no record anywhere — strictly worse than today, where the batch at least
+    fails loudly. So a coordinator hiccup costs us the forgiveness, not the
+    record. `ignored` counts as not-landed: an operator stopped the task, so
+    S1 threw the report away."""
+    calls = pool_batch_env
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url, json))
+        return reply if url.endswith("/api/missing-files") else _FakeResponse({"ok": True})
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_UPSTREAM_EMPTY))
+
+    with pytest.raises(RuntimeError, match="archived=False"):
+        _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS, activities.run_pool_batch,
+                                 _task_input(), 1, "k", None, True)
+
+
+def test_failures_that_are_not_about_the_file_are_never_forgiven(pool_batch_env, monkeypatch):
+    """A cancelled upload counts toward `failed_files` (pipeline.py must not
+    report the batch clean) but says an operator paused the task, not that the
+    source lost anything — so it is not archivable, and a batch made of those
+    cannot be forgiven. Nothing is posted either: there is nothing missing to
+    record."""
+    calls = pool_batch_env
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_UPLOAD_CANCELLED, FAIL_STAGED_FILE_MISSING))
+
+    with pytest.raises(RuntimeError, match="archivable=0/2"):
+        _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS, activities.run_pool_batch,
+                                 _task_input(), 1, "k", None, True)
+
+    assert _calls_by_path(calls, "/api/missing-files") == []
+
+
+def test_a_partly_archivable_batch_is_not_forgiven_but_is_partly_archived(pool_batch_env, monkeypatch):
+    """Mixed batch: forgiveness needs EVERY failure accounted for, so this one
+    raises — but the one genuinely-missing file is still recorded, so the next
+    attempt (or the operator) knows about it."""
+    calls = pool_batch_env
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_UPSTREAM_EMPTY, FAIL_UPLOAD_CANCELLED))
+
+    with pytest.raises(RuntimeError, match="archivable=1/2"):
+        _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS, activities.run_pool_batch,
+                                 _task_input(), 1, "k", None, True)
+
+    archive = _calls_by_path(calls, "/api/missing-files")
+    assert [f["reason"] for f in archive[0][1]["files"]] == [FAIL_UPSTREAM_EMPTY]
+
+
+def test_an_uncounted_loss_is_never_forgiven(pool_batch_env, monkeypatch):
+    """`failed_details` is required to account for every failed file
+    (PipelineStats' documented invariant). If it ever does not — a new failure
+    path that bumps the counter without recording the file — the batch must
+    fail, not be forgiven on the strength of an incomplete archive."""
+    monkeypatch.setattr("dlm.temporal.pipeline.PipelineEngine",
+                        _engine_failing_with(FAIL_UPSTREAM_EMPTY, failed_count=3))
+
+    with pytest.raises(RuntimeError, match="archivable=1/3"):
+        _run_activity_on_attempt(POOL_BATCH_MAX_ATTEMPTS, activities.run_pool_batch,
+                                 _task_input(), 1, "k", None, True)

@@ -12,7 +12,7 @@ from temporalio.workflow import ActivityCancellationType
 
 with workflow.unsafe.imports_passed_through():
     from ..core.naming import shard_task_name
-    from .models import TaskInput, TaskResult, ShardInput, ShardResult
+    from .models import POOL_BATCH_MAX_ATTEMPTS, TaskInput, TaskResult, ShardInput, ShardResult
 
 
 BATCH_SIZE = 500  # files per pipeline batch (Temporal checkpoint boundary)
@@ -910,7 +910,10 @@ POOL_BATCH_RETRY = RetryPolicy(
     initial_interval=timedelta(minutes=5),
     backoff_coefficient=2.0,
     maximum_interval=timedelta(minutes=30),
-    maximum_attempts=3,
+    # Shared with run_pool_batch's "is this my last chance" test — see
+    # models.POOL_BATCH_MAX_ATTEMPTS for why a second literal here would be a
+    # silent, asymmetric bug rather than a duplicated constant.
+    maximum_attempts=POOL_BATCH_MAX_ATTEMPTS,
     non_retryable_error_types=NON_RETRYABLE_ERRORS + [
         "BatchLimitExceededError",
         "PoolBatchMismatch",

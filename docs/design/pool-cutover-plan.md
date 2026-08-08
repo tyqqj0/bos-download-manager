@@ -238,6 +238,42 @@ RoboDojo 的 depth 文件正是这个形状。**结论：`missing_files` 为空�
 `tolerate_missing=True` 但非最后一次尝试 → 仍然 raise；最后一次尝试且 ≤5 → 放行且上报；
 最后一次尝试但 >5 → raise；阈值可通过环境变量调整。
 
+#### 实施记录（2026-08-08，已完成）
+
+`dlm/temporal/models.py`（常量）+ `workflows.py`（`POOL_BATCH_RETRY` 读同一常量）+
+`activities.py`（`_report_missing_files` + `tolerate_missing` + 先入账后判定）；
+测试追加在 `tests/test_run_pool_batch.py` 尾部（+17 个，全套 529 → 546 passed）。
+测试写在既有文件里而不是新建一个，是因为容忍逻辑要用它的整套 harness
+（`pool_batch_env` fixture、假 `PipelineEngine`、`ActivityEnvironment` 驱动），
+跨测试文件 import fixture 能跑但很脆。
+
+**偏离 1：容忍条件从 3 个加到 5 个**（`recorded` 与 `fully_archivable`）。
+计划稿的 `tolerable` 只看 `tolerate_missing and final_attempt and <= 上限`，
+留了一个洞：`failed_files` 可以**整批由取消构成**（白名单一节自己论证过这点），
+那种批次的 `archivable` 是空的、`_report_missing_files` 什么都不发，
+于是"放行 + 无任何记录"—— 比今天的响亮失败更差，也直接违背 R4 修订版
+"一律入库、一律可查"。所以：
+- `recorded`：入账 POST 没落地（HTTP 失败 / 返回 `error` / 返回 `ignored`）就不放行。
+  代价是协调端抽风时我们失去"宽恕"，而不是失去"记录"。
+- `fully_archivable`：`len(archivable) == failed_files`，即每一个失败都是刚写进档案的
+  文件级事实。附带覆盖了另一种漂移 —— 将来有新的失败路径只加计数不写
+  `failed_details`（违反 `PipelineStats` 的不变式），批次会失败而不是被一份
+  不完整的档案糊过去。
+
+两条都与计划稿的"宁可严"一致，方向上只会更严，不会放过更多。
+
+**偏离 2：`POOL_BATCH_FAIL_MAX` 的环境变量测试用独立加载而非 `importlib.reload`**。
+reload 会重建 `PipelineStats` 等 dataclass，持有旧引用的模块（包括这个测试文件本身）
+就不再和 activity 类型检查的是同一个类。改为用 `spec_from_file_location` 把
+`models.py` 作为一次性模块加载（必须先 `sys.modules` 注册，否则 `@dataclass`
+解析注解时拿到 `None`）。顺带把"负值 / 拼错的值在 import 期就 ValueError"也钉住了。
+
+**验证方式**：五个条件逐个做了变异测试（删掉 `final_attempt` → 3 红；删掉 `recorded`
+→ 3 红；删掉 `fully_archivable` → 3 红；把上限改成 `10**9` → 1 红），
+确认每个条件都真有测试挡着；`activities.py` 变异后已按字节还原。
+另加一个漂移守卫断言 `POOL_BATCH_RETRY.maximum_attempts == POOL_BATCH_MAX_ATTEMPTS`
+—— 这正是本节担心的"两处各写一个 3"。
+
 ### T4 —— workflow 侧接线 + 诚实收尾（R4 / A6）
 
 **文件**: `dlm/temporal/workflows.py`（`PoolDownloadWorkflow`）、`dlm/temporal/activities.py`（新 activity）
