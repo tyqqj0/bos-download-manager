@@ -636,10 +636,10 @@ pool 的批次归属与释放由 `release_pool_batches` 负责，那是模式内
 |---|---|---|
 | 0.1 | 本地跑全量测试 | 当前基线 453 passed；replay 27 passed |
 | 0.2 | 推送 `feat/architecture-upgrade` 到 origin | 需要你点头 —— 这是唯一的对外动作 |
-| 0.3 | S1 `git fetch` → checkout `feat/architecture-upgrade` → 对齐 `origin` | S1 `git rev-parse --short HEAD` == 本地 |
-| 0.4 | S1 上把 `.env.bak-*` 移到 `/root/env-backups/` | `ls $REPO_DIR/.env.bak*` 为空 |
+| 0.3 | S1 `git fetch` → checkout `feat/architecture-upgrade` → 对齐 `origin` | S1 `git rev-parse --short HEAD` == 本地。2026-08-08 实测起点：S1 在 **`hotfix/pipeline-integrity` @ `1c5814a`** —— 是换分支，不是 fast-forward |
+| 0.4 | S1 `.env.bak-*` 移到 `/root/env-backups/` | `ls $REPO_DIR/.env.bak*` 为空。实测当前有 1 个：`.env.bak-20260807-173836`（untracked，是 Key 轮换留下的；里面是旧 Key，别留在 rsync 能碰到的目录） |
 | 0.5 | 记录切换前基线 | 两个前缀的 BOS 字节/对象数（用 `calendar.timegm`）；`downloading` 行的 `dispatch_mode` 快照；17 台 md5 manifest |
-| 0.6 | **在 S1 上建一次性 pytest venv** | `deploy-workers.sh:88-103` 的 G7 门槛在 `python3 -m pytest --version` 失败时**硬中止部署**，而 S1 没装 pytest（CLAUDE.md 明确记着"两边都没有"）。按 CLAUDE.md 的配方建 `/tmp/dlm-test-venv` 并确认 `pytest --version` 在 G7 实际调用的解释器下可用，否则 Phase 2 第一条命令就会失败 |
+| 0.6 | **在 S1 上建一次性 pytest venv** | `deploy-workers.sh:88-103` 的 G7 门槛在 `python3 -m pytest --version` 失败时**硬中止部署**，而 S1 没装 pytest（2026-08-08 实测：`/usr/bin/python3` = 3.10.12，`No module named pytest`，且 `/tmp/dlm-test-venv` 不存在）。**注意 CLAUDE.md 的配方写的是 `python3.12`，S1 上没有** —— 只有 `/usr/bin/python3.10`，所以 venv 必须用 3.10 建（`pyproject.toml` 的 `requires-python = ">=3.10"`，且全仓无 3.11+ 语法：`datetime.UTC`/`Self`/`except*`/`TaskGroup`/`StrEnum`/`tomllib` 均未出现，已 grep 确认）。G7 用的是**环境里的 `python3`**，不是固定路径，所以调用方式是 `PATH=/tmp/dlm-test-venv/bin:$PATH bash scripts/deploy-workers.sh`。跑在 S1 上对生产库是安全的：`tests/conftest.py` 的 session 级 autouse `_never_touch_the_production_db` 把 `snapshot.DB_PATH` 重定向到 tmp 并**断言**不含 `/data/dlm.db`，另一个 autouse guard 把告警日志重定向到 tmp。磁盘要留意：S1 `/` 81% 已用、只剩 7.6G，且 `/data` 与 `/` **同一个 `/dev/vda2`**（不是独立盘） |
 | 0.7 | **临时 mask web watchdog** | `dlm-web-watchdog.timer` 每 30s 探 `/api/dashboard`，wedged 就重启 web。Phase 3.1 手动重启 web 与它撞车会造成两次重启叠加、`init_db()` 迁移期间的窗口更难判读。`systemctl mask dlm-web-watchdog.timer`，Phase 3 完成后立刻 unmask（写进收尾清单，别忘） |
 
 #### Phase 0 前置实测（2026-08-08，只读，已完成）
