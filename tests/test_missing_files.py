@@ -1045,18 +1045,40 @@ def test_a_stopped_but_unfinalized_task_does_not_alert(status, db):
     assert _of_type(out, "missing_files_many") == []
 
 
-def test_the_gate_uses_the_shared_finalized_status_set(db):
-    """Pins the import, not a copy: a local tuple here would drift from
-    fleet.py the first time someone adds a status."""
-    import dlm.web.alerts as alerts_mod
-    from dlm.web.fleet import FINALIZED_STATUSES
+def test_the_gate_uses_the_shared_finalized_status_set(db, monkeypatch):
+    """Pins the import behaviourally: a local copy of the tuple in alerts.py
+    would not see this change, so the alert would stay silent.
 
-    assert FINALIZED_STATUSES == ("done", "failed")
-    src = (alerts_mod.__file__ or "")
-    with open(src) as fh:
-        body = fh.read()
-    assert "FINALIZED_STATUSES" in body
-    assert 'status") not in ("done", "failed")' not in body
+    An earlier version of this test read alerts.py's source and asserted the
+    string "FINALIZED_STATUSES" appeared in it. That passes for a module that
+    imports the name and never uses it, and it passes for any differently
+    formatted hardcoded copy — so it pinned spelling, not behaviour. The
+    function-level `from .fleet import FINALIZED_STATUSES` in alerts.py
+    resolves at call time, which is what makes the real check possible.
+    """
+    import dlm.web.fleet as fleet
+
+    assert fleet.FINALIZED_STATUSES == ("done", "failed")
+
+    t = _finished(db, status="archived", count=5, limit=10)
+    assert _of_type(_alerts([t]), "missing_files") == []
+
+    monkeypatch.setattr(fleet, "FINALIZED_STATUSES", ("done", "failed", "archived"))
+
+    assert _of_type(_alerts([t]), "missing_files") != []
+
+
+def test_the_gate_would_go_silent_if_the_set_shrank(db, monkeypatch):
+    """The other direction, so the test above cannot pass by alerting on
+    everything regardless of status."""
+    import dlm.web.fleet as fleet
+
+    t = _finished(db, status="done", count=5, limit=10)
+    assert _of_type(_alerts([t]), "missing_files") != []
+
+    monkeypatch.setattr(fleet, "FINALIZED_STATUSES", ("failed",))
+
+    assert _of_type(_alerts([t]), "missing_files") == []
 
 
 def test_an_old_loss_stops_warning_but_stays_on_the_record(db):
