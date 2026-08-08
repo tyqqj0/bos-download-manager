@@ -156,7 +156,7 @@ def test_dead_download_process_is_flagged_even_while_idle():
 # costs exactly what the alert was built to buy.
 
 from dlm.queue import snapshot  # noqa: E402
-from dlm.web.health_verifier import EVENT_DELIVERY_WINDOW, _as_epoch  # noqa: E402
+from dlm.web.health_verifier import EVENT_SILENCE_TOLERANCE, _as_epoch  # noqa: E402
 
 
 def _live_task(task_id="t-live"):
@@ -169,20 +169,15 @@ def _live_task(task_id="t-live"):
     return task_id
 
 
-def _batch(shard_id, task_id, server, started_ago, status="running", done_files=3):
+def _batch(shard_id, task_id, server, started_ago, status="running"):
     """A pool batch row. started_at is ISO TEXT in this table — the column next
-    to it, updated_at, is an epoch float, so the type is worth pinning.
-
-    done_files defaults above zero: these tests are about the silence of a
-    worker that HAS finished files and so should have emitted events. A batch
-    with done_files=0 has emitted nothing, which is its own case below.
-    """
+    to it, updated_at, is an epoch float, so the type is worth pinning."""
     from datetime import datetime, timezone
     started = datetime.fromtimestamp(
         time.time() - started_ago, tz=timezone.utc).isoformat(timespec="seconds")
     snapshot.upsert_shard({
         "id": shard_id, "task_id": task_id, "shard_index": 0, "server": server,
-        "status": status, "total_files": 10, "done_files": done_files,
+        "status": status, "total_files": 10, "done_files": 0,
         "started_at": started, "updated_at": time.time(),
     })
 
@@ -226,7 +221,7 @@ def test_long_running_silent_worker_is_still_reported(dlm_db):
     """The grace must not become an amnesty."""
     _events_table()
     task_id = _live_task()
-    _batch("s-old", task_id, "w1", started_ago=EVENT_DELIVERY_WINDOW * 3)
+    _batch("s-old", task_id, "w1", started_ago=EVENT_SILENCE_TOLERANCE * 3)
 
     anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
 
@@ -243,7 +238,8 @@ def test_a_worker_cycling_short_batches_gets_no_permanent_excuse(dlm_db):
     """
     _events_table()
     task_id = _live_task()
-    _batch("s-done-1", task_id, "w1", started_ago=3600, status="done")
+    _batch("s-done-1", task_id, "w1",
+           started_ago=EVENT_SILENCE_TOLERANCE * 2, status="done")
     _batch("s-now", task_id, "w1", started_ago=30)
 
     anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
@@ -254,7 +250,7 @@ def test_a_worker_cycling_short_batches_gets_no_permanent_excuse(dlm_db):
 def test_delivered_events_clear_it_regardless_of_age(dlm_db):
     _events_table()
     task_id = _live_task()
-    _batch("s-old2", task_id, "w1", started_ago=EVENT_DELIVERY_WINDOW * 3)
+    _batch("s-old2", task_id, "w1", started_ago=EVENT_SILENCE_TOLERANCE * 3)
     conn = snapshot._conn()
     conn.execute(
         "INSERT INTO events (task_id, server_key, event_type, data, timestamp) "
@@ -294,65 +290,37 @@ def test_started_at_accepts_both_column_types():
     assert _as_epoch("not a date") is None
 
 
-# ── Layer 2: activity is not completion ──────────────────────────────────
-#
-# The counter this alert triggers on, files_last_5min, is `find -mmin -5`: it
-# counts files whose mtime moved, i.e. files being WRITTEN. The events it looks
-# for are emitted when a file FINISHES. On 2026-08-09 w5 was flagged while its
-# batch read done_files=0 of 25, done_bytes 8.7/34.3 GB at 176 MB/s — four
-# ~1.4 GB files in flight, none finished for 16 minutes — and its last events
-# matched its previous batch's last completion to the second.
+def test_a_long_gap_between_finished_files_is_not_broken_delivery(dlm_db):
+    """The w5 case, and why the tolerance is hours rather than minutes.
 
-def test_worker_that_has_finished_no_file_in_its_batch_is_not_reported(dlm_db):
-    """The w5 case: long past the tenure grace, busy, and correctly silent."""
+    The trigger (files_last_5min = `find -mmin -5`) counts files being WRITTEN;
+    the events counted against it are emitted only when a file FINISHES. w5 was
+    flagged on 2026-08-09 at done_bytes 8.7/34.3 GB and 176 MB/s with four
+    ~1.4 GB files in flight — nothing had finished for 16 minutes, its buffer
+    flushes every 5s, and its last events matched its previous batch's last
+    completion to the second. Nothing was late; there was nothing to send.
+
+    shards.done_files cannot narrow this: mid-run it holds only skipped_files
+    (activities.py:1406), so a "did a file complete recently" gate reads 0 on
+    every running batch and silently disables the alert fleet-wide. The
+    tolerance is the honest instrument instead.
+    """
     _events_table()
     task_id = _live_task()
-    _batch("s-bigfiles", task_id, "w1",
-           started_ago=EVENT_DELIVERY_WINDOW * 3, done_files=0)
+    _batch("s-bigfiles", task_id, "w5", started_ago=1800)  # 30 min in, silent
 
-    anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
+    anomalies = correlate_layers([_busy("w5")], [snapshot.get_task(task_id)], [])
 
     assert "layer2_delivery_broken" not in _types(anomalies), anomalies
 
 
-def test_completions_with_no_events_is_still_reported(dlm_db):
-    """The gate must not swallow the case the alert exists for: files finished,
-    so events were emitted, and none of them arrived."""
+def test_silence_past_the_tolerance_is_still_reported(dlm_db):
+    """The tolerance must not become an amnesty: over two hours even a very
+    large file completes, so total silence is evidence of a dead channel."""
     _events_table()
     task_id = _live_task()
-    _batch("s-completed", task_id, "w1",
-           started_ago=EVENT_DELIVERY_WINDOW * 3, done_files=7)
+    _batch("s-mute", task_id, "w5", started_ago=EVENT_SILENCE_TOLERANCE + 600)
 
-    anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
-
-    assert "layer2_delivery_broken" in _types(anomalies), anomalies
-
-
-def test_a_finished_batchs_completions_do_not_excuse_the_current_one(dlm_db):
-    """done_files stays set on a done row forever. Counting it would make every
-    later batch look like it had finished files, resurrecting the false
-    positive — the mirror of why the tenure grace reads the oldest row."""
-    _events_table()
-    task_id = _live_task()
-    _batch("s-fin", task_id, "w1", started_ago=7200, status="done", done_files=25)
-    _batch("s-cur", task_id, "w1",
-           started_ago=EVENT_DELIVERY_WINDOW * 3, done_files=0)
-
-    anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
-
-    assert "layer2_delivery_broken" not in _types(anomalies), anomalies
-
-
-def test_completions_across_two_concurrent_batches_are_summed(dlm_db):
-    """A pool worker can hold more than one batch; a completion in either one
-    means events were owed."""
-    _events_table()
-    task_id = _live_task()
-    _batch("s-a", task_id, "w1",
-           started_ago=EVENT_DELIVERY_WINDOW * 3, done_files=0)
-    _batch("s-b", task_id, "w1",
-           started_ago=EVENT_DELIVERY_WINDOW * 3, done_files=2)
-
-    anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
+    anomalies = correlate_layers([_busy("w5")], [snapshot.get_task(task_id)], [])
 
     assert "layer2_delivery_broken" in _types(anomalies), anomalies

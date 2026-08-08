@@ -47,9 +47,27 @@ SIDECAR_FIELDS = (
 EVENT_DELIVERY_FLOOR = 5
 
 # How far back Layer 2 events are looked for, and equally the grace a worker
-# gets before its silence is called broken. A worker cannot be expected to have
-# delivered an event covering time it was not yet working.
-EVENT_DELIVERY_WINDOW = 600
+# gets before its silence is called broken.
+#
+# Two hours, not ten minutes, and the reason is that the trigger and the
+# evidence measure different things. The trigger is files_last_5min, which is
+# `find -mmin -5` — files whose mtime moved, i.e. files being WRITTEN. The
+# evidence is events, which are only emitted when a file FINISHES. On TB-scale
+# datasets those diverge for a long time: on 2026-08-09 w5 was flagged with its
+# batch at done_bytes 8.7/34.3 GB, 176 MB/s, four ~1.4 GB files in flight and
+# none finished for 16 minutes, its last events matching its previous batch's
+# last completion to the second. The buffer flushes every 5s, so nothing was
+# late — there was nothing to send.
+#
+# SQLite cannot narrow this: shards.done_files is only `skipped_files` mid-run
+# (activities.py:1406 says so) and the true count lands at batch end, so a
+# "did a file complete recently" gate reads 0 on every running batch and would
+# switch this alert off fleet-wide. A long tolerance is cruder but honest —
+# over two hours even a very large file completes, so total silence is real.
+# The cost is that a channel dying for under two hours goes unreported; the
+# direct signal for that is event_buffer_pending, which reads -1 on all 16
+# workers because nothing writes /data/staging/.event_buffer_status yet.
+EVENT_SILENCE_TOLERANCE = 7200
 
 
 async def verify_all_workers() -> dict:
@@ -159,41 +177,6 @@ def _working_since(conn) -> dict[str, float]:
     return since
 
 
-def _completed_files_on_running_rows(conn) -> dict[str, int]:
-    """{server: files completed so far in the work rows it is running now}
-
-    The events this module looks for (`file_downloaded` / `file_uploaded`) are
-    emitted when a file FINISHES. `files_last_5min` is `find -mmin -5`, which
-    counts files whose mtime moved — i.e. files being written. On TB-scale
-    datasets those are different things for a long time: on 2026-08-09 w5 was
-    flagged while its batch read done_files=0 of 25, done_bytes 8.7/34.3 GB at
-    176 MB/s — four ~1.4 GB files in flight, none finished for 16 minutes, and
-    its last events lined up exactly with its previous batch's last completion.
-    Silence there is not a broken channel; it is the truth.
-
-    So a zero here means "this worker has had nothing to report", and its
-    silence carries no information. Only running rows count: a finished row's
-    done_files stays set forever and would resurrect the false positive on
-    every later batch.
-
-    A server absent from the result is NOT the same as one mapped to 0. Absent
-    means it holds no running row, so whether a file should have completed is
-    unknown, and the caller must fall back to judging silence on its own — a
-    gate that read "unknown" as "nothing to report" would switch this alert
-    off fleet-wide the day done_files stopped being written.
-    """
-    completed: dict[str, int] = {}
-    rows = conn.execute(
-        "SELECT s.server, s.done_files FROM shards s "
-        "JOIN tasks t ON t.id = s.task_id "
-        "WHERE t.status = 'downloading' AND s.status = 'running' "
-        "AND s.server IS NOT NULL"
-    ).fetchall()
-    for server, done_files in rows:
-        completed[server] = completed.get(server, 0) + int(done_files or 0)
-    return completed
-
-
 def correlate_layers(
     workers: list[dict],
     tasks: list[dict],
@@ -207,14 +190,11 @@ def correlate_layers(
     held = work_by_server(tasks, running_shards)
     try:
         working_since = _working_since(_conn())
-        completed_now = _completed_files_on_running_rows(_conn())
     except Exception:
-        # No shards table yet, or a schema older than started_at/done_files.
-        # Both fall back to the pre-existing behaviour — no grace, gate off —
-        # rather than to "nothing completed anywhere", which would silently
-        # switch the alert off fleet-wide on a schema we failed to read.
+        # No shards table yet, or a schema older than started_at. Empty means
+        # "no grace for anyone", i.e. the pre-existing behaviour — not a
+        # fleet-wide amnesty on a schema we failed to read.
         working_since = {}
-        completed_now = None
     anomalies: list[dict] = []
 
     for w in workers:
@@ -276,7 +256,7 @@ def correlate_layers(
                 recent_events = _conn().execute(
                     "SELECT COUNT(*) FROM events "
                     "WHERE server_key = ? AND timestamp > ?",
-                    (server_key, now - EVENT_DELIVERY_WINDOW),
+                    (server_key, now - EVENT_SILENCE_TOLERANCE),
                 ).fetchone()[0]
             except Exception:
                 recent_events = -1  # events table may not exist yet
@@ -291,27 +271,15 @@ def correlate_layers(
             # were in fact arriving seconds later. An alert that fires on
             # healthy routine is how a real one gets ignored.
             began = working_since.get(server_key)
-            too_new = began is not None and (now - began) < EVENT_DELIVERY_WINDOW
+            too_new = began is not None and (now - began) < EVENT_SILENCE_TOLERANCE
 
-            # …and a worker that has not finished a single file in the batch it
-            # is running now has emitted nothing to lose. `files_last_5min`
-            # counts files being written; the events counted above are only
-            # emitted when a file completes. See
-            # _completed_files_on_running_rows for the w5 case where those
-            # differed by 16 minutes of perfectly healthy 176 MB/s downloading.
-            nothing_to_report = (
-                completed_now is not None
-                and server_key in completed_now
-                and completed_now[server_key] == 0
-            )
-
-            if recent_events == 0 and not too_new and not nothing_to_report:
+            if recent_events == 0 and not too_new:
                 anomalies.append({
                     "type": "layer2_delivery_broken",
                     "server": server_key,
                     "message": f"Worker {server_key} has file activity (Layer 1) "
                                f"but no events received (Layer 2) in "
-                               f"{EVENT_DELIVERY_WINDOW // 60} min",
+                               f"{EVENT_SILENCE_TOLERANCE // 60} min",
                 })
 
     return anomalies
