@@ -7,7 +7,7 @@ Multi-server dataset download manager. Coordinates 16 worker nodes downloading d
 - **Repo**: https://github.com/tyqqj0/bos-download-manager.git
 - **Web UI**: http://154.85.43.52:8080
 - **State**: SQLite on S1 (`dlm/queue/snapshot.py`) — the ONLY state source. Legacy BOS state.json is dead (kept only in one-shot migrate scripts).
-- **Data buckets**: `auwomo-data` (datasets, keys = `{category}/{name}/{repo_path}`), `auwomo-model` (models, keys = `{name}/{repo_path}`)
+- **Data buckets**: `auwomo-data` (datasets, keys = `{category}/{name}/{repo_path}`), `auwomo-model-open` (models, keys = `{name}/{repo_path}`)
 
 ## Architecture (Temporal, since 2026-07)
 
