@@ -46,6 +46,11 @@ SIDECAR_FIELDS = (
 # Above this many new files in 5 min, Layer 2 events should be arriving too.
 EVENT_DELIVERY_FLOOR = 5
 
+# How far back Layer 2 events are looked for, and equally the grace a worker
+# gets before its silence is called broken. A worker cannot be expected to have
+# delivered an event covering time it was not yet working.
+EVENT_DELIVERY_WINDOW = 600
+
 
 async def verify_all_workers() -> dict:
     """Correlate the layers. Runs the SQLite reads off the event-loop thread."""
@@ -110,6 +115,50 @@ def work_by_server(tasks: list[dict], running_shards: list[dict]) -> dict[str, d
     return by_server
 
 
+def _as_epoch(value) -> float | None:
+    """shards.started_at is ISO text; shards.updated_at next to it is an epoch
+    float. Accept either rather than trusting one and silently comparing a
+    string to a number."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _working_since(conn) -> dict[str, float]:
+    """{server: epoch it began the OLDEST work row it holds on a live task}
+
+    Deliberately the oldest, not the newest. Pool mode hands a worker one
+    batch at a time, so "when did its current row start" restarts the clock
+    every few minutes — which would give a worker whose event delivery is
+    permanently broken a permanent excuse. Completed rows count: they are the
+    evidence that this worker has been on this task long enough for an event
+    to have arrived.
+
+    A server missing from the result gets no grace: absent evidence that it
+    only just started, silence is judged on its own.
+    """
+    since: dict[str, float] = {}
+    rows = conn.execute(
+        "SELECT s.server, s.started_at FROM shards s "
+        "JOIN tasks t ON t.id = s.task_id "
+        "WHERE t.status = 'downloading' AND s.server IS NOT NULL "
+        "AND s.started_at IS NOT NULL"
+    ).fetchall()
+    for server, started_at in rows:
+        epoch = _as_epoch(started_at)
+        if epoch is None:
+            continue
+        if server not in since or epoch < since[server]:
+            since[server] = epoch
+    return since
+
+
 def correlate_layers(
     workers: list[dict],
     tasks: list[dict],
@@ -121,6 +170,12 @@ def correlate_layers(
 
     now = time.time() if now is None else now
     held = work_by_server(tasks, running_shards)
+    try:
+        working_since = _working_since(_conn())
+    except Exception:
+        # No shards table yet, or a schema older than started_at. Empty means
+        # "no grace for anyone", i.e. the pre-existing behaviour.
+        working_since = {}
     anomalies: list[dict] = []
 
     for w in workers:
@@ -182,17 +237,30 @@ def correlate_layers(
                 recent_events = _conn().execute(
                     "SELECT COUNT(*) FROM events "
                     "WHERE server_key = ? AND timestamp > ?",
-                    (server_key, now - 600),
+                    (server_key, now - EVENT_DELIVERY_WINDOW),
                 ).fetchone()[0]
             except Exception:
                 recent_events = -1  # events table may not exist yet
 
-            if recent_events == 0:
+            # A worker that started working inside the event window has not
+            # been silent — it has not had time to speak. Sharded mode hid
+            # this: a worker took one shard and held it for hours, so it was
+            # only ever fresh right after a deploy. Pool mode recruits a
+            # worker the moment the window widens, and on 2026-08-09 that
+            # turned every recruitment into a WARNING: w1/w2/w3/w7 were all
+            # flagged 6 minutes into their first batch while their events
+            # were in fact arriving seconds later. An alert that fires on
+            # healthy routine is how a real one gets ignored.
+            began = working_since.get(server_key)
+            too_new = began is not None and (now - began) < EVENT_DELIVERY_WINDOW
+
+            if recent_events == 0 and not too_new:
                 anomalies.append({
                     "type": "layer2_delivery_broken",
                     "server": server_key,
                     "message": f"Worker {server_key} has file activity (Layer 1) "
-                               f"but no events received (Layer 2) in 10 min",
+                               f"but no events received (Layer 2) in "
+                               f"{EVENT_DELIVERY_WINDOW // 60} min",
                 })
 
     return anomalies

@@ -141,3 +141,149 @@ def test_dead_download_process_is_flagged_even_while_idle():
     assert _types(correlate_layers(workers, [], [], now)) == {
         "process_dead_undetected"
     }
+
+
+# ── layer2_delivery_broken: silence vs. not-yet-spoken ───────────────────
+#
+# This alert had no test and, under pool mode, no accuracy. It compares "files
+# arrived in the last 5 min" against "events arrived in the last 10 min", which
+# holds for sharded mode — a worker took one shard and kept it for hours, so it
+# was only ever fresh right after a deploy. Pool mode recruits a worker the
+# instant the dispatch window widens. On 2026-08-09 molmobot's window went 1→4
+# and all four new workers were flagged 6 minutes into their first batch, while
+# a direct read of the events table showed their events arriving seconds later.
+# A warning that fires on healthy routine trains everyone to ignore it, which
+# costs exactly what the alert was built to buy.
+
+from dlm.queue import snapshot  # noqa: E402
+from dlm.web.health_verifier import EVENT_DELIVERY_WINDOW, _as_epoch  # noqa: E402
+
+
+def _live_task(task_id="t-live"):
+    snapshot.upsert_task({
+        "id": task_id, "name": "X", "repo_id": "org/r", "source": "hf",
+        "type": "dataset", "category": "other", "status": "downloading",
+        "server": None, "priority": 0, "size_gb": 1.0, "downloaded_gb": 0.0,
+        "progress_pct": 0, "speed_mbps": 0, "retry_count": 0,
+    })
+    return task_id
+
+
+def _batch(shard_id, task_id, server, started_ago, status="running"):
+    """A pool batch row. started_at is ISO TEXT in this table — the column next
+    to it, updated_at, is an epoch float, so the type is worth pinning."""
+    from datetime import datetime, timezone
+    started = datetime.fromtimestamp(
+        time.time() - started_ago, tz=timezone.utc).isoformat(timespec="seconds")
+    snapshot.upsert_shard({
+        "id": shard_id, "task_id": task_id, "shard_index": 0, "server": server,
+        "status": status, "total_files": 10, "done_files": 0,
+        "started_at": started, "updated_at": time.time(),
+    })
+
+
+def _busy(key):
+    """A worker whose Layer 1 activity is above the floor."""
+    return _worker(key, files5=50, conns=8, alive=1)
+
+
+def _events_table():
+    """The events table is created lazily by POST /api/events, so a DB no
+    worker has ever reported to does not have one — and correlate_layers then
+    reads recent_events as -1 and stays silent. These tests are about the
+    grace, not about that fallback, so they start from a table that exists."""
+    conn = snapshot._conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT,
+            server_key TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            data TEXT,
+            timestamp REAL NOT NULL,
+            created_at REAL DEFAULT (strftime('%s', 'now'))
+        )
+    """)
+    conn.commit()
+
+
+def test_freshly_recruited_worker_is_not_reported_as_broken(dlm_db):
+    _events_table()
+    task_id = _live_task()
+    _batch("s-fresh", task_id, "w1", started_ago=120)
+
+    anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
+
+    assert "layer2_delivery_broken" not in _types(anomalies), anomalies
+
+
+def test_long_running_silent_worker_is_still_reported(dlm_db):
+    """The grace must not become an amnesty."""
+    _events_table()
+    task_id = _live_task()
+    _batch("s-old", task_id, "w1", started_ago=EVENT_DELIVERY_WINDOW * 3)
+
+    anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
+
+    assert "layer2_delivery_broken" in _types(anomalies), anomalies
+
+
+def test_a_worker_cycling_short_batches_gets_no_permanent_excuse(dlm_db):
+    """Why the grace reads the OLDEST row, not the current one.
+
+    Pool hands out one batch at a time. Judging freshness by the batch a worker
+    happens to hold now would reset the clock every few minutes, so a worker
+    whose delivery is permanently broken would be permanently excused. Its
+    completed rows are the evidence that it has been here long enough.
+    """
+    _events_table()
+    task_id = _live_task()
+    _batch("s-done-1", task_id, "w1", started_ago=3600, status="done")
+    _batch("s-now", task_id, "w1", started_ago=30)
+
+    anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
+
+    assert "layer2_delivery_broken" in _types(anomalies), anomalies
+
+
+def test_delivered_events_clear_it_regardless_of_age(dlm_db):
+    _events_table()
+    task_id = _live_task()
+    _batch("s-old2", task_id, "w1", started_ago=EVENT_DELIVERY_WINDOW * 3)
+    conn = snapshot._conn()
+    conn.execute(
+        "INSERT INTO events (task_id, server_key, event_type, data, timestamp) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, "w1", "file_done", "{}", time.time() - 30))
+    conn.commit()
+
+    anomalies = correlate_layers([_busy("w1")], [snapshot.get_task(task_id)], [])
+
+    assert "layer2_delivery_broken" not in _types(anomalies), anomalies
+
+
+def test_worker_with_no_work_row_gets_no_grace(dlm_db):
+    """Absent evidence that it only just started, silence is judged as before —
+    a grace that defaults to ON would silently disable the alert fleet-wide."""
+    _events_table()
+    _live_task()
+
+    anomalies = correlate_layers([_busy("w9")], [], [])
+
+    assert "layer2_delivery_broken" in _types(anomalies), anomalies
+
+
+def test_started_at_accepts_both_column_types():
+    """shards.started_at is ISO text; sharded-era rows and updated_at are epoch
+    floats. Comparing a str to a float raises, so both must decode."""
+    from datetime import datetime, timezone
+
+    now = time.time()
+    assert abs(_as_epoch(now) - now) < 1
+
+    iso = "2026-08-09T01:52:07+00:00"
+    expected = datetime(2026, 8, 9, 1, 52, 7, tzinfo=timezone.utc).timestamp()
+    assert _as_epoch(iso) == expected
+
+    assert _as_epoch(None) is None
+    assert _as_epoch("not a date") is None
