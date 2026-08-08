@@ -288,8 +288,9 @@ env 在 exec 时读取，`dlm/core/config.py::load_config` 用的 `load_dotenv` 
 
 - 代码层：死代码清单已给出 keep/delete 决策与理由；replay 测试在清理后依然全绿
 - 运行时层：清理的 staging 目录清单与"仍在运行的分片"清单**无交集**（清理前后各记录一次）
-- 全量测试通过（**部署前基线 627 passed**，2026-08-08 于 `17a7ff6` 实测）。
-  演进：需求定稿当天 453 → T1–T7 pool 改动完成 599 → 评审第 1 轮修复 627
+- 全量测试通过（**部署前基线 671 passed**，2026-08-08 于 `b7da883` 实测）。
+  演进：需求定稿当天 453 → T1–T7 pool 改动完成 599 → 评审第 1 轮修复 627 →
+  迁移/HTTP 契约审计修复 671
 - replay 测试（`tests/test_workflow_replay.py`、`tests/test_pool_workflow_replay.py`，
   **当前 41 passed**）通过 —— 这两个文件回放 `tests/fixtures/histories/` 里录下的 7 份
   真实历史，是 R5 "清理不许破坏 replay" 的唯一证据

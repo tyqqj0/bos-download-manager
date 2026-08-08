@@ -938,3 +938,49 @@ depth 文件），该批次第 6 个坏文件就会让整批抛异常 → 两轮
 5. **测试绕过 ASGI 直接调路由函数。** 与本仓既有测试风格一致（`test_default_dispatch_mode.py`
    等同样直调），不在本次改测试基础设施。
 
+---
+
+## 11. 迁移 + HTTP 契约审计（2026-08-08）
+
+独立子代理审计了两件事：SQLite 迁移（新建库 vs 原地迁移 vs 重复运行），
+以及 worker→S1 的 HTTP 契约。**迁移一侧干净**：所有 DDL 都是
+`CREATE TABLE IF NOT EXISTS` + `try/except` 包裹的 `ALTER ADD COLUMN`，
+新建库走 CREATE 拿到同样的列，原地库走 ALTER，重复运行幂等。
+
+### 已修（`b7da883`）：S1 拒绝的写入不许看起来像成功了
+
+5 个 fire-and-forget 活动（`update_shard_status`、`report_shard_progress`、
+`report_resume_info`、`aggregate_task_from_shards`、`assign_shard_server`）
+把响应整个丢掉。要命的地方在于**这些路由是用 HTTP 200 表示拒绝的**：
+shard 行不存在（resume/reshard 已经换掉了旧 workflow 还在上报的那批行）时返回
+`{"error": ...}`，父任务已终态时返回 `{"ignored": true}`。所以 `raise_for_status()`
+和"请求有没有抛"都看不见 —— 一次丢掉的 `status -> done` 会让分片在仪表盘上
+永远停在 `running`，而 worker 日志和 workflow 历史里什么都没有。
+
+**只记日志，不抛异常。** 这几个调用在 workflow 里没带 `retry_policy`，
+继承 Temporal 的默认无限重试；在这里抛异常会把"一次静默丢失"换成
+"协调器对着一个永远不会好的拒绝无限重试"—— 那更糟。可见性是修复本身，
+判断留给运维。
+
+`report_resume_info` 是其中最要紧的一个：那一行是 A4"没有重下 BOS 已有数据"的
+证据，所以它的日志行把文件数和 GB 数一起打出来。
+`create_shards_in_db` 有返回值，继续抛 —— 但两个 key 都没有的响应体
+（代理错误页 / S1 500）不再表现为一句 `KeyError: 'shard_ids'`。
+
+44 条测试，7/7 变异被捕获（含"降级成 debug"、"改成抛异常"、"去掉
+`raise_for_status`"三个最容易被误当成改进的方向）。
+
+### 记录但不改的 2 条
+
+1. **`upload_speed_mbps` 靠懒 ALTER 加列**（`dlm/web/routes/servers.py:309`，
+   首次 `/api/events` POST 时执行），新建库的 `tasks` DDL 里没有它。
+   于是全新库在第一次收到事件之前，列结构与原地迁移的库不同。两条路径都会自愈、
+   都不崩，本次不动 —— 改 DDL 要连带处理"已有库多一次无害 ALTER"，
+   收益只是整齐。
+2. **`aggregate_task_from_shards` 对 pool 任务是确定的空操作**。pool 不建 shard 行，
+   S1 那侧 `_aggregate_task` 见到零行就直接 `{"shards": 0}` 返回 —— 
+   **不会把任务进度清零**（已读代码确认）。pool 协调器仍然调它。
+   保留而不做成条件调用：这个调用在已录制的 pool 历史里，去掉它会破坏 replay
+   而毫无收益（R5）。已在活动的 docstring 里写清，避免下一个人当成 bug 删掉。
+
+
