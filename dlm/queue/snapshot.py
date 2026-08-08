@@ -294,16 +294,24 @@ def update_task_progress(task_id: str, progress_pct: float = None,
     conn.commit()
 
 
-def complete_task(task_id: str, status: str = "done"):
-    """Mark task as completed or failed."""
+def complete_task(task_id: str, status: str = "done", phase: Optional[str] = None):
+    """Mark task as completed or failed.
+
+    `phase` defaults to clearing the column: a finished task must not keep
+    "downloading batch 12/40" on the dashboard. But a caller may pass the one
+    thing worth keeping past completion — the pool coordinator's missing-file
+    note ("3 file(s) missing, within ceiling 10 — GET ...") is written for a
+    `done` row and used to be wiped by this UPDATE, so the second tier of the
+    missing-file verdict was honest only in the alert channel (review GAP-3).
+    """
     conn = _conn()
     now = time.time()
     from datetime import datetime, timezone
     completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     conn.execute(
         "UPDATE tasks SET status = ?, completed_at = ?, updated_at = ?, "
-        "speed_mbps = 0, phase = NULL WHERE id = ?",
-        (status, completed_at, now, task_id),
+        "speed_mbps = 0, phase = ? WHERE id = ?",
+        (status, completed_at, now, phase, task_id),
     )
     conn.commit()
 

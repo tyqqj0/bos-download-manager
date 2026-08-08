@@ -265,11 +265,15 @@ def _mode(db, task_id):
     return db.get_task(task_id)["dispatch_mode"]
 
 
-def _run_backfill(module, apply: bool):
+def _run_backfill(module, apply: bool, exclude=()):
     """Drive the script the way an operator does — through argv."""
     import sys
 
-    argv = ["backfill_dispatch_mode.py"] + (["--apply"] if apply else [])
+    argv = ["backfill_dispatch_mode.py"]
+    for task_id in exclude:
+        argv += ["--exclude-task", task_id]
+    if apply:
+        argv.append("--apply")
     old = sys.argv
     sys.argv = argv
     try:
@@ -363,3 +367,105 @@ def test_the_backfill_reports_the_rows_it_moved(db, backfill, capsys):
     assert "2 row(s) to move to pool" in out
     assert "t-pending" in out and "t-failed" in out
     assert "UPDATE affected 2 row(s)" in out
+
+
+# ── --exclude-task (review GAP-2) ──────────────────────────────────────────
+#
+# The cutover plan's Phase 3 chose "backfill everything EXCEPT the two tasks
+# paused for the deploy" — their mode comes from an individual reshard, which
+# is the step sitting behind the operator approval gate. Without this flag the
+# plan's chosen option did not exist in the code, and a `--apply` run would
+# have moved both rows before that gate.
+
+
+def test_an_excluded_task_keeps_its_mode(db, backfill):
+    _seed(db, "t-held", "paused")
+    _seed(db, "t-other", "paused")
+
+    assert _run_backfill(backfill, apply=True, exclude=["t-held"]) == 0
+
+    assert _mode(db, "t-held") == "sharded"
+    assert _mode(db, "t-other") == "pool"
+
+
+def test_the_exclusion_holds_for_a_null_mode_row_too(db, backfill):
+    """The COALESCE branch and the exclusion branch are separate clauses in the
+    same WHERE. A NULL-mode row is the one the backfill most wants to move, so
+    it is also the one most likely to slip past an exclusion built wrong."""
+    _seed(db, "t-held", "pending")
+    conn = db._conn()
+    conn.execute("UPDATE tasks SET dispatch_mode = NULL WHERE id = 't-held'")
+    conn.commit()
+
+    assert _run_backfill(backfill, apply=True, exclude=["t-held"]) == 0
+
+    assert _mode(db, "t-held") is None
+
+
+def test_an_excluded_row_does_not_make_the_run_fail(db, backfill, capsys):
+    """The post-UPDATE check re-runs the SELECT and exits 1 on any row still
+    off pool. If that check did not carry the same exclusion, every excluded
+    run would end in a spurious failure — and an operator who sees exit 1 after
+    a backfill has no way to tell a held-back row from a broken UPDATE."""
+    _seed(db, "t-held", "paused")
+    _seed(db, "t-other", "pending")
+
+    assert _run_backfill(backfill, apply=True, exclude=["t-held"]) == 0
+
+    out = capsys.readouterr().out
+    assert "still not on pool" not in out
+    assert "excluding 1 held back" in out
+
+
+def test_the_dry_run_preview_honours_the_exclusion(db, backfill, capsys):
+    """The preview is what the operator reads before typing --apply. A preview
+    that counted the held-back row would be describing a different write than
+    the one that follows."""
+    _seed(db, "t-held", "paused")
+    _seed(db, "t-other", "pending")
+
+    assert _run_backfill(backfill, apply=False, exclude=["t-held"]) == 0
+
+    out = capsys.readouterr().out
+    assert "1 row(s) to move to pool" in out
+    assert "held back by --exclude-task (1)" in out
+    assert "stays 'sharded'" in out
+
+
+def test_excluding_a_task_that_does_not_exist_is_loud_but_not_fatal(db, backfill, capsys):
+    """A copy-pasted id list must not break the moment one of its rows was
+    cleaned up. But the usual cause is a typo, and a typo'd exclusion protects
+    nothing — so it is said out loud."""
+    _seed(db, "t-real", "pending")
+
+    assert _run_backfill(backfill, apply=True, exclude=["t-typo"]) == 0
+
+    assert "NO SUCH TASK" in capsys.readouterr().out
+    assert _mode(db, "t-real") == "pool"
+
+
+def test_a_repeated_exclusion_is_not_counted_twice(db, backfill, capsys):
+    """The id list is built by hand on S1. A duplicate must not change the
+    parameter count the WHERE clause was built for."""
+    _seed(db, "t-held", "paused")
+
+    assert _run_backfill(backfill, apply=True,
+                         exclude=["t-held", "t-held"]) == 0
+
+    out = capsys.readouterr().out
+    assert "held back by --exclude-task (1)" in out
+    assert _mode(db, "t-held") == "sharded"
+
+
+def test_without_the_flag_nothing_is_held_back(db, backfill, capsys):
+    """The flag is opt-in: the plain invocation every earlier test uses must
+    keep behaving exactly as before."""
+    _seed(db, "t-a", "paused")
+    _seed(db, "t-b", "pending")
+
+    assert _run_backfill(backfill, apply=True) == 0
+
+    out = capsys.readouterr().out
+    assert "held back" not in out
+    assert "All pending/paused/failed rows are on pool." in out
+    assert _mode(db, "t-a") == "pool" and _mode(db, "t-b") == "pool"

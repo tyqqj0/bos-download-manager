@@ -192,6 +192,105 @@ def test_deleting_the_task_takes_its_rows_with_it(db):
     assert db.count_missing_files("t-mf") == 0
 
 
+# ── the `done`-with-missing-files disclosure (review GAP-3) ─────────────
+#
+# R4's revised semantics let a task with a few permanently-missing files report
+# `done` and get transferred. The one thing making that honest rather than
+# silent is the note the coordinator writes into `phase`:
+# "3 file(s) missing, within ceiling 10 — GET /api/tasks/{id}/missing-files".
+# It used to be written by the workflow, forwarded nowhere, and then wiped by
+# complete_task's unconditional `phase = NULL` — so the qualified verdict
+# existed only in the alert channel, and the row an operator actually looks at
+# read as an unqualified `done`.
+
+
+def test_complete_task_clears_the_phase_by_default(db):
+    """The default has to stay "clear": a finished task must not keep
+    "downloading batch 12/40" on the dashboard forever, and every sharded and
+    legacy terminal report sends no phase at all."""
+    _task(db)
+    db.update_task_progress("t-mf", phase="downloading batch 12/40")
+
+    db.complete_task("t-mf", "done")
+
+    assert db.get_task("t-mf")["phase"] in (None, "")
+
+
+def test_complete_task_keeps_a_phase_it_was_given(db):
+    _task(db)
+    note = "3 file(s) missing, within ceiling 10 — GET /api/tasks/t-mf/missing-files"
+
+    db.complete_task("t-mf", "done", phase=note)
+
+    row = db.get_task("t-mf")
+    assert row["status"] == "done"
+    assert row["phase"] == note
+
+
+def test_the_terminal_progress_report_forwards_the_phase(db):
+    """The workflow's note travels over HTTP — workers cannot touch SQLite — so
+    /api/task-progress's terminal branch is where it was being dropped."""
+    _task(db)
+    note = "3 file(s) missing, within ceiling 10 — GET /api/tasks/t-mf/missing-files"
+
+    out = asyncio.run(server_routes.task_progress({
+        "task_id": "t-mf", "status": "done", "phase": note,
+        "downloaded_gb": 12.5, "progress_pct": 100,
+    }))
+
+    assert out["completed"] == "done"
+    row = db.get_task("t-mf")
+    assert row["phase"] == note
+    assert row["downloaded_gb"] == 12.5
+
+
+@pytest.mark.parametrize("body", [
+    {"task_id": "t-mf", "status": "done"},
+    {"task_id": "t-mf", "status": "done", "phase": None},
+])
+def test_a_terminal_report_without_a_phase_still_clears_it(db, body):
+    """What every sharded and legacy coordinator sends. An absent key and an
+    explicit null must behave the same, or the fix would leave stale progress
+    text on exactly the tasks it was not about."""
+    _task(db)
+    db.update_task_progress("t-mf", phase="downloading batch 12/40")
+
+    asyncio.run(server_routes.task_progress(body))
+
+    assert db.get_task("t-mf")["phase"] in (None, "")
+
+
+def test_the_note_survives_on_a_failed_task_too(db):
+    """Over-ceiling tasks report `failed` with the same kind of note. Keeping it
+    only for `done` would make the worse outcome the less informative one."""
+    _task(db)
+    note = "50 file(s) missing, over ceiling 10"
+
+    asyncio.run(server_routes.task_progress({
+        "task_id": "t-mf", "status": "failed", "phase": note,
+        "error": "50 file(s) missing",
+    }))
+
+    row = db.get_task("t-mf")
+    assert row["status"] == "failed"
+    assert row["phase"] == note
+
+
+def test_the_empty_repo_phase_now_survives_completion(db):
+    """One sharded-visible side effect, pinned deliberately rather than left to
+    be discovered: ShardedDownloadWorkflow's empty-repo `done` passes
+    phase="empty repo", which used to become NULL and now persists. That is an
+    improvement — "done, empty repo" explains a 0-byte task — but it IS a
+    change in what the dashboard shows for that path."""
+    _task(db)
+
+    asyncio.run(server_routes.task_progress({
+        "task_id": "t-mf", "status": "done", "phase": "empty repo",
+    }))
+
+    assert db.get_task("t-mf")["phase"] == "empty repo"
+
+
 def test_resharding_a_task_does_not_touch_its_rows(db):
     """A reshard deletes batch rows and returns the task to pending. It must
     not take the archive with it: the files were missing before the reshard and
@@ -444,10 +543,14 @@ class _Resp:
         return self._payload
 
 
-def _run_verify(rows, existing, monkeypatch, task=None, limit=10):
+def _run_verify(rows, existing, monkeypatch, task=None, limit=10, recheck=True,
+                heartbeats=None):
     """Drive the activity against a fake coordinator + fake BOS.
 
     Returns (result, bos, calls) where calls is [(verb, url, body)] in order.
+    The GET fake honours the `limit` query parameter the same way
+    /api/tasks/{id}/missing-files does, so a scan-cap test exercises the real
+    truncation contract rather than a convenient stand-in.
     """
     from temporalio.testing import ActivityEnvironment
 
@@ -460,9 +563,13 @@ def _run_verify(rows, existing, monkeypatch, task=None, limit=10):
     calls = []
     kept = {"count": len(rows)}
 
-    def fake_get(url, timeout=None):
-        calls.append(("GET", url, None))
-        return _Resp({"count": len(rows), "files": rows})
+    def fake_get(url, params=None, timeout=None):
+        calls.append(("GET", url, params))
+        cap = (params or {}).get("limit")
+        sent = rows if cap is None else rows[:max(0, cap)]
+        return _Resp({"count": len(sent), "total": len(rows),
+                      "truncated": cap is not None and len(rows) > max(0, cap),
+                      "files": sent})
 
     def fake_delete(url, json=None, timeout=None):
         calls.append(("DELETE", url, json))
@@ -486,7 +593,11 @@ def _run_verify(rows, existing, monkeypatch, task=None, limit=10):
     monkeypatch.setenv("DLM_COORDINATOR", "http://s1:8080")
 
     env = ActivityEnvironment()
-    result = asyncio.run(env.run(activities.verify_missing_files, task, limit))
+    if heartbeats is not None:
+        env.on_heartbeat = lambda *args: heartbeats.append(args)
+    result = asyncio.run(
+        env.run(activities.verify_missing_files, task, limit, recheck)
+    )
     return result, bos, calls
 
 
@@ -612,8 +723,9 @@ def test_the_returned_count_comes_from_the_database_not_arithmetic(monkeypatch):
     from dlm.temporal import activities
     from dlm.temporal.models import TaskInput
 
-    monkeypatch.setattr("requests.get", lambda url, timeout=None: _Resp(
-        {"count": 1, "files": rows}))
+    monkeypatch.setattr("requests.get",
+                        lambda url, params=None, timeout=None: _Resp(
+                            {"count": 1, "total": 1, "files": rows}))
     monkeypatch.setattr("requests.delete",
                         lambda url, json=None, timeout=None: _Resp(
                             {"ok": True, "cleared": 1, "remaining": 0}))
@@ -642,8 +754,9 @@ def test_a_coordinator_error_body_is_raised_not_swallowed(monkeypatch):
     from dlm.temporal import activities
     from dlm.temporal.models import TaskInput
 
-    monkeypatch.setattr("requests.get", lambda url, timeout=None: _Resp(
-        {"count": 0, "files": []}))
+    monkeypatch.setattr("requests.get",
+                        lambda url, params=None, timeout=None: _Resp(
+                            {"count": 0, "total": 0, "files": []}))
     monkeypatch.setattr("requests.post", lambda url, json=None, timeout=None: _Resp(
         {"error": "no such task"}))
     monkeypatch.setenv("DLM_COORDINATOR", "http://s1:8080")
@@ -653,6 +766,163 @@ def test_a_coordinator_error_body_is_raised_not_swallowed(monkeypatch):
     env = ActivityEnvironment()
     with pytest.raises(RuntimeError, match="no such task"):
         asyncio.run(env.run(activities.verify_missing_files, task, 10))
+
+
+# ── T4: recheck=False and the scan cap (review GAP-1) ───────────────────
+#
+# The scan is what stops a task reporting `failed` over files that are actually
+# in the bucket. Two paths reach finalize with no verdict left to change — a
+# task already condemned by a failed batch, and an archive so large that its
+# size is itself the diagnosis — and on those the scan is pure cost. Both still
+# record the ceiling, because alerting has nothing else to work from.
+
+
+def test_recheck_false_records_the_ceiling_without_touching_bos(monkeypatch):
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+    remaining, bos, calls = _run_verify(
+        rows, {"manipulation/X/a/1.bin": 100}, monkeypatch, recheck=False)
+
+    assert bos.looked_up == []
+    assert [v for v, _, _ in calls] == ["POST"]
+    assert _cleared(calls) == []
+
+
+def test_recheck_false_still_returns_the_database_count(monkeypatch):
+    """The coordinator needs it for the error message it is about to write."""
+    rows = [{"file_path": f"a/{i}.bin", "size_bytes": 100} for i in range(3)]
+    remaining, _, calls = _run_verify(rows, {}, monkeypatch, recheck=False)
+
+    assert remaining == 3
+    assert [b["limit"] for v, _, b in calls if v == "POST"] == [10]
+
+
+def test_the_listing_request_asks_for_one_more_than_the_cap(monkeypatch):
+    """Off-by-one here is the whole mechanism: at exactly the cap the archive
+    must be scanned, and the only way to tell "exactly at" from "over" without
+    transferring the whole thing is to ask for one extra row."""
+    from dlm.temporal.models import MISSING_VERIFY_MAX
+
+    _, _, calls = _run_verify([], {}, monkeypatch)
+
+    gets = [params for v, _, params in calls if v == "GET"]
+    assert gets == [{"limit": MISSING_VERIFY_MAX + 1}]
+
+
+def test_an_archive_at_the_cap_is_still_scanned(monkeypatch):
+    monkeypatch.setattr("dlm.temporal.models.MISSING_VERIFY_MAX", 3)
+    rows = [{"file_path": f"a/{i}.bin", "size_bytes": 100} for i in range(3)]
+    existing = {f"manipulation/X/a/{i}.bin": 100 for i in range(3)}
+
+    _, bos, calls = _run_verify(rows, existing, monkeypatch)
+
+    assert len(bos.looked_up) == 3
+    assert _cleared(calls) == [["a/0.bin", "a/1.bin", "a/2.bin"]]
+
+
+def test_an_over_cap_archive_keeps_every_row_unscanned(monkeypatch):
+    """An archive this large is a systemic fault — one dead credential, one bad
+    worker — not a handful of dead upstream files. Keeping the rows makes the
+    task fail on its ceiling with every path still queryable, which is the
+    honest outcome; scanning them would spend hours of HEADs to reach the same
+    verdict."""
+    monkeypatch.setattr("dlm.temporal.models.MISSING_VERIFY_MAX", 3)
+    rows = [{"file_path": f"a/{i}.bin", "size_bytes": 100} for i in range(4)]
+    existing = {f"manipulation/X/a/{i}.bin": 100 for i in range(4)}
+
+    remaining, bos, calls = _run_verify(rows, existing, monkeypatch)
+
+    assert bos.looked_up == []
+    assert _cleared(calls) == []
+    assert remaining == 4
+    assert [v for v, _, _ in calls] == ["GET", "POST"]
+
+
+def test_a_scan_cap_of_zero_disables_the_scan(monkeypatch):
+    """DLM_MISSING_VERIFY_MAX=0 is the documented kill switch, so it has to mean
+    "never scan" rather than "scan an empty list and clear nothing"."""
+    monkeypatch.setattr("dlm.temporal.models.MISSING_VERIFY_MAX", 0)
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+
+    remaining, bos, calls = _run_verify(
+        rows, {"manipulation/X/a/1.bin": 100}, monkeypatch)
+
+    assert bos.looked_up == []
+    assert remaining == 1
+
+
+def test_every_row_is_checked_across_chunk_boundaries(monkeypatch):
+    """The chunking is a heartbeat mechanism, not a sampling one."""
+    monkeypatch.setattr("dlm.temporal.models.MISSING_VERIFY_CHUNK", 2)
+    rows = [{"file_path": f"a/{i}.bin", "size_bytes": 100} for i in range(5)]
+    existing = {f"manipulation/X/a/{i}.bin": 100 for i in range(5)}
+
+    _, bos, calls = _run_verify(rows, existing, monkeypatch)
+
+    assert sorted(bos.looked_up) == sorted(existing)
+    assert _cleared(calls) == [[f"a/{i}.bin" for i in range(5)]]
+
+
+def test_the_scan_heartbeats_once_per_chunk(monkeypatch):
+    """heartbeat_timeout on this activity is 5 minutes and a large archive takes
+    longer than that to scan. A single up-front heartbeat guaranteed a
+    timeout-and-retry loop over the same rows — the activity would never
+    finish, and the task would never reach a verdict."""
+    monkeypatch.setattr("dlm.temporal.models.MISSING_VERIFY_CHUNK", 2)
+    rows = [{"file_path": f"a/{i}.bin", "size_bytes": 100} for i in range(5)]
+    beats = []
+
+    _run_verify(rows, {}, monkeypatch, heartbeats=beats)
+
+    assert len(beats) == 3  # ceil(5 / 2)
+    assert all("re-checking missing files of t-mf" in b[0] for b in beats)
+
+
+def test_the_skipped_paths_do_not_heartbeat_at_all(monkeypatch):
+    """Nothing to heartbeat about, and a heartbeat on a path that makes no BOS
+    calls would only make the logs lie about what ran."""
+    rows = [{"file_path": "a/1.bin", "size_bytes": 100}]
+    beats = []
+
+    _run_verify(rows, {}, monkeypatch, recheck=False, heartbeats=beats)
+
+    assert beats == []
+
+
+def test_the_default_scan_cap_covers_every_task_that_can_still_pass(monkeypatch):
+    """The cap must not be able to condemn a task the batch-level tolerance
+    already forgave. POOL_MAX_BATCHES × POOL_BATCH_FAIL_MAX is the largest
+    archive a task still eligible for `done` can carry, so anything at or below
+    that must be scannable."""
+    from dlm.temporal.models import MISSING_VERIFY_MAX, POOL_BATCH_FAIL_MAX
+    from dlm.web.fleet import POOL_MAX_BATCHES
+
+    assert MISSING_VERIFY_MAX >= POOL_MAX_BATCHES * POOL_BATCH_FAIL_MAX
+
+
+def test_a_negative_scan_cap_is_refused_at_import(monkeypatch):
+    """A negative cap would make `len(rows) > MAX` true for every archive, so
+    the scan would silently never run again on any task. Refuse loudly at
+    startup rather than degrade into permanent silence.
+
+    Loaded under a throwaway module name rather than reloaded in place:
+    `importlib.reload` would rebind TaskInput and friends, and every other
+    module in the session holds references to the originals."""
+    import importlib.util
+    import pathlib
+    import sys
+
+    path = (pathlib.Path(__file__).parent.parent
+            / "dlm" / "temporal" / "models.py")
+    monkeypatch.setenv("DLM_MISSING_VERIFY_MAX", "-1")
+
+    spec = importlib.util.spec_from_file_location("_dlm_models_probe", path)
+    module = importlib.util.module_from_spec(spec)
+    # @dataclass resolves annotations through sys.modules[cls.__module__], so
+    # the throwaway name has to be registered before exec. monkeypatch removes
+    # it again on teardown.
+    monkeypatch.setitem(sys.modules, "_dlm_models_probe", module)
+    with pytest.raises(ValueError, match="DLM_MISSING_VERIFY_MAX"):
+        spec.loader.exec_module(module)
 
 
 # ── T5: alerts and /api/doctor ──────────────────────────────────────────
@@ -851,10 +1121,11 @@ def test_doctor_reports_the_missing_files_of_finalized_tasks(db, monkeypatch):
 
 
 def test_missing_files_never_make_the_doctor_unhealthy(db, monkeypatch):
-    """`healthy` is scripts/deploy-workers.sh's deploy gate. A settled loss is
-    permanent, so counting it as an issue would pin the gate red forever — one
-    dead upstream file would block every future deploy. Notification is the
-    alert engine's job; this section is the record."""
+    """`healthy` is the live-fault verdict the dashboard's doctor modal, the
+    DLM skill's health branch and every deploy acceptance check read. A settled
+    loss is permanent, so counting it as an issue would pin that verdict red
+    forever — one dead upstream file would make the whole signal useless.
+    Notification is the alert engine's job; this section is the record."""
     from dlm.web.routes import doctor
 
     _stub_doctor_temporal(monkeypatch)

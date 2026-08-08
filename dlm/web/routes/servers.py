@@ -189,7 +189,15 @@ async def task_progress(body: dict):
             for key in ("downloaded_gb", "progress_pct", "error"):
                 if key in body:
                     update_task_progress(task_id, **{key: body[key]})
-            complete_task(task_id, status)
+            # `phase` is forwarded here too (review GAP-3). The pool
+            # coordinator's finalize step puts the missing-file note in it —
+            # "3 file(s) missing, within ceiling 10 — GET ..." — and this
+            # branch used to drop it, so a `done` task that forgave permanently
+            # missing files rendered as an unqualified `done` and the honesty
+            # the verdict promised existed only in the alert. Absent or null
+            # phase still clears the column, which is what every sharded and
+            # legacy terminal report sends.
+            complete_task(task_id, status, phase=body.get("phase"))
             return {"ok": True, "completed": status}
 
         kwargs = {}

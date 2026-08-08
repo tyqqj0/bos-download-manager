@@ -438,9 +438,14 @@ T4 已判 `failed`），却因为 50 < 100 只发 WARNING。反过来一个 500 
    记录在 `missing_files` 表、`/api/doctor` 的 `missing_files` 段、
    以及告警首次触发时已经写进 `/data/dlm-alerts.log` 的那行里，三处都不过期。
    `completed_at` 解析不出来时**保留**告警（歧义不能换来沉默）。
-3. **`/api/doctor` 报但不计入 `total_issues`。** `healthy` 是
-   `scripts/deploy-workers.sh` 的部署门（T10）。已经落定的损失是永久的，
-   计进去等于让一个上游死文件永久卡住此后**所有**部署。
+3. **`/api/doctor` 报但不计入 `total_issues`。** `healthy` 是"现在有没有活故障"
+   这个判断 —— 仪表盘 doctor 弹窗、DLM skill 的健康分支、以及历次部署验收
+   （如 2026-08-02 计划 A4「doctor healthy」）读的都是它。已经落定的损失是永久的，
+   计进去等于让一个上游死文件把这个判断永久钉在红色，那它就什么都不再回答了。
+   （**更正**：此处初稿写的是"`scripts/deploy-workers.sh` 的部署门（T10）"——
+   **不成立**，该脚本 `grep -n doctor` 无命中，它的门是自己的 md5 manifest +
+   pytest。`doctor.py` 里同样的错误注释与 `tests/test_missing_files.py`
+   的 docstring 已一并改掉，见复审 GAP-4。）
    通知归告警引擎，这一段只负责"查得到"。
 
 另外补了方案第 7 节 R-1 要求的确认：`check_alerts` → `summary["alerts"]` →

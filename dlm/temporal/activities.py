@@ -1593,7 +1593,9 @@ async def release_pool_batches(task_id: str) -> int:
 
 
 @activity.defn
-async def verify_missing_files(task_input: TaskInput, limit: int) -> int:
+async def verify_missing_files(
+    task_input: TaskInput, limit: int, recheck: bool = True
+) -> int:
     """Re-check this task's archived missing files against BOS; return what is
     still missing, and record the ceiling the coordinator will judge that by.
 
@@ -1604,9 +1606,12 @@ async def verify_missing_files(task_input: TaskInput, limit: int) -> int:
     uploaded successfully. Without this pass a task could report `failed` over
     files that are sitting in the bucket.
 
-    Cheap enough to do one HEAD per row: missing files are a rare event
-    (tens, not millions — a task with millions of them fails on the ceiling
-    long before anyone cares about the round trips).
+    `recheck=False` records the ceiling and returns the count WITHOUT touching
+    BOS. The coordinator passes it when the verdict is already `failed` on
+    batch failures (review GAP-1): that task needs the count for its error
+    message and the ceiling for alerting, but a BOS scan cannot change its
+    outcome, and the archive of a task that failed systemically is exactly the
+    one large enough to hurt.
 
     Fail-open toward "still missing", in every direction:
       * A row is cleared ONLY if BOS has that key with the exact recorded
@@ -1622,6 +1627,9 @@ async def verify_missing_files(task_input: TaskInput, limit: int) -> int:
         every HEAD would run against a prefix that is probably not this
         task's. (Model tasks are unaffected — their prefix is `{name}/` and
         does not involve `category` at all.)
+      * An archive larger than MISSING_VERIFY_MAX is not scanned at all (see
+        that constant): the rows are kept, so the task fails on its ceiling
+        with every path still queryable.
 
     Returns the task's remaining missing-file count as SQLite sees it, so the
     coordinator's verdict and the row the dashboard shows cannot disagree.
@@ -1629,16 +1637,10 @@ async def verify_missing_files(task_input: TaskInput, limit: int) -> int:
     import requests
     from ..core.bos import bos_target, create_bos_client
     from ..core.config import load_config
+    from .models import MISSING_VERIFY_CHUNK, MISSING_VERIFY_MAX
 
     base = _coordinator()
     task_id = task_input.id
-
-    resp = await asyncio.to_thread(
-        lambda: requests.get(f"{base}/api/tasks/{task_id}/missing-files", timeout=60)
-    )
-    resp.raise_for_status()
-    listing = resp.json()
-    rows = listing.get("files") or []
 
     def _record_limit() -> int:
         r = requests.post(
@@ -1654,6 +1656,34 @@ async def verify_missing_files(task_input: TaskInput, limit: int) -> int:
             )
         return int(body.get("missing_files_count", 0))
 
+    if not recheck:
+        return await asyncio.to_thread(_record_limit)
+
+    # One more than the cap, so an over-cap archive is detectable without
+    # transferring (or JSON-serialising on S1) the whole thing. The endpoint
+    # returns everything when no limit is given — that is for operators.
+    resp = await asyncio.to_thread(
+        lambda: requests.get(
+            f"{base}/api/tasks/{task_id}/missing-files",
+            params={"limit": MISSING_VERIFY_MAX + 1},
+            timeout=60,
+        )
+    )
+    resp.raise_for_status()
+    listing = resp.json()
+    rows = listing.get("files") or []
+
+    if len(rows) > MISSING_VERIFY_MAX:
+        logger.error(
+            "Skipping missing-file re-check for %s: %d+ archived row(s) exceeds "
+            "the %d-row scan cap, so every row is kept and this task will fail "
+            "on its ceiling. An archive this large is a systemic fault, not a "
+            "few dead upstream files — GET /api/tasks/%s/missing-files and look "
+            "for one shared source, worker, or credential.",
+            task_id, len(rows), MISSING_VERIFY_MAX, task_id,
+        )
+        return await asyncio.to_thread(_record_limit)
+
     checkable = bool(rows) and (
         task_input.type == "model" or bool(task_input.category)
     )
@@ -1667,12 +1697,18 @@ async def verify_missing_files(task_input: TaskInput, limit: int) -> int:
             )
         return await asyncio.to_thread(_record_limit)
 
-    def _verify() -> list[str]:
+    state: dict = {}
+
+    def _setup():
         config = load_config()
-        bos = create_bos_client(
+        state["bos"] = create_bos_client(
             config["BAIDU_AK"], config["BAIDU_SK"], config["BOS_ENDPOINT"]
         )
-        bucket, prefix = bos_target(task_input)
+        state["bucket"], state["prefix"] = bos_target(task_input)
+
+    def _verify_chunk(chunk: list[dict]) -> list[str]:
+        bos = state["bos"]
+        bucket, prefix = state["bucket"], state["prefix"]
 
         def _present(row: dict) -> tuple[str, bool]:
             path = row.get("file_path") or ""
@@ -1685,15 +1721,29 @@ async def verify_missing_files(task_input: TaskInput, limit: int) -> int:
             except Exception:
                 return path, False
 
-        present: list[str] = []
+        found: list[str] = []
         with ThreadPoolExecutor(max_workers=16) as pool:
-            for path, ok in pool.map(_present, rows):
+            for path, ok in pool.map(_present, chunk):
                 if ok:
-                    present.append(path)
-        return present
+                    found.append(path)
+        return found
 
-    activity.heartbeat(f"re-checking {len(rows)} missing file(s) of {task_id}")
-    present = await asyncio.to_thread(_verify)
+    await asyncio.to_thread(_setup)
+
+    # Heartbeat per chunk, not once before the whole scan: the activity's
+    # heartbeat_timeout is 5 minutes and a large archive takes longer than that,
+    # so a single up-front heartbeat guaranteed a timeout-and-retry loop over
+    # the same rows (review GAP-1).
+    present: list[str] = []
+    for start in range(0, len(rows), MISSING_VERIFY_CHUNK):
+        activity.heartbeat(
+            f"re-checking missing files of {task_id}: {start}/{len(rows)}"
+        )
+        present.extend(
+            await asyncio.to_thread(
+                _verify_chunk, rows[start:start + MISSING_VERIFY_CHUNK]
+            )
+        )
 
     if present:
         logger.info(

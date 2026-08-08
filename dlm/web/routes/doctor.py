@@ -168,11 +168,15 @@ async def diagnose():
 
     # 8. Missing files — what finalized tasks listed but never got onto BOS.
     #    Reported, deliberately NOT counted in total_issues: a settled loss is
-    #    permanent, so counting it would pin `healthy` to false forever, and
-    #    `healthy` is what scripts/deploy-workers.sh reads as its deploy gate
-    #    (T10). A dead upstream file must not be able to block every future
-    #    deploy. The alert engine is the channel that actually notifies —
-    #    same numbers, with de-dupe and severity.
+    #    permanent, so counting it would pin `healthy` to false forever.
+    #    `healthy` is a LIVE-fault verdict — the one field the dashboard's
+    #    doctor modal, the DLM skill's health branch and every deploy
+    #    acceptance check read to answer "is anything wrong right now" — and a
+    #    permanently-false verdict answers nothing. (It is NOT read by
+    #    scripts/deploy-workers.sh, which gates on its own md5 manifest and
+    #    pytest run; an earlier version of this comment claimed otherwise —
+    #    review GAP-4.) The alert engine is the channel that actually notifies
+    #    about missing files — same numbers, with de-dupe and severity.
     from ..fleet import FINALIZED_STATUSES
 
     missing_files = [

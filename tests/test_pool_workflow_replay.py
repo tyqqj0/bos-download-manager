@@ -150,6 +150,7 @@ class _PoolActivityStubs:
         self.batch_calls = []          # (batch_index,) in dispatch order
         self.tolerated = []            # (batch_index, tolerate_missing) per call
         self.verified = []             # limits passed to verify_missing_files
+        self.verify_calls = []         # (limit, recheck) per call
         self.recorded = []             # results lists passed to bookkeeping
         self.released = []             # task_ids passed to release
         self.dashboard = []            # (status, phase)
@@ -239,8 +240,10 @@ class _PoolActivityStubs:
         self.released.append(task_id)
         return 3
 
-    async def verify_missing_files(self, task_input: TaskInput, limit: int) -> int:
+    async def verify_missing_files(self, task_input: TaskInput, limit: int,
+                                  recheck: bool = True) -> int:
         self.verified.append(limit)
+        self.verify_calls.append((limit, recheck))
         if self.verify_raises:
             raise ApplicationError("coordinator unreachable", non_retryable=True)
         return self.missing_after_verify
@@ -577,6 +580,51 @@ def test_the_empty_repo_path_goes_through_the_recheck_too():
     assert result.status == "done"
     assert len(stubs.verified) == 1
     assert any(p == "empty repo" for _, p, _ in stubs.dashboard)
+
+
+# ── the recheck flag (review GAP-1) ────────────────────────────────────────
+#
+# The BOS scan exists to stop a task reporting `failed` over files that are
+# actually in the bucket. A task already condemned by a failed batch has no
+# verdict left to change, and its archive is the one large enough to make the
+# scan expensive — so that path records the ceiling and skips the scan.
+
+
+def test_a_task_headed_for_done_still_scans_bos():
+    from dlm.temporal.models import task_missing_limit
+
+    stubs = _PoolActivityStubs(num_batches=2)
+    asyncio.run(_run_pool_workflow(stubs))
+
+    assert stubs.verify_calls == [(task_missing_limit(100), True)]
+
+
+def test_a_task_condemned_by_a_failed_batch_skips_the_scan():
+    """It still needs the count for its error message and the ceiling for
+    alerting — that is bookkeeping, not verification."""
+    from dlm.temporal.models import task_missing_limit
+
+    stubs = _PoolActivityStubs(num_batches=3, fail_always=[2],
+                               missing_after_verify=4)
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "failed"
+    assert stubs.verify_calls == [(task_missing_limit(100), False)]
+
+
+def test_the_batch_failure_survives_a_broken_bookkeeping_call():
+    """When the bookkeeping POST itself fails on an already-doomed task, the
+    error the dashboard shows must still name the real cause. Reporting
+    "missing-file re-check failed" there would send the operator to look at
+    dead upstream files instead of the batch that actually broke."""
+    stubs = _PoolActivityStubs(num_batches=3, fail_always=[2],
+                               verify_raises=True)
+    result = asyncio.run(_run_pool_workflow(stubs))
+
+    assert result.status == "failed"
+    assert "1/3 batches failed after retry" in result.error
+    assert "missing-file count unavailable" in result.error
+    assert f"/api/tasks/{_task_input().id}/missing-files" in result.error
 
 
 def test_verify_missing_files_is_registered_on_the_workers():

@@ -1194,10 +1194,19 @@ class PoolDownloadWorkflow:
 
         # The re-check also persists `limit` (see the activity): alerting needs
         # the same number the verdict used, and cannot derive it later.
+        #
+        # `recheck` is off when batch failures have already decided the verdict
+        # (review GAP-1). The count and the ceiling are still recorded — the
+        # error message quotes the count and the alert engine needs the ceiling
+        # — but the BOS scan is skipped, because it cannot change `failed` into
+        # anything else and the archive of a task that failed systemically is
+        # precisely the one big enough to turn this step into a HEAD storm
+        # (240k rows at one HEAD each, retried by ACTIVITY_RETRY every time it
+        # outruns its heartbeat_timeout).
         try:
             remaining = await workflow.execute_activity(
                 "verify_missing_files",
-                args=[task_input, limit],
+                args=[task_input, limit, not failed_batches],
                 start_to_close_timeout=timedelta(minutes=20),
                 heartbeat_timeout=timedelta(minutes=5),
                 retry_policy=ACTIVITY_RETRY,
@@ -1205,6 +1214,18 @@ class PoolDownloadWorkflow:
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            # A task whose batches already failed keeps its own error message:
+            # the verdict was never in doubt, and replacing "3/40 batches
+            # failed" with a bookkeeping error would hide the actual cause from
+            # the operator reading the dashboard row.
+            if failed_batches:
+                return await self._fail(
+                    task_id,
+                    f"{failed_batches}/{num_batches} batches failed after retry"
+                    f"; missing-file count unavailable "
+                    f"({str(e)[:150]}) — GET /api/tasks/{task_id}/missing-files",
+                    files_uploaded=files_uploaded, bytes_uploaded=bytes_uploaded,
+                )
             # No verdict without this: `done` would be the silent report the
             # whole task exists to prevent, and there is no local fallback —
             # the archive lives in S1's SQLite. `failed` here costs a retry

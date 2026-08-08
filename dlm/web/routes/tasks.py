@@ -143,7 +143,7 @@ async def get_task(task_id: str):
 
 
 @router.get("/tasks/{task_id}/missing-files")
-async def list_task_missing_files(task_id: str):
+async def list_task_missing_files(task_id: str, limit: int | None = None):
     """Files that entered this task's filelist and never reached BOS.
 
     NOT a complete inventory of what the dataset is missing. Files the source
@@ -152,6 +152,12 @@ async def list_task_missing_files(task_id: str):
     and cannot be recorded here — ModelScope's RoboDojo depth files are
     exactly that shape. An empty list means "nothing we tried to transfer was
     lost", not "nothing is missing".
+
+    `limit` caps the rows returned and reports `truncated`; without it the
+    whole archive comes back, which is what an operator reading the list
+    wants. The finalize re-check always passes one, because an archive written
+    under a systemic fault can hold six figures of rows and this handler
+    serialises them on S1's blocking pool (review GAP-1).
     """
     def _do():
         from ...queue.snapshot import get_task, init_db, list_missing_files
@@ -159,7 +165,12 @@ async def list_task_missing_files(task_id: str):
         if not get_task(task_id):
             return None
         rows = list_missing_files(task_id)
-        return {"task_id": task_id, "count": len(rows), "files": rows}
+        total = len(rows)
+        truncated = limit is not None and total > max(0, limit)
+        if truncated:
+            rows = rows[:max(0, limit)]
+        return {"task_id": task_id, "count": len(rows), "total": total,
+                "truncated": truncated, "files": rows}
 
     result = await run_blocking(_do)
     if result is None:

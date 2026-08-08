@@ -172,6 +172,43 @@ def task_missing_limit(listed_files: int) -> int:
     return max(TASK_MISSING_ABS, int(max(0, listed_files) * TASK_MISSING_RATIO))
 
 
+# How many archived rows the finalize re-check will HEAD against BOS before it
+# refuses the scan (review GAP-1).
+#
+# The archive is written optimistically and is NOT bounded by the per-batch
+# tolerance: every permanently-failed file upserts a row whether or not its
+# batch was forgiven, so under a systemic fault (a key rotated out from under
+# the fleet, a CDN outage) a 240k-file task can archive six figures of rows.
+# One HEAD each, at 16 threads, does not finish inside any sane
+# heartbeat_timeout — and the retry policy then re-runs the identical scan,
+# which is how a bounded bookkeeping step turns into a HEAD storm against a
+# task that is already doomed.
+#
+# The default is deliberately the largest archive a task that still has a
+# chance at `done` can carry: a batch is forgiven for at most
+# POOL_BATCH_FAIL_MAX files, a task chunks into at most 1500 batches
+# (fleet.POOL_MAX_BATCHES — restated as a literal here rather than imported,
+# because this module is loaded on workers and dlm.web.fleet is S1-side), and
+# any batch failing beyond tolerance makes the task `failed` on the
+# failed_batches branch without consulting this scan at all. So a scan larger
+# than this can only belong to a task whose verdict is already decided.
+MISSING_VERIFY_MAX = int(
+    os.environ.get("DLM_MISSING_VERIFY_MAX", str(1500 * POOL_BATCH_FAIL_MAX))
+)
+if MISSING_VERIFY_MAX < 0:
+    raise ValueError(
+        f"DLM_MISSING_VERIFY_MAX={MISSING_VERIFY_MAX} must be >= 0 "
+        "(0 disables the re-check's BOS scan entirely)"
+    )
+
+# Rows per heartbeat during that scan. `verify_missing_files` used to emit
+# exactly one heartbeat — before the blocking call — so a scan longer than
+# heartbeat_timeout was killed and retried forever no matter how well it was
+# progressing. Chunking the scan lets the activity prove liveness while it
+# works, and makes the progress visible in `temporal workflow describe`.
+MISSING_VERIFY_CHUNK = 256
+
+
 
 @dataclass
 class TaskResult:
