@@ -110,10 +110,37 @@ async def reconcile() -> dict:
         has_workflow = has_live_workflow(task_id, running_ids)
 
         if not has_workflow:
+            # A pool task's terminal state is the coordinator workflow's to
+            # report, never this loop's to infer. Three things make the shard
+            # inference below actively wrong for pool:
+            #
+            #   1. Pool batch rows and sharded shard rows share the `shards`
+            #      table, so "every row is done" is a legitimate *transient*
+            #      state mid-run — the window loop has finished the batches it
+            #      created and has not created the next window's rows yet.
+            #   2. This block sits ABOVE decision C's pool skip, so that
+            #      `continue` cannot protect against it.
+            #   3. It has no staleness gate at all, unlike every other
+            #      auto-decision here.
+            #
+            # Together those let one unlucky poll declare a pool task `done`,
+            # bypassing the coordinator's missing-file verification, its
+            # ceiling check, and the WARNING that must accompany a `done` with
+            # known missing files. "Reported done with no alert and no
+            # queryable record" is the single failure mode the missing-file
+            # accounting exists to prevent, and this path reaches it without
+            # any file even being missing.
+            #
+            # Skipping the inference means a pool task whose coordinator is
+            # genuinely gone stays `downloading` until a human acts. That is
+            # the accepted posture: pool tasks do not self-heal (see decision
+            # C), and pool_orphaned/pool_starved are the signals for it.
+            is_pool = (task.get("dispatch_mode") or "sharded") == "pool"
+
             # Before re-dispatching, check if all shards are already done.
             # This handles the case where the parent ShardedDownloadWorkflow
             # died but all child ShardWorkerWorkflows completed successfully.
-            shards = get_shards_by_task(task_id)
+            shards = [] if is_pool else get_shards_by_task(task_id)
             if shards:
                 done_shards = [s for s in shards if s.get("status") == "done"]
                 failed_shards = [s for s in shards if s.get("status") == "failed"]
@@ -180,7 +207,7 @@ async def reconcile() -> dict:
             # to a human. The sharded branch underneath is untouched — G1
             # requires it stay byte-identical, and it is what
             # Egocentric-100K's self-healing rests on.
-            if (task.get("dispatch_mode") or "sharded") == "pool":
+            if is_pool:
                 # DEAD_THRESHOLD, not zero: auto_dispatch commits status='downloading'
                 # before start_workflow, and running_workflows() reads Temporal's
                 # eventually-consistent visibility index, so a pool task dispatched
@@ -456,6 +483,20 @@ def reclaim_orphaned_shards(running_ids, now: float | None = None) -> list[dict]
         between `create_shards_in_db` and the child appearing in a list scan,
         and any list lag behind a just-started execution
 
+    Both conditions are sharded-shaped, and neither holds for a pool batch,
+    so pool rows are skipped entirely:
+      * a pool batch runs as an ACTIVITY of the coordinator, not as a
+        `shard-{id}` child workflow, so the liveness test is never satisfied
+        no matter how healthy the batch is;
+      * POOL_BATCH_RETRY backs off to a 30-minute maximum interval, twice
+        SHARD_ORPHAN_GRACE, so a batch that is retrying exactly as designed
+        goes quiet for longer than this grace as a matter of course.
+    Writing such a row to `failed` does not just mislabel it: every row
+    terminal with one genuine failure is what reconcile()'s auto-fail reads as
+    "this task is dead". A healthy pool task would be buried by its own retry
+    policy. Batch ownership and release are the pool path's own business
+    (`release_pool_batches`), which is mode-internal and consistent.
+
     Callers must pass ids from a query that SUCCEEDED. An empty set from a
     failed query would read as "nothing is running" and fail every live shard
     in the fleet; `reconcile()` returns early on query failure for that reason.
@@ -474,6 +515,12 @@ def reclaim_orphaned_shards(running_ids, now: float | None = None) -> list[dict]
     for shard in get_running_shards(include_stopped_tasks=True):
         shard_id = shard.get("id") or ""
         if not shard_id or f"shard-{shard_id}" in running_ids:
+            continue
+        # Same `or "sharded"` fallback the rest of this module uses: no mode on
+        # the row means it predates pool, so treat it as sharded. A row whose
+        # task is missing entirely also lands here (LEFT JOIN gives None) and
+        # stays reclaimable — that is the stranded case this pass exists for.
+        if (shard.get("task_dispatch_mode") or "sharded") == "pool":
             continue
         updated_at = shard.get("updated_at") or 0
         if updated_at > cutoff:

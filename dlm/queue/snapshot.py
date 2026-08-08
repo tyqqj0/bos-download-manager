@@ -477,10 +477,23 @@ def get_running_shards(include_stopped_tasks: bool = False) -> list:
     `failed`; hiding them from the reclaim would leave them `running` in the
     database forever, visible in /api/tasks/{id}/shards, and dependent on the
     JOIN staying in every future read path.
+
+    That branch also carries the parent's mode as `task_dispatch_mode` (LEFT
+    JOIN, so a row whose task is missing still comes back, with None). The
+    reclaim needs it: a pool batch is an activity, not a child workflow, so
+    the "no running shard-{id} execution" test is never true for a pool row,
+    and its retry backoff legitimately exceeds the quiet grace. Without the
+    mode, the reclaim writes healthy backing-off batches to `failed`. It is
+    deliberately NOT added to the JOINed branch — those callers ask "who is
+    busy", a question with the same answer in both modes.
     """
     conn = _conn()
     if include_stopped_tasks:
-        rows = conn.execute("SELECT * FROM shards WHERE status = 'running'").fetchall()
+        rows = conn.execute(
+            "SELECT s.*, t.dispatch_mode AS task_dispatch_mode "
+            "FROM shards s LEFT JOIN tasks t ON t.id = s.task_id "
+            "WHERE s.status = 'running'"
+        ).fetchall()
         return [dict(r) for r in rows]
     placeholders = ", ".join("?" * len(_TERMINAL_TASK_STATUSES))
     rows = conn.execute(

@@ -264,3 +264,136 @@ def test_re_dispatch_is_visible_to_the_churn_guards(dlm_db, monkeypatch):
 
     _reconcile(monkeypatch)
     assert dlm_db.get_task("t-churn")["retry_count"] == 1
+
+
+# --- pool rows are not the control plane's to judge --------------------------
+#
+# Pool batch rows and sharded shard rows share the `shards` table, and until
+# these tests the reconciler read them identically. Both paths below are
+# pre-existing pool bugs, not regressions from the missing-file work: a pool
+# task could be declared done or failed by the reconciler, bypassing the
+# coordinator's own finalization entirely.
+
+def _pool_task(snapshot, task_id, name=None, source="hf"):
+    snapshot.upsert_task({
+        "id": task_id, "name": name or task_id, "repo_id": f"org/{task_id}",
+        "status": "downloading", "source": source, "priority": 0,
+        "dispatch_mode": "pool",
+    })
+
+
+def test_a_backing_off_pool_batch_is_not_reclaimed(dlm_db):
+    """POOL_BATCH_RETRY backs off to a 30-minute maximum interval, twice
+    SHARD_ORPHAN_GRACE, and a pool batch runs as an activity rather than a
+    `shard-{id}` child workflow — so both reclaim conditions are satisfied by a
+    batch that is retrying exactly as designed."""
+    _pool_task(dlm_db, "t-pool-backoff")
+    _shard(dlm_db, "b-t-pool-backoff-0", "w1", OLD, task_id="t-pool-backoff")
+
+    reclaimed = reclaim_orphaned_shards(running_ids=set())
+
+    assert reclaimed == []
+    assert dlm_db.get_shard("b-t-pool-backoff-0")["status"] == "running"
+
+
+def test_a_sharded_shard_is_still_reclaimed_when_pool_rows_are_present(dlm_db):
+    """The skip must key off the row's own parent, not disable the pass."""
+    _pool_task(dlm_db, "t-pool-mixed")
+    _shard(dlm_db, "b-t-pool-mixed-0", "w1", OLD, task_id="t-pool-mixed")
+    _shard(dlm_db, "s-t-sharded-0", "bj3", OLD, task_id="t-sharded")
+
+    reclaimed = reclaim_orphaned_shards(running_ids=set())
+
+    assert [r["shard_id"] for r in reclaimed] == ["s-t-sharded-0"]
+
+
+def test_an_orphan_row_whose_task_is_gone_is_still_reclaimed(dlm_db):
+    """The LEFT JOIN gives task_dispatch_mode=None for a parentless row. Those
+    rows are the stranded case this pass exists for, so `or "sharded"` must let
+    them through rather than reading None as pool."""
+    _shard(dlm_db, "s-t-orphaned-0", "bj3", OLD, task_id="t-vanished")
+    conn = dlm_db._conn()
+    conn.execute("DELETE FROM tasks WHERE id = ?", ("t-vanished",))
+    conn.commit()
+
+    reclaimed = reclaim_orphaned_shards(running_ids=set())
+
+    assert [r["shard_id"] for r in reclaimed] == ["s-t-orphaned-0"]
+
+
+def test_reconcile_does_not_auto_complete_a_pool_task_from_batch_rows(
+        dlm_db, monkeypatch):
+    """The single most important assertion in this file.
+
+    "Every batch row is done" is a legitimate transient state mid-run: the
+    window loop finished the batches it created and has not created the next
+    window's rows yet. Reading it as task completion lets the reconciler report
+    `done` without the coordinator's missing-file verification, without the
+    ceiling check, and without the WARNING that must accompany a `done` with
+    known missing files — the exact "reported done, no alert, no queryable
+    record" failure the accounting exists to prevent, reached without any file
+    being missing at all.
+    """
+    _pool_task(dlm_db, "t-pool-window", name="windowed")
+    _age_task(dlm_db, "t-pool-window", DEAD)
+    _shard(dlm_db, "b-t-pool-window-0", "w1", OLD, task_id="t-pool-window",
+           index=0, status="done")
+    _shard(dlm_db, "b-t-pool-window-1", "w2", OLD, task_id="t-pool-window",
+           index=1, status="done")
+
+    report = _reconcile(monkeypatch)
+
+    assert dlm_db.get_task("t-pool-window")["status"] == "downloading", \
+        "reconciler declared a pool task done from batch rows"
+    assert report.get("auto_completed") is None
+    assert dlm_db.get_task("t-pool-window")["completed_at"] in (None, "")
+
+
+def test_reconcile_does_not_auto_fail_a_pool_task_from_batch_rows(
+        dlm_db, monkeypatch):
+    """A batch that exhausted its attempts still has the coordinator's
+    re-dispatch round ahead of it (workflows.py' second pass over failed
+    batches). Burying the task here removes that round and, because a failed
+    task is never auto-re-dispatched, ends the download for good."""
+    _pool_task(dlm_db, "t-pool-failed", name="poolfailed")
+    _age_task(dlm_db, "t-pool-failed", DEAD)
+    _shard(dlm_db, "b-t-pool-failed-0", "w1", OLD, task_id="t-pool-failed",
+           index=0, status="failed")
+    _shard(dlm_db, "b-t-pool-failed-1", "w2", OLD, task_id="t-pool-failed",
+           index=1, status="done")
+
+    report = _reconcile(monkeypatch)
+
+    assert dlm_db.get_task("t-pool-failed")["status"] == "downloading"
+    assert report.get("auto_failed") is None
+
+
+def test_reconcile_records_a_stale_pool_task_as_pool_orphaned(dlm_db, monkeypatch):
+    """Skipping the inference must not make a genuinely dead pool coordinator
+    invisible: pool_orphaned is the only signal a human gets, since pool tasks
+    do not self-heal."""
+    _pool_task(dlm_db, "t-pool-dead", name="pooldead")
+    _age_task(dlm_db, "t-pool-dead", DEAD)
+    _shard(dlm_db, "b-t-pool-dead-0", "w1", OLD, task_id="t-pool-dead",
+           status="done")
+
+    report = _reconcile(monkeypatch)
+
+    assert [p["task_id"] for p in report.get("pool_orphaned", [])] == \
+        ["t-pool-dead"]
+
+
+def test_reconcile_still_auto_completes_a_sharded_task(dlm_db, monkeypatch):
+    """Regression guard: the sharded inference is what Egocentric-100K's
+    self-healing rests on and must behave exactly as before."""
+    dlm_db.upsert_task({"id": "t-sh-done", "name": "shdone", "repo_id": "org/x",
+                        "status": "downloading", "source": "modelscope",
+                        "priority": 0, "dispatch_mode": "sharded"})
+    _age_task(dlm_db, "t-sh-done", DEAD)
+    _shard(dlm_db, "s-t-sh-done-0", "bj3", OLD, task_id="t-sh-done",
+           status="done")
+
+    report = _reconcile(monkeypatch)
+
+    assert dlm_db.get_task("t-sh-done")["status"] == "done"
+    assert report["auto_completed"] == ["shdone"]

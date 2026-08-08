@@ -673,7 +673,26 @@ def test_stale_pool_orphan_still_produces_pool_orphaned_entry_and_alert(db, monk
     assert hits[0]["severity"] == CRITICAL
 
 
-def test_pool_task_with_all_done_batches_still_auto_completes(db, monkeypatch):
+def test_pool_task_with_all_done_batches_is_not_auto_completed(db, monkeypatch):
+    """Supersedes test_pool_task_with_all_done_batches_still_auto_completes.
+
+    T9 pinned the old behaviour as characterization: decision C's skip only
+    covered orphan re-dispatch, and the done/failed inference sitting above it
+    kept applying to pool tasks. That is now a defect rather than a quirk.
+
+    "Every batch row is done" is a legitimate transient state mid-run — the
+    window loop finished the batches it created and has not created the next
+    window's rows yet — so the inference can fire on a healthy task. And a
+    `done` reported here skips the coordinator's missing-file verification, its
+    ceiling check, and the WARNING that must accompany a `done` with known
+    missing files. The reconciler cannot supply any of the three: verification
+    is a BOS HEAD sweep that runs as a worker activity.
+
+    A pool task's terminal state is the coordinator's to report, via
+    /api/task-progress. The cost is that a coordinator dying at the very end
+    leaves the task `downloading` until a human acts — the accepted posture,
+    since pool tasks do not self-heal and pool_orphaned is the signal for it.
+    """
     from dlm.web import reconciler
     import dlm.web.temporal_client as tc
 
@@ -692,11 +711,24 @@ def test_pool_task_with_all_done_batches_still_auto_completes(db, monkeypatch):
 
     report = asyncio.run(reconciler.reconcile())
 
-    assert "t-pool-done" in report.get("auto_completed", [])
-    assert db.get_task("t-pool-done")["status"] == "done"
+    assert "t-pool-done" not in report.get("auto_completed", [])
+    assert db.get_task("t-pool-done")["status"] == "downloading"
 
 
-def test_pool_task_with_a_failed_batch_still_auto_fails(db, monkeypatch):
+def test_pool_task_with_a_failed_batch_is_not_auto_failed(db, monkeypatch):
+    """Supersedes test_pool_task_with_a_failed_batch_still_auto_fails.
+
+    A batch that exhausted its attempts still has the coordinator's re-dispatch
+    round ahead of it, and that round is the whole point of pool: another host
+    may succeed where a poisoned one failed. Burying the task here removes the
+    round, and because a failed task is never auto-re-dispatched, ends the
+    download permanently.
+
+    It also composes with reclaim_orphaned_shards to fail a task with nothing
+    wrong: POOL_BATCH_RETRY backs off to 30 minutes against a 15-minute reclaim
+    grace, so the reclaim writes a healthy backing-off batch to `failed`, and
+    this inference reads that as the task being dead.
+    """
     from dlm.web import reconciler
     import dlm.web.temporal_client as tc
 
@@ -715,8 +747,8 @@ def test_pool_task_with_a_failed_batch_still_auto_fails(db, monkeypatch):
 
     report = asyncio.run(reconciler.reconcile())
 
-    assert "t-pool-failed" in report.get("auto_failed", [])
-    assert db.get_task("t-pool-failed")["status"] == "failed"
+    assert "t-pool-failed" not in report.get("auto_failed", [])
+    assert db.get_task("t-pool-failed")["status"] == "downloading"
 
 
 # ═══════════════════════════════════════════════════════════════════════
