@@ -385,6 +385,55 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 ),
             }
 
+    # Transfers to 地瓜云. Deliberately two alerts, not one per failure mode:
+    # the far side runs its own monitoring of the import jobs, so what we need
+    # here is not a second copy of that — it is the two states where OUR data is
+    # not where it should be and no automation will fix it.
+    #
+    #   blocked — never posted. The gates refused the `done` (unbelievable
+    #     shard rows, an empty BOS prefix, a rename after arming). CRITICAL
+    #     because nothing is moving and nothing will start it.
+    #   short/failed — posted, then either the far side reported failure or our
+    #     own verification found fewer bytes on 地瓜云 than on BOS. WARNING:
+    #     the data is still safe on BOS, and the fix is a retry.
+    #
+    # No shelf life on either: the reason is on the row, and both clear the
+    # moment a human retries (`POST /api/transfer/{id}/retry`) or the row is
+    # revoked. `transfer_error` already carries the specific cause, including
+    # prefix drift, so a separate alert type per cause would only re-key the
+    # same string.
+    for t in tasks:
+        tstatus = t.get("transfer_status")
+        if tstatus not in ("blocked", "short", "failed"):
+            continue
+        task_id = t.get("id", "")
+        name = t.get("name") or task_id
+        reason = t.get("transfer_error") or "(no reason recorded)"
+        if tstatus == "blocked":
+            new_alerts[f"transfer_blocked:{task_id}"] = {
+                "severity": CRITICAL,
+                "type": "transfer_blocked",
+                "task_id": task_id,
+                "task_name": t.get("name", ""),
+                "message": (
+                    f"Transfer of {name} is BLOCKED and will not start on its "
+                    f"own: {reason}. Fix the cause, then POST "
+                    f"/api/transfer/{task_id}/retry."
+                ),
+            }
+        else:
+            new_alerts[f"transfer_{tstatus}:{task_id}"] = {
+                "severity": WARNING,
+                "type": f"transfer_{tstatus}",
+                "task_id": task_id,
+                "task_name": t.get("name", ""),
+                "message": (
+                    f"Transfer of {name} is {tstatus}: {reason}. The bytes are "
+                    f"still on BOS; POST /api/transfer/{task_id}/retry re-posts "
+                    f"the import (the far side skips what is already there)."
+                ),
+            }
+
     # Log state transitions
     al = _get_alert_logger()
 

@@ -217,6 +217,23 @@ def init_db():
         # reported success, so a short transfer is queryable rather than living
         # only inside an error string. 0 = not verified yet.
         ("transfer_verified_bytes", "INTEGER", "0"),
+        # What the BOS prefix measured at dispatch time — bytes and object
+        # count. Two jobs, neither of which `transfer_bytes` can do:
+        #
+        #   1. the verification denominator. `transfer_bytes` counts only the
+        #      bytes THIS round dispatched, so verifying against it would pass
+        #      a resumed task that moved a fraction of its data (RoboDojo:
+        #      715.7 GB dispatched against 6189.9 GB actually on BOS) — exactly
+        #      the false-done class this feature exists to catch.
+        #   2. the "BOS was not modified" check. The transfer only ever READS
+        #      BOS, so a byte or object count that differs after the import
+        #      means another actor wrote the prefix mid-transfer. Recorded and
+        #      alerted, never used to block: it is information about the world,
+        #      not a fault in the transfer.
+        #
+        # 0/0 = never measured (every row armed before the dispatcher existed).
+        ("transfer_bos_bytes", "INTEGER", "0"),
+        ("transfer_bos_objects", "INTEGER", "0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")

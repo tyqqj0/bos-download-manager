@@ -12,6 +12,16 @@ logger = logging.getLogger("dlm.web")
 EXECUTOR_WORKERS = 4
 _executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
 
+# The two transfer stages get their own pool. They are the only stages that can
+# legitimately run for minutes (a 3.4 TB prefix is ~50 BOS list pages per
+# dispatched row, and verification lists both ends), and an abandoned stage
+# keeps its thread — so on the shared pool one wedged far side would strand a
+# thread that the dashboard and the staging GC need. Two slots: only one
+# transfer pass runs at a time, so the second is headroom for a pass whose
+# thread is still stuck on a call that timed out.
+TRANSFER_EXECUTOR_WORKERS = 2
+_transfer_executor = ThreadPoolExecutor(max_workers=TRANSFER_EXECUTOR_WORKERS)
+
 DASHBOARD_INTERVAL = 10
 WORKFLOW_SYNC_INTERVAL = 30
 TRANSFER_INTERVAL = 60
@@ -28,13 +38,20 @@ STAGING_GC_INTERVAL = 3600  # decision G — local-disk-only, terminal-tasks-onl
 # callee. Generous: these are normally sub-second.
 STAGE_TIMEOUT = 60
 
+# The transfer stages are the exception, by an order of magnitude. Measuring a
+# multi-TB BOS prefix is thousands of list calls, and the dispatcher does that
+# for up to four rows in one pass; 60s would abandon every cycle on a large
+# dataset and never post an import at all. Still bounded — an unbounded await
+# here is the wedged control plane again.
+TRANSFER_STAGE_TIMEOUT = 600
 
-async def _blocking_stage(loop, fn, name: str):
-    """Run a blocking stage on the thread pool with a deadline.
+
+async def _blocking_stage(loop, fn, name: str, timeout=None, executor=None):
+    """Run a blocking stage on a thread pool with a deadline.
 
     `run_in_executor` carries no timeout of its own, so the three stages that
     used it bare were the hole left in the bound above. They are not
-    pure-SQLite either: `_poll_transfers` logs into the DCloud API and lists
+    pure-SQLite either: the transfer stages log into the DCloud API and list
     async tasks, so a peer that accepts the connection and never answers parks
     this `while True` forever — the wedged control plane again, from a third
     direction.
@@ -46,17 +63,21 @@ async def _blocking_stage(loop, fn, name: str):
     the pool — but by then every cycle times out and says so in the log,
     instead of the loop going silent on the very first hang, and dispatch and
     reconcile (which await coroutines, not the pool) keep running throughout.
+    That is also why the slow transfer stages are handed a separate pool: the
+    starvation they can cause is confined to each other.
 
     Returns None if the stage timed out or raised — callers must not treat
     that as a result.
     """
+    deadline = STAGE_TIMEOUT if timeout is None else timeout
+    pool = _executor if executor is None else executor
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(_executor, fn), timeout=STAGE_TIMEOUT)
+            loop.run_in_executor(pool, fn), timeout=deadline)
     except asyncio.TimeoutError:
         logger.error(
-            f"{name} exceeded {STAGE_TIMEOUT}s — stage abandoned; its thread is "
-            f"still held (pool has {EXECUTOR_WORKERS} slots)"
+            f"{name} exceeded {deadline}s — stage abandoned; its thread is "
+            f"still held (pool has {pool._max_workers} slots)"
         )
     except Exception as e:
         logger.error(f"{name} error: {e}")
@@ -175,67 +196,61 @@ def _build_dashboard() -> dict:
 
 
 def _poll_transfers():
-    """Check status of in-progress D-Robotics transfers."""
-    import os
-    from ..queue.snapshot import _conn
+    """Advance in-flight BOS→地瓜云 transfers. See `dlm/transfer/dispatch.py`.
 
-    conn = _conn()
-    rows = conn.execute(
-        "SELECT id, name, transfer_task_id FROM tasks WHERE transfer_status = 'transferring'"
-    ).fetchall()
-    transferring = [dict(r) for r in rows]
+    A thin delegation on purpose. The body that used to live here wrote
+    `transfer_status='done'` the moment the far side said 成功 and verified
+    nothing — the same "trust a completion report" mistake the download side
+    made. The replacement verifies before it believes, and lives beside the
+    dispatcher it shares a state machine with.
+    """
+    from ..transfer.dispatch import poll_transfers
+    report = poll_transfers()
+    if report.get("done") or report.get("short") or report.get("failed"):
+        logger.info(f"Transfer poll: {report}")
+    elif report.get("errors"):
+        logger.error(f"Transfer poll errors: {report['errors']}")
+    return report
 
-    if not transferring:
-        return 0
 
-    dcloud_user = os.environ.get("DCLOUD_USER")
-    dcloud_pass = os.environ.get("DCLOUD_PASS")
-    if not dcloud_user or not dcloud_pass:
-        return 0
+def _dispatch_ready_transfers():
+    """Post imports for armed transfers. See `dlm/transfer/dispatch.py`."""
+    from ..transfer.dispatch import dispatch_ready_transfers
+    report = dispatch_ready_transfers()
+    if report.get("dispatched") or report.get("blocked"):
+        logger.info(f"Transfer dispatch: {report}")
+    elif report.get("errors"):
+        logger.error(f"Transfer dispatch errors: {report['errors']}")
+    return report
 
-    try:
-        from ..transfer.dcloud import DCloudClient
-        client = DCloudClient(dcloud_user, dcloud_pass)
-        client.login()
 
-        async_tasks = client.list_async_tasks(page_size=100)
-        task_status_map = {t.get("task_id"): t for t in async_tasks}
+async def _transfer_cycle(loop):
+    """One poll-then-dispatch pass over the transfer state machine.
 
-        updated = 0
-        now_ts = time.time()
+    Poll first, dispatch second: polling frees in-flight slots, so a pass that
+    finishes two transfers can post two more immediately instead of waiting out
+    another interval. Both halves go through `_blocking_stage`, so neither can
+    hang this task — and the task itself is what keeps the minutes they may take
+    off the main loop.
+    """
+    poll_report = await _blocking_stage(
+        loop, _poll_transfers, "transfer poll",
+        timeout=TRANSFER_STAGE_TIMEOUT, executor=_transfer_executor)
+    if poll_report is not None:
+        cache.set("transfer_poll_report", poll_report)
 
-        for task in transferring:
-            if not task.get("transfer_task_id"):
-                continue
-            remote = task_status_map.get(task["transfer_task_id"])
-            if not remote:
-                continue
-            status = remote.get("status", "")
-            if status in ("成功", "success", "done"):
-                conn.execute(
-                    "UPDATE tasks SET transfer_status = ?, transfer_error = NULL, updated_at = ? WHERE id = ?",
-                    ("done", now_ts, task["id"]),
-                )
-                updated += 1
-            elif status in ("失败", "failed", "error"):
-                conn.execute(
-                    "UPDATE tasks SET transfer_status = ?, transfer_error = ?, updated_at = ? WHERE id = ?",
-                    ("failed", remote.get("error_msg", status), now_ts, task["id"]),
-                )
-                updated += 1
-
-        if updated:
-            conn.commit()
-        return updated
-    except Exception as e:
-        logger.error(f"Transfer poll error: {e}")
-        return 0
+    dispatch_report = await _blocking_stage(
+        loop, _dispatch_ready_transfers, "transfer dispatch",
+        timeout=TRANSFER_STAGE_TIMEOUT, executor=_transfer_executor)
+    if dispatch_report is not None:
+        cache.set("transfer_dispatch_report", dispatch_report)
 
 
 async def background_scheduler():
     """Main background loop — refresh dashboard, reconcile workflows, poll transfers."""
     loop = asyncio.get_event_loop()
     last_transfer_poll = 0
+    transfer_cycle = None
     last_reconcile = 0
     last_dispatch = 0
     last_health_verify = 0
@@ -259,8 +274,15 @@ async def background_scheduler():
                 cache.set_dashboard(dashboard)
 
             now = time.time()
-            if now - last_transfer_poll > TRANSFER_INTERVAL:
-                await _blocking_stage(loop, _poll_transfers, "transfer poll")
+            # Transfers run as their own task, not inline: a dispatch pass can
+            # legitimately take minutes (see TRANSFER_STAGE_TIMEOUT), and
+            # awaiting that here would park the dashboard, auto-dispatch and
+            # reconciler behind it for exactly as long. One cycle at a time —
+            # while a pass is still running, `last_transfer_poll` is left alone
+            # so the next iteration re-checks instead of piling on a second.
+            if (now - last_transfer_poll > TRANSFER_INTERVAL
+                    and (transfer_cycle is None or transfer_cycle.done())):
+                transfer_cycle = asyncio.create_task(_transfer_cycle(loop))
                 last_transfer_poll = now
 
             # Auto-dispatch pending tasks to idle workers (own 30s cadence —

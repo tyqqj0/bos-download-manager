@@ -63,6 +63,7 @@ InternData ~4h, rest ~3h — roughly 65-70h serial for the full manifest.
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -74,7 +75,20 @@ from dlm.core.bos import create_bos_client  # noqa: E402
 from dlm.core.config import load_config  # noqa: E402
 from dlm.transfer import inflight  # noqa: E402
 from dlm.transfer.dcloud import DCloudClient  # noqa: E402
+# The four measurement primitives used to live in this file. They moved to
+# dlm/transfer/measure.py when the automatic dispatcher needed the same numbers:
+# two definitions of "how many bytes are under this prefix" is how this script
+# came to disagree with the rest of the codebase about which bucket a model
+# lives in.
+from dlm.transfer.measure import (  # noqa: E402
+    bos_stats, bos_top_children, jfs_children, jfs_folder_size,
+)
 from dlm.transfer.targets import plan_from_mapping  # noqa: E402
+
+# measure.py reports its retries through the logging module; without this they
+# would vanish, and a systemd run's stderr goes to the same log file as log().
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 
 STATE_PATH = "/root/transfer_state-20260803.json"
 
@@ -135,69 +149,6 @@ def save_state(state):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, STATE_PATH)
-
-
-def bos_stats(bos, bucket, prefix):
-    total, count, marker = 0, 0, ""
-    while True:
-        resp = bos.list_objects(bucket, prefix=prefix, marker=marker, max_keys=1000)
-        for obj in getattr(resp, "contents", None) or []:
-            total += obj.size
-            count += 1
-        if not getattr(resp, "is_truncated", False):
-            break
-        marker = resp.next_marker
-    return total, count
-
-
-def bos_top_children(bos, bucket, prefix):
-    """Top-level child names (dirs without trailing /, plus direct files)."""
-    names, marker = set(), ""
-    while True:
-        resp = bos.list_objects(bucket, prefix=prefix, delimiter="/",
-                                marker=marker, max_keys=1000)
-        for p in getattr(resp, "common_prefixes", None) or []:
-            names.add(p.prefix[len(prefix):].rstrip("/"))
-        for obj in getattr(resp, "contents", None) or []:
-            rel = obj.key[len(prefix):]
-            if rel:
-                names.add(rel)
-        if not getattr(resp, "is_truncated", False):
-            break
-        marker = resp.next_marker
-    return names
-
-
-def jfs_folder_size(dcloud, parent, name, retries=3):
-    """Recursive size of parent/name per the files API, None if absent."""
-    for attempt in range(retries):
-        try:
-            page = 1
-            while True:
-                resp = dcloud.list_files(path=parent, page=page, page_size=50)
-                files = (resp.get("data") or {}).get("files") or []
-                for f in files:
-                    if f["name"] == name:
-                        return int(f.get("size") or 0)
-                if len(files) < 50:
-                    return None
-                page += 1
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-            log(f"WARN jfs list {parent} attempt {attempt + 1} failed: {e}")
-            time.sleep(30)
-
-
-def jfs_children(dcloud, path):
-    names, page = set(), 1
-    while True:
-        resp = dcloud.list_files(path=path, page=page, page_size=50)
-        files = (resp.get("data") or {}).get("files") or []
-        names |= {f["name"] for f in files}
-        if len(files) < 50:
-            return names
-        page += 1
 
 
 def find_async_task(dcloud, task_id, max_pages=5):
