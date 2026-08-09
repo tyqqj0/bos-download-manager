@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""One-shot: batch-import verified-complete datasets from BOS to the
-D-Robotics (地瓜云) JuiceFS. 2026-08-03, user-approved, Opus-reviewed.
+"""Batch-import verified-complete datasets and models from BOS to the
+D-Robotics (地瓜云) JuiceFS. 2026-08-03, user-approved, Opus-reviewed;
+hardened 2026-08-10 (per-item failures, in-flight reuse, model bucket).
 
 Safety contract (the whole point of this script):
   - BOS is READ-ONLY here: the only BOS calls are list_objects. The import
@@ -9,10 +10,24 @@ Safety contract (the whole point of this script):
     can write to or delete from BOS.
   - JuiceFS side only ever gains data at the listed target paths. No
     delete/move API is called anywhere.
-  - Serial (concurrency 1), stop-on-failure: the first dataset that fails
-    halts the run with its reason in the state file; nothing cascades.
+  - Serial (concurrency 1). One item's failure — a refused pre-flight, a poll
+    timeout, a failed verification — is recorded in the state file and the run
+    MOVES ON to the next item; the process exits non-zero at the end so a
+    supervisor still sees it. Two CONSECUTIVE import-call failures do stop the
+    round: that is the far side refusing us, and seven more attempts would only
+    make noise. (Before 2026-08-10 any single failure sys.exit'd the whole
+    round, so a 72h poll timeout on item 4 silently cancelled items 5-9.)
+  - Never posts an import that is already in flight: the remote async task list
+    carries (source, target), so an item whose import is still running there
+    gets re-attached to that task_id and polled instead of re-posted. That is
+    the hole the 2026-08-04 DL3DV run fell through — our side gave up at the
+    72h cap on 08-07 while the remote task ran on until 08-09 19:26.
   - Idempotent: a dataset whose JuiceFS folder already covers the BOS bytes
     is skipped, so the script can be re-run after any interruption.
+  - Bucket and destination are NOT hardcoded: both come from
+    `dlm.transfer.targets`, the same module the automatic dispatcher uses. A
+    manifest item with `"type": "model"` therefore reads `auwomo-model-open`
+    and lands under `/auwomo-model/{category}/{name}`.
   - Source prefixes MUST end with "/" — review evidence: all 672 prior
     imports in the D-Robotics async history use trailing-slash sources, and
     a slash-less prefix would also match sibling prefixes (manipulation/
@@ -57,17 +72,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dlm.core.bos import create_bos_client  # noqa: E402
 from dlm.core.config import load_config  # noqa: E402
-from dlm.constants import DATA_BUCKET  # noqa: E402
+from dlm.transfer import inflight  # noqa: E402
 from dlm.transfer.dcloud import DCloudClient  # noqa: E402
+from dlm.transfer.targets import plan_from_mapping  # noqa: E402
 
-ROOT = "/727a2f92-30c"
-RAW = f"{ROOT}/auwomo-datasets/raw-data"
 STATE_PATH = "/root/transfer_state-20260803.json"
 
 POLL_S = 60
 ITEM_TIMEOUT_S = 72 * 3600
 PROGRESS_EVERY_S = 30 * 60        # probe target size as a progress signal
 CONSECUTIVE_ERR_LIMIT = 5         # poll errors in a row (after re-login) -> item fails
+CONSECUTIVE_ITEM_FAIL_LIMIT = 2   # import CALLS refused in a row -> stop the round
 SKIP_STATUSES = ("verified", "verified_bos_drift", "verified_scope_warn")
 
 # Order matters: Alpha first (small, freshly file-level-verified — proves the
@@ -75,6 +90,12 @@ SKIP_STATUSES = ("verified", "verified_bos_drift", "verified_scope_warn")
 # Every entry was NOT_TRANSFERRED in the v2 reconciliation with a clean
 # (absent) target. PARTIAL datasets are deliberately excluded: the import
 # API's merge semantics onto an existing folder are unverified.
+#
+# `src` is optional — omitted, it is derived from (type, category, name) by
+# `dlm.transfer.targets`. It is spelled out on every entry below because these
+# are first-generation prefixes that predate the current naming rule and
+# genuinely differ from the derived one (DL3DV lives under `datasets/` while
+# its category is `multimodal`).
 MANIFEST = [
     {"name": "AgiBotWorld-Alpha",
      "src": "manipulation/AgiBotWorld-Alpha/", "category": "manipulation"},
@@ -116,10 +137,10 @@ def save_state(state):
     os.replace(tmp, STATE_PATH)
 
 
-def bos_stats(bos, prefix):
+def bos_stats(bos, bucket, prefix):
     total, count, marker = 0, 0, ""
     while True:
-        resp = bos.list_objects(DATA_BUCKET, prefix=prefix, marker=marker, max_keys=1000)
+        resp = bos.list_objects(bucket, prefix=prefix, marker=marker, max_keys=1000)
         for obj in getattr(resp, "contents", None) or []:
             total += obj.size
             count += 1
@@ -129,11 +150,11 @@ def bos_stats(bos, prefix):
     return total, count
 
 
-def bos_top_children(bos, prefix):
+def bos_top_children(bos, bucket, prefix):
     """Top-level child names (dirs without trailing /, plus direct files)."""
     names, marker = set(), ""
     while True:
-        resp = bos.list_objects(DATA_BUCKET, prefix=prefix, delimiter="/",
+        resp = bos.list_objects(bucket, prefix=prefix, delimiter="/",
                                 marker=marker, max_keys=1000)
         for p in getattr(resp, "common_prefixes", None) or []:
             names.add(p.prefix[len(prefix):].rstrip("/"))
@@ -180,14 +201,8 @@ def jfs_children(dcloud, path):
 
 
 def find_async_task(dcloud, task_id, max_pages=5):
-    for page in range(1, max_pages + 1):
-        tasks = dcloud.list_async_tasks(page=page, page_size=100)
-        if not tasks:
-            return None
-        for t in tasks:
-            if t.get("task_id") == task_id:
-                return t
-    return None
+    return inflight.find_by_id(
+        inflight.fetch_tasks(dcloud, max_pages=max_pages), task_id)
 
 
 def poll_until_done(dcloud, task_id, item):
@@ -205,9 +220,10 @@ def poll_until_done(dcloud, task_id, item):
             t = find_async_task(dcloud, task_id)
             consecutive_errors = 0
             status = str(t.get("status", "")) if t else "(absent from list)"
-            if t and status in ("成功", "success", "done"):
+            verdict = inflight.classify(t.get("status")) if t else "running"
+            if verdict == "ok":
                 return True, status
-            if t and status in ("失败", "failed", "error"):
+            if verdict == "failed":
                 return False, f"{status}: {t.get('error_msg', '')}"
             if time.time() - last_probe >= PROGRESS_EVERY_S:
                 last_probe = time.time()
@@ -284,7 +300,12 @@ def main():
         with open(args.manifest) as f:
             custom = json.load(f)
         for m in custom:
-            assert m.get("name") and m.get("src") and m.get("category"), m
+            # `src` stays optional: targets.plan_from_mapping derives it from
+            # (type, category, name) when absent. `type` must be spelled
+            # correctly if present — a typo would silently read the data bucket
+            # for a model and find nothing there.
+            assert m.get("name") and m.get("category"), m
+            assert m.get("type", "dataset") in ("dataset", "model"), m
     try:
         manifest = select_manifest(MANIFEST, custom, args.only)
     except ValueError as e:
@@ -303,71 +324,147 @@ def main():
 
     state = load_state()
 
-    # ---- Pre-flight every item first: fail fast before moving any bytes.
-    plan = []
+    # ---- Pre-flight every item first: refuse the bad ones before moving any
+    # bytes. A refusal is per-item (recorded + counted), not a round abort.
+    plan, refused = [], []
     for item in manifest:
-        name, src, category = item["name"], item["src"], item["category"]
+        p = plan_from_mapping(item)
+        name, src = p.name, p.prefix
         assert src.endswith("/"), f"source prefix must end with '/': {src}"
         st = state.get(name, {})
         if st.get("status") in SKIP_STATUSES:
             log(f"  skip (already {st['status']}): {name}")
             continue
-        bos_bytes, bos_objects = bos_stats(bos, src)
+        bos_bytes, bos_objects = bos_stats(bos, p.bucket, src)
         if bos_bytes == 0:
-            sys.exit(f"ABORT pre-flight: BOS source {src} is empty — "
-                     f"world changed since reconciliation")
-        parent = f"{RAW}/{category}"
-        jfs = jfs_folder_size(dcloud, parent, name)
+            log(f"  REFUSE: BOS source {p.bucket}/{src} is empty — world "
+                f"changed since reconciliation")
+            state[name] = {"status": "blocked", "bos_bytes": 0,
+                           "error": f"BOS source {p.bucket}/{src} is empty"}
+            refused.append(name)
+            continue
+        jfs = jfs_folder_size(dcloud, p.parent, name)
         if jfs and jfs >= bos_bytes and not item.get("force"):
             log(f"  skip (target already complete): {name} jfs={jfs:,} >= bos={bos_bytes:,}")
             state[name] = {"status": "verified", "jfs_bytes": jfs,
                            "bos_bytes": bos_bytes, "note": "pre-existing"}
             continue
         if jfs and not args.allow_topup and not item.get("force"):
-            sys.exit(f"ABORT pre-flight: {parent}/{name} exists with {jfs:,} B "
-                     f"< {bos_bytes:,} B — partial target; re-run with "
-                     f"--allow-topup (overwrite/skip-same semantics proven "
-                     f"2026-08-03) or resolve by hand")
+            log(f"  REFUSE: {p.target} exists with {jfs:,} B < {bos_bytes:,} B "
+                f"— partial target; re-run with --allow-topup (overwrite/"
+                f"skip-same semantics proven 2026-08-03) or resolve by hand")
+            state[name] = {"status": "blocked", "jfs_bytes": jfs,
+                           "bos_bytes": bos_bytes,
+                           "error": "partial target, --allow-topup not given"}
+            refused.append(name)
+            continue
         if jfs:
             log(f"  top-up: {name} target has {jfs:,} B < bos {bos_bytes:,} B")
-        plan.append({**item, "bos_bytes": bos_bytes, "bos_objects": bos_objects,
-                     "parent": parent, "target": f"{parent}/{name}"})
-        log(f"  plan: {src} ({bos_bytes:,} B / {bos_objects} obj) -> {parent}/{name}")
+        plan.append({**item, "name": name, "src": src, "bucket": p.bucket,
+                     "bos_bytes": bos_bytes, "bos_objects": bos_objects,
+                     "parent": p.parent, "target": p.target})
+        log(f"  plan: {p.bucket}/{src} ({bos_bytes:,} B / {bos_objects} obj) "
+            f"-> {p.target}")
 
     if args.execute:
         save_state(state)
     if not plan:
         log("nothing to do")
-        return
+        return finish(refused, [])
     if not args.execute:
         log(f"dry-run only — {len(plan)} imports pending. Re-run with --execute.")
-        return
+        return finish(refused, [])
 
-    # ---- Serial execution, stop on first failure.
-    for item in plan:
+    return finish(refused, execute_plan(bos, dcloud, cfg, plan, state))
+
+
+def finish(refused, failed):
+    """Exit non-zero if anything needs attention.
+
+    A skipped item must not look like success to whatever supervises the run —
+    that is the price of no longer aborting the round on the first failure.
+    """
+    bad = list(refused) + list(failed)
+    if not bad:
+        log("ALL DONE — every dataset imported and verified")
+        return
+    log(f"FINISHED WITH {len(bad)} PROBLEM ITEM(S): {', '.join(bad)} "
+        f"— reasons in {STATE_PATH}")
+    sys.exit(1)
+
+
+def execute_plan(bos, dcloud, cfg, plan, state):
+    """Import every planned item serially. Returns the failed items' names.
+
+    One item's failure does NOT cancel its successors: on 2026-08-04 item 4 hit
+    the 72h poll cap and `sys.exit` took items 5-9 down with it, unrun and
+    unrecorded. The single exception is CONSECUTIVE_ITEM_FAIL_LIMIT import
+    CALLS refused in a row — that is the far side rejecting us, and the
+    remaining items would only add identical failures.
+    """
+    failed = []
+    consecutive_call_failures = 0
+    for index, item in enumerate(plan):
         name, src = item["name"], item["src"]
         log(f"=== {name}: import starting ({item['bos_bytes']:,} B)")
+        prior_task_id = (state.get(name) or {}).get("dcloud_task_id")
         state[name] = {"status": "importing", "bos_bytes": item["bos_bytes"],
                        "bos_objects": item["bos_objects"],
                        "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         save_state(state)
+
+        # ---- Re-attach instead of re-posting. A remote import still running
+        # against this (source, target) means a previous run of ours gave up
+        # early — posting a second one would have two importers writing the
+        # same directory.
         try:
-            try:
-                dcloud.create_folder(RAW + "/", item["category"])
-            except Exception:
-                pass  # folder may already exist; import creates paths anyway
-            # src keeps its trailing slash: the D-Robotics endpoint string is
-            # a key prefix, and every one of the 672 prior imports ends in
-            # "/" — see the safety contract above.
-            task_id = dcloud.import_from_bos(
-                bos_ak=cfg["BAIDU_AK"], bos_sk=cfg["BAIDU_SK"],
-                bos_bucket=DATA_BUCKET, bos_path=src,
-                target_path=item["target"],
+            running = inflight.find_running(
+                inflight.fetch_tasks(dcloud),
+                source=inflight.endpoint_source(item["bucket"], src),
+                target=item["target"],
+                task_id=prior_task_id,
             )
         except Exception as e:
-            state[name].update(status="failed", error=f"import call failed: {e}")
-            save_state(state)
-            sys.exit(f"STOP: {name} import call failed: {e}")
+            running = None
+            log(f"WARN [{name}] could not list remote async tasks ({e}) — "
+                f"posting a new import")
+        if running is not None:
+            task_id = running.get("task_id")
+            consecutive_call_failures = 0
+            log(f"  [{name}] re-attaching to in-flight remote task {task_id} "
+                f"(status={running.get('status')!r}, "
+                f"created={running.get('created_at')}) — no new import posted")
+        else:
+            try:
+                try:
+                    root, leaf = item["parent"].rsplit("/", 1)
+                    dcloud.create_folder(root + "/", leaf)
+                except Exception:
+                    pass  # folder may already exist; import creates paths anyway
+                # src keeps its trailing slash: the D-Robotics endpoint string
+                # is a key prefix, and every one of the 672 prior imports ends
+                # in "/" — see the safety contract above.
+                task_id = dcloud.import_from_bos(
+                    bos_ak=cfg["BAIDU_AK"], bos_sk=cfg["BAIDU_SK"],
+                    bos_bucket=item["bucket"], bos_path=src,
+                    target_path=item["target"],
+                )
+            except Exception as e:
+                consecutive_call_failures += 1
+                state[name].update(status="failed", error=f"import call failed: {e}")
+                save_state(state)
+                failed.append(name)
+                log(f"FAIL [{name}] import call failed "
+                    f"({consecutive_call_failures}/{CONSECUTIVE_ITEM_FAIL_LIMIT}): {e}")
+                if consecutive_call_failures >= CONSECUTIVE_ITEM_FAIL_LIMIT:
+                    skipped = [it["name"] for it in plan[index + 1:]]
+                    log(f"STOP: {consecutive_call_failures} import calls refused "
+                        f"in a row — the far side is not taking work. Skipping "
+                        f"{len(skipped)} remaining item(s): {', '.join(skipped) or '(none)'}")
+                    failed.extend(skipped)
+                    break
+                continue
+            consecutive_call_failures = 0
         state[name]["dcloud_task_id"] = task_id
         save_state(state)
         log(f"  [{name}] dcloud task {task_id}, polling every {POLL_S}s")
@@ -377,7 +474,11 @@ def main():
             status = "timeout_polling" if detail.startswith("timeout_polling") else "failed"
             state[name].update(status=status, error=detail)
             save_state(state)
-            sys.exit(f"STOP: {name} import {status}: {detail}")
+            failed.append(name)
+            log(f"FAIL [{name}] import {status}: {detail} — remote task "
+                f"{task_id} is NOT cancelled and may still be running; a "
+                f"re-run re-attaches to it. Continuing with the next item.")
+            continue
 
         # ---- Verify 1: size — target folder covers the bytes.
         jfs = jfs_folder_size(dcloud, item["parent"], name)
@@ -389,7 +490,7 @@ def main():
             # can list every legitimate source under "scope_srcs".
             src_children = set()
             for sp in item.get("scope_srcs") or [src]:
-                src_children |= bos_top_children(bos, sp)
+                src_children |= bos_top_children(bos, item["bucket"], sp)
             dst_children = jfs_children(dcloud, item["target"])
         except Exception as e:
             src_children, dst_children = None, None
@@ -402,7 +503,7 @@ def main():
                 log(f"ERROR [{name}] target has children not in source: "
                     f"{sorted(extra)[:10]}")
         # ---- Verify 3: BOS untouched.
-        bos_bytes2, bos_objects2 = bos_stats(bos, src)
+        bos_bytes2, bos_objects2 = bos_stats(bos, item["bucket"], src)
         readonly_ok = (bos_bytes2 == item["bos_bytes"]
                        and bos_objects2 == item["bos_objects"])
         state[name].update(
@@ -420,15 +521,19 @@ def main():
             state[name].update(status="failed",
                                error=f"size check failed: jfs={jfs} < bos={item['bos_bytes']}")
             save_state(state)
-            sys.exit(f"STOP: {name} completed but size check failed "
-                     f"(jfs={jfs}, bos={item['bos_bytes']:,})")
+            failed.append(name)
+            log(f"FAIL [{name}] import completed but size check failed "
+                f"(jfs={jfs}, bos={item['bos_bytes']:,})")
+            continue
         if scope_ok is False:
             state[name].update(status="failed",
                                error="scope check failed: target holds children "
                                      "not present under the source prefix")
             save_state(state)
-            sys.exit(f"STOP: {name} completed but SCOPE check failed — "
-                     f"see log for the extra children")
+            failed.append(name)
+            log(f"FAIL [{name}] import completed but SCOPE check failed — "
+                f"see the extra children above")
+            continue
         if scope_ok is None:
             state[name]["status"] = "verified_scope_warn"
         elif not readonly_ok:
@@ -439,7 +544,7 @@ def main():
         log(f"=== {name}: {state[name]['status'].upper()} "
             f"jfs={jfs:,} >= bos={item['bos_bytes']:,}, scope_ok={scope_ok}")
 
-    log("ALL DONE — every dataset imported and verified")
+    return failed
 
 
 if __name__ == "__main__":
