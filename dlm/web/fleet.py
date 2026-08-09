@@ -496,6 +496,37 @@ def merge_workers(workers: list[dict], now: float | None = None) -> list[dict]:
     return merged
 
 
+def servers_view(workers: list[dict], now: float | None = None) -> dict[str, dict]:
+    """{server_key: merged row + `worker_alive`} — the shape the web UI renders.
+
+    Two surfaces serve it (`/api/dashboard`'s `servers` key and
+    `GET /api/servers`), which is the whole reason it lives here: the Workers
+    strip and the Servers tab building this dict independently is how they came
+    to disagree in the first place. The Celery-era scheduler injected
+    `dashboard_data["servers"]`; the Temporal rewrite dropped that line and
+    every one of those three UI regions has rendered from `{}` ever since.
+
+    `worker_alive` is heartbeat freshness — the same predicate as
+    `alive_workers` — and deliberately NOT `download_process_alive`, which is
+    the sidecar's separate claim about the temporal worker *process*. The UI
+    turns a false value into an offline dot and a Restart button, so it has to
+    mean "this node stopped reporting", which is what a restart addresses.
+    A node whose sidecar is quiet but whose temporal row is fresh is up.
+
+    No `local` key: S1 runs no worker and owns no `workers` row, so nothing in
+    this dict is ever the master. The template's `srv.local` branches were
+    deleted rather than fed a fabricated flag.
+    """
+    now = time.time() if now is None else now
+    return {
+        w["server_key"]: {
+            **w,
+            "worker_alive": (now - (w.get("last_seen") or 0)) < WORKER_TIMEOUT,
+        }
+        for w in merge_workers(workers, now)
+    }
+
+
 def alive_workers(workers: list[dict], now: float | None = None) -> list[dict]:
     """Deduped workers whose freshest heartbeat is within WORKER_TIMEOUT."""
     now = time.time() if now is None else now

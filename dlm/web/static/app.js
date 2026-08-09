@@ -10,9 +10,6 @@ function app() {
         selectedTasks: [],
         selectAll: false,
         showAddModal: false,
-        showLogModal: false,
-        logServer: '',
-        logContent: '',
         lastSync: '',
         showDoctorModal: false,
         doctorLoading: false,
@@ -83,9 +80,10 @@ function app() {
         },
 
         get workersOnly() {
-            const servers = this.dashboard.servers || {};
-            return Object.entries(servers)
-                .filter(([_, srv]) => !srv.local)
+            // No `local` filter: S1 owns no `workers` row, so every entry here
+            // is a worker. Filtering on a field no payload emits is what let
+            // this whole view read from `{}` unnoticed.
+            return Object.entries(this.dashboard.servers || {})
                 .map(([key, srv]) => ({ key, ...srv }));
         },
 
@@ -307,30 +305,16 @@ function app() {
             } catch (e) { this.addForm.error = 'Network error'; }
         },
 
-        async restartWorker(key) {
-            if (!confirm(`Confirm restart worker on ${key}?`)) return;
-            try {
-                const res = await fetch(`/api/servers/${key}/restart`, { method: 'POST' });
-                if (res.ok) {
-                    this.showToast(`Worker ${key} restarted`, 'success');
-                    await this.fetchDashboard();
-                } else {
-                    const data = await res.json();
-                    this.showToast(data.detail || 'Restart failed', 'error');
-                }
-            } catch (e) { this.showToast('Restart failed', 'error'); }
-        },
-
-        async viewLog(key) {
-            this.logServer = key;
-            this.logContent = 'Loading...';
-            this.showLogModal = true;
-            try {
-                const res = await fetch(`/api/servers/${key}/log?lines=80`);
-                const data = await res.json();
-                this.logContent = data.log || 'No log available';
-            } catch (e) { this.logContent = 'Failed to fetch log'; }
-        },
+        // No restartWorker / viewLog here. Both fetched
+        // /api/servers/{key}/restart and /api/servers/{key}/log, routes that
+        // were deleted with the Celery daemon in 860ad56 and never replaced —
+        // the old log route tailed that daemon's queue.log, a file nothing
+        // writes any more. Their buttons only became reachable when the Servers
+        // tab started rendering, so they are gone rather than newly clickable
+        // and dead. Restart deliberately has no successor: worker restart goes
+        // through scripts/deploy-workers.sh, which restarts under the version
+        // manifest that keeps the fleet off mixed code — a one-host web button
+        // is exactly the bypass that constraint exists to prevent.
 
         confirmDelete(taskId, taskName) {
             if (confirm(`Delete task "${taskName}"? This cannot be undone.`)) {
@@ -454,10 +438,11 @@ function app() {
         },
 
         // Helpers
-        statusIcon(status) {
-            const icons = { done: '✓', downloading: '↓', dispatched: '→', queued: '○', failed: '✗', skipped: '⏸' };
-            return icons[status] || '?';
-        },
+        // No statusIcon(): its only caller was the Servers tab's "Active tasks"
+        // list, which rendered `srv.active_tasks` — a Celery-era field with no
+        // successor (a Temporal pool worker holds one batch, and the task table
+        // already shows which). Removed with that block rather than left as an
+        // unreferenced helper.
 
         statusClass(status) {
             const classes = {
@@ -604,7 +589,17 @@ function app() {
             try {
                 const resp = await fetch('/api/transfer/sync', { method: 'POST' });
                 const data = await resp.json();
-                this.showToast(`同步完成: ${data.updated || 0} 个更新`);
+                // A 503 here means the poll timed out or raised — the route
+                // refuses to dress that up as "0 updated", so don't either.
+                if (!resp.ok) {
+                    this.showToast(data.detail || '同步失败', 'error');
+                    return;
+                }
+                if ((data.errors || []).length) {
+                    this.showToast(`同步有错误: ${data.errors[0]}`, 'error');
+                } else {
+                    this.showToast(`同步完成: ${data.updated || 0} 个更新`);
+                }
                 await this.fetchTransfer();
             } catch (e) {
                 this.showToast('同步失败', 'error');
@@ -613,7 +608,11 @@ function app() {
 
         timeAgo(isoStr) {
             if (!isoStr) return '';
-            const diff = (Date.now() - new Date(isoStr).getTime()) / 1000;
+            // Accepts an ISO string or an epoch-seconds number: SQLite carries
+            // `last_seen`/`updated_at` as floats, and every caller that had to
+            // hand-convert was one `* 1000` away from rendering "56y ago".
+            const t = typeof isoStr === 'number' ? isoStr * 1000 : new Date(isoStr).getTime();
+            const diff = (Date.now() - t) / 1000;
             if (diff < 60) return 'just now';
             if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
             if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;

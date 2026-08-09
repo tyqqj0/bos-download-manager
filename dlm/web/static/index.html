@@ -336,18 +336,19 @@
                         <div class="flex items-center gap-2">
                             <span class="w-3 h-3 rounded-full" :class="srv.worker_alive ? 'bg-green-400' : 'bg-red-400'"></span>
                             <span class="font-bold" x-text="key"></span>
-                            <span class="text-xs text-gray-500" x-text="srv.host"></span>
+                            <span class="text-xs text-gray-500" x-text="srv.hostname"></span>
                         </div>
-                        <button @click="restartWorker(key)" class="px-2 py-1 bg-orange-600 hover:bg-orange-700 rounded text-xs"
-                                x-show="!srv.worker_alive && !srv.local">
-                            Restart
-                        </button>
+                        <!-- No Restart button. It posted to
+                             /api/servers/{key}/restart, gone since the Celery
+                             rewrite, and gets no successor on purpose: worker
+                             restart goes through scripts/deploy-workers.sh so
+                             the fleet comes back under one version manifest. -->
                     </div>
                     <div class="space-y-2 text-sm">
                         <div class="flex justify-between">
                             <span class="text-gray-400">Status</span>
                             <span :class="srv.worker_alive ? 'text-green-400' : 'text-red-400'"
-                                  x-text="srv.local ? 'master' : (srv.worker_alive ? 'running' : 'offline')"></span>
+                                  x-text="srv.worker_alive ? 'running' : 'offline'"></span>
                         </div>
                         <div class="flex justify-between">
                             <span class="text-gray-400">Disk Free</span>
@@ -362,28 +363,20 @@
                         </div>
                         <div class="flex justify-between">
                             <span class="text-gray-400">Current</span>
-                            <span class="text-gray-200 truncate max-w-[200px]" x-text="srv.current_task || 'idle'"></span>
+                            <span class="text-gray-200 truncate max-w-[200px]" x-text="srv.current_task_id || 'idle'"></span>
                         </div>
-                        <div class="flex justify-between">
-                            <span class="text-gray-400">Queue</span>
-                            <span x-text="`${srv.queue_depth} tasks`"></span>
-                        </div>
-                        <div class="flex justify-between" x-show="srv.alive_at">
+                        <!-- No queue-depth row: a Temporal pool worker takes one
+                             batch at a time and has no per-node queue to measure.
+                             The old Celery-era `queue_depth` field is gone from
+                             the payload, so that row rendered "undefined tasks". -->
+                        <div class="flex justify-between" x-show="srv.last_seen">
                             <span class="text-gray-400">Last heartbeat</span>
-                            <span class="text-xs text-gray-500" x-text="timeAgo(srv.alive_at)"></span>
+                            <span class="text-xs text-gray-500" x-text="timeAgo(srv.last_seen)"></span>
                         </div>
                     </div>
-                    <!-- Active tasks -->
-                    <div class="mt-3 border-t border-gray-700 pt-2" x-show="srv.active_tasks?.length">
-                        <div class="text-xs text-gray-500 mb-1">Active tasks:</div>
-                        <template x-for="at in (srv.active_tasks || [])" :key="at.id">
-                            <div class="text-xs text-gray-300 truncate" x-text="`${statusIcon(at.status)} ${at.name}`"></div>
-                        </template>
-                    </div>
-                    <button @click="viewLog(key)" class="mt-2 text-xs text-blue-400 hover:text-blue-300" x-show="!srv.local">
-                        View Log
-                    </button>
-                    <button @click="cleanServer(key)" class="mt-2 ml-3 text-xs text-yellow-400 hover:text-yellow-300" x-show="!srv.local && srv.disk_free_gb < 50">
+                    <!-- No View Log button: its route tailed the deleted Celery
+                         daemon's queue.log. Worker logs are read over ssh. -->
+                    <button @click="cleanServer(key)" class="mt-2 text-xs text-yellow-400 hover:text-yellow-300" x-show="srv.disk_free_gb < 50">
                         Clean Staging
                     </button>
                 </div>
@@ -469,16 +462,7 @@
             </div>
         </div>
 
-        <!-- Log Modal -->
-        <div x-show="showLogModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showLogModal = false">
-            <div class="bg-gray-800 rounded-lg p-6 w-[700px] max-h-[80vh] overflow-auto">
-                <div class="flex justify-between mb-3">
-                    <h3 class="font-bold" x-text="`Log: ${logServer}`"></h3>
-                    <button @click="showLogModal = false" class="text-gray-400 hover:text-white">&times;</button>
-                </div>
-                <pre class="text-xs text-gray-300 font-mono whitespace-pre-wrap bg-gray-900 p-3 rounded max-h-[60vh] overflow-auto" x-text="logContent"></pre>
-            </div>
-        </div>
+        <!-- No Log Modal: nothing opens it since View Log was removed. -->
 
         <!-- Doctor Modal -->
         <div x-show="showDoctorModal" x-cloak class="fixed inset-0 bg-black/50 flex items-center justify-center z-50" @click.self="showDoctorModal = false">

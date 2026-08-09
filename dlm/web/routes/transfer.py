@@ -7,11 +7,17 @@ un-paused on the next restart. The dashboard rendered all three as working
 controls, which is the worst version of broken: clicking them produced no
 effect and no error. They now call the same arming path the automatic trigger
 uses, and `pause` persists.
+
+`sync` was a fourth one, missed by that sweep because it fails one step
+earlier: the ⟳ 立即检查 button fetches a path that no route ever served, so it
+404'd rather than no-op'd. `tests/test_servers_view.py` now walks every
+`/api/` literal in app.js against the registered routes, which is the check
+that would have caught all four.
 """
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from . import run_blocking
 
@@ -155,3 +161,50 @@ async def pause_transfer(body: dict = None):
         return {"paused": transfers_paused()}
 
     return await run_blocking(_do)
+
+
+@router.post("/transfer/sync")
+async def sync_transfer():
+    """Poll in-flight transfers now, instead of waiting out the 60s cycle.
+
+    Runs on the SCHEDULER's transfer executor, not this package's pool, and that
+    is the whole point of the endpoint rather than an implementation detail:
+    that pool has exactly one slot so a stage still stuck inside a BOS or DCloud
+    call cannot run beside the next cycle and post the same import twice (see
+    scheduler.py's comment on TRANSFER_EXECUTOR_WORKERS). A route with a thread
+    of its own would reintroduce that race on demand — from the button an
+    operator is most likely to press when a transfer looks stuck, i.e. exactly
+    when a stage is hung. Here the click queues behind the hung stage instead.
+
+    Poll only, no dispatch: this answers "did the far side finish?", which is
+    what 立即检查 asks. Arming is 全部搬运 (`/transfer/trigger`) and posting
+    happens in the automatic cycle within TRANSFER_INTERVAL.
+    """
+    import asyncio
+
+    from ..scheduler import (
+        TRANSFER_STAGE_TIMEOUT,
+        _blocking_stage,
+        _poll_transfers,
+        _transfer_executor,
+    )
+
+    report = await _blocking_stage(
+        asyncio.get_event_loop(), _poll_transfers, "transfer poll (manual)",
+        timeout=TRANSFER_STAGE_TIMEOUT, executor=_transfer_executor)
+    if report is None:
+        # _blocking_stage logs the reason and returns None for both a timeout
+        # and a raise. Surfacing that as `{"updated": 0}` would read as
+        # "checked, nothing changed" — the opposite of what happened.
+        raise HTTPException(
+            503, "poll timed out or failed — see /var/log/dlm-web.log")
+
+    # No cache write: the scheduler stashes its own report under
+    # "transfer_poll_report" but nothing reads that key, and mirroring a
+    # write-only key here would just look like state this route maintains.
+    # The result the caller needs is in the response; the durable result is
+    # the `transfer_status` columns the poll already wrote.
+    updated = sum(len(report.get(k) or [])
+                  for k in ("done", "short", "failed"))
+    return {"ok": True, "updated": updated, "report": report,
+            "errors": report.get("errors") or []}

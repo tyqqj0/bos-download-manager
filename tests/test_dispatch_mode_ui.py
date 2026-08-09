@@ -140,7 +140,7 @@ def test_submit_add_omits_dispatch_mode_key_when_form_value_is_empty():
     instead of falling through to DEFAULT_DISPATCH_MODE."""
     appjs = (STATIC / "app.js").read_text()
     start = appjs.index("async submitAdd()")
-    end = appjs.index("async restartWorker", start)
+    end = appjs.index("confirmDelete(", start)
     body = appjs[start:end]
     assert "body.dispatch_mode = this.addForm.dispatch_mode" in body
     assert "dispatch_mode: this.addForm.dispatch_mode," not in body
@@ -151,7 +151,7 @@ def test_add_form_reset_uses_empty_dispatch_mode_not_sharded_literal():
     as the initial state, not silently reintroduce the hardcoded literal."""
     appjs = (STATIC / "app.js").read_text()
     start = appjs.index("async submitAdd()")
-    end = appjs.index("async restartWorker", start)
+    end = appjs.index("confirmDelete(", start)
     body = appjs[start:end]
     assert "dispatch_mode: ''" in body
     assert "dispatch_mode: 'sharded'" not in body
@@ -233,7 +233,7 @@ def test_submit_add_sends_shard_count_only_for_sharded():
     written in the first place."""
     appjs = (STATIC / "app.js").read_text()
     start = appjs.index("async submitAdd()")
-    body = appjs[start:appjs.index("async restartWorker", start)]
+    body = appjs[start:appjs.index("confirmDelete(", start)]
     assert "if (this.effectiveDispatchMode() === 'sharded')" in body
     assert "body.shard_count" in body
     # not an unconditional key in the body literal

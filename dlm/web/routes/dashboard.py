@@ -15,7 +15,7 @@ async def get_dashboard():
     # executor hop needed to read it. Exposed so the add-task form can show
     # the live server default instead of a client-side literal that would
     # silently drift from it the moment DLM_DEFAULT_DISPATCH_MODE flips.
-    from ..fleet import DEFAULT_DISPATCH_MODE
+    from ..fleet import DEFAULT_DISPATCH_MODE, servers_view
 
     data = cache.get_dashboard()
     if not data:
@@ -28,4 +28,15 @@ async def get_dashboard():
             return get_dashboard_summary()
 
         data = await run_blocking(_live)
-    return {**data, "default_dispatch_mode": DEFAULT_DISPATCH_MODE}
+    # `servers` is derived here, not stored: it is a pure transform of the
+    # `workers` rows already in the payload (merge the two hostnames per node,
+    # stamp worker_alive), so it costs no extra query and cannot go stale
+    # against them. The Workers strip, the server filter dropdown and the whole
+    # Servers tab read `dashboard.servers` and had been rendering from `{}`
+    # since the Temporal rewrite dropped the scheduler line that used to supply
+    # it — see fleet.servers_view.
+    return {
+        **data,
+        "servers": servers_view(data.get("workers") or []),
+        "default_dispatch_mode": DEFAULT_DISPATCH_MODE,
+    }

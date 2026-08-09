@@ -4,7 +4,6 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from ..cache import cache
 from ..fleet import TERMINAL_STATUSES
 from . import run_blocking
 
@@ -18,7 +17,7 @@ async def list_servers():
     """Get all workers with live status."""
     def _do():
         from ...queue.snapshot import get_workers, init_db
-        from ..fleet import merge_workers
+        from ..fleet import servers_view
         init_db()
         # merge, not last-row-wins: every worker reports under two hostnames
         # (`wN@temporal` = liveness only, `wN@sidecar` = the metrics), so a
@@ -27,22 +26,27 @@ async def list_servers():
         # disk_free_gb off this payload, so that was a coin flip per request:
         # half the page loads showed "0G free" and hid the cleanup button on a
         # worker that had just reported its real free space.
-        return {w["server_key"]: w for w in merge_workers(get_workers())}
+        #
+        # servers_view rather than merge_workers directly, so this payload and
+        # /api/dashboard's `servers` key are the same dict built by the same
+        # function — including `worker_alive`, which the UI needs and no route
+        # used to emit.
+        return servers_view(get_workers())
 
-    cached = cache.get_servers()
-    if cached:
-        return {"servers": cached}
-    data = await run_blocking(_do)
-    return {"servers": data}
+    return {"servers": await run_blocking(_do)}
 
 
 @router.get("/servers/{key}")
 async def get_server(key: str):
     """Get a single worker's status."""
-    data = cache.get_servers()
-    if not data or key not in data:
+    # Reads live, like /api/servers above. This used to serve
+    # `cache.get_servers()` exclusively — and nothing has ever called
+    # `cache.set_servers()` since the Temporal rewrite, so every request 404'd
+    # on a worker that was up and reporting.
+    servers = (await list_servers())["servers"]
+    if key not in servers:
         raise HTTPException(404, f"Worker {key} not found")
-    return data[key]
+    return servers[key]
 
 
 @router.post("/servers/{key}/ping")

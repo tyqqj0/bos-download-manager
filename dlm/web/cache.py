@@ -15,7 +15,6 @@ class DLMCache:
     def __init__(self):
         self._lock = threading.Lock()
         self.dashboard = CacheEntry()
-        self.servers = CacheEntry()
         self.tasks = CacheEntry()
         self._kv: dict = {}
 
@@ -28,14 +27,10 @@ class DLMCache:
         with self._lock:
             return self.dashboard.data
 
-    def set_servers(self, data: dict):
-        with self._lock:
-            self.servers.data = data
-            self.servers.updated_at = time.time()
-
-    def get_servers(self) -> dict:
-        with self._lock:
-            return self.servers.data
+    # No servers entry: `set_servers` was never called after the Temporal
+    # rewrite, so `get_servers` returned {} forever and GET /api/servers/{key}
+    # 404'd on every live worker. Both routes read the DB directly now; the
+    # per-node view is 16 rows, not the dashboard's 7+ aggregate queries.
 
     def set_tasks(self, data: dict):
         with self._lock:
