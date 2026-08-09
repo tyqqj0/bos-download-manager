@@ -17,13 +17,17 @@ import time
 from dlm.web.health_verifier import correlate_layers, work_by_server
 
 
-def _worker(key, *, last_seen=None, files5=None, conns=None, alive=None):
+def _worker(key, *, last_seen=None, files5=None, conns=None, alive=None,
+            backlog=None):
+    """`backlog` is event_buffer_pending. None is what a worker on older code
+    or with an unreadable status file reports, and it is deliberately NOT 0."""
     return {
         "server_key": key,
         "last_seen": time.time() if last_seen is None else last_seen,
         "files_last_5min": files5,
         "https_connections": conns,
         "download_process_alive": alive,
+        "event_buffer_pending": backlog,
     }
 
 
@@ -156,7 +160,9 @@ def test_dead_download_process_is_flagged_even_while_idle():
 # costs exactly what the alert was built to buy.
 
 from dlm.queue import snapshot  # noqa: E402
-from dlm.web.health_verifier import EVENT_SILENCE_TOLERANCE, _as_epoch  # noqa: E402
+from dlm.web.health_verifier import (  # noqa: E402
+    EVENT_BACKLOG_TOLERANCE, EVENT_SILENCE_TOLERANCE, _as_epoch,
+)
 
 
 def _live_task(task_id="t-live"):
@@ -182,9 +188,9 @@ def _batch(shard_id, task_id, server, started_ago, status="running"):
     })
 
 
-def _busy(key):
+def _busy(key, backlog=None):
     """A worker whose Layer 1 activity is above the floor."""
-    return _worker(key, files5=50, conns=8, alive=1)
+    return _worker(key, files5=50, conns=8, alive=1, backlog=backlog)
 
 
 def _events_table():
@@ -324,3 +330,95 @@ def test_silence_past_the_tolerance_is_still_reported(dlm_db):
     anomalies = correlate_layers([_busy("w5")], [snapshot.get_task(task_id)], [])
 
     assert "layer2_delivery_broken" in _types(anomalies), anomalies
+
+
+# ── the direct signal: event_buffer_pending (#87) ────────────────────
+#
+# The two-hour tolerance above is an inference with a known cost — a channel
+# that dies for under two hours goes unreported. `event_buffer_pending` now
+# carries the buffer's real backlog (events held past event_buffer.STUCK_AFTER),
+# which is direct evidence rather than inference, so where it exists the wait
+# drops to EVENT_BACKLOG_TOLERANCE. Where it does not exist it must change
+# nothing: -1/None means the sidecar could not read the file, and unknown is
+# not zero.
+
+
+def test_a_reported_backlog_shortens_the_wait(dlm_db):
+    """25 minutes of silence with events piling up in the buffer is reported —
+    under the old inference-only rule this worker had another 95 minutes of
+    grace before anyone would hear about it."""
+    _events_table()
+    task_id = _live_task()
+    _batch("s-backed-up", task_id, "w5",
+           started_ago=EVENT_BACKLOG_TOLERANCE + 600)
+
+    anomalies = correlate_layers(
+        [_busy("w5", backlog=1200)], [snapshot.get_task(task_id)], [])
+
+    types = _types(anomalies)
+    assert "layer2_delivery_broken" in types, anomalies
+    assert "1200 events backlogged" in next(
+        a["message"] for a in anomalies if a["type"] == "layer2_delivery_broken")
+
+
+def test_an_unknown_backlog_keeps_the_long_tolerance(dlm_db):
+    """Same 25 minutes of silence, but the worker reports -1: its sidecar could
+    not read the status file, or it is on older code. Judging it on a signal
+    nobody sent would re-create the false alarm on TB-scale files."""
+    _events_table()
+    task_id = _live_task()
+    _batch("s-unknown", task_id, "w5",
+           started_ago=EVENT_BACKLOG_TOLERANCE + 600)
+
+    for reported in (-1, None):
+        anomalies = correlate_layers(
+            [_busy("w5", backlog=reported)], [snapshot.get_task(task_id)], [])
+        assert "layer2_delivery_broken" not in _types(anomalies), (reported, anomalies)
+
+
+def test_an_empty_backlog_is_evidence_of_a_working_channel(dlm_db):
+    """backlog == 0 means everything emitted was delivered, so silence is real
+    idleness — a big file in flight, nothing finished. This is the w5 case, and
+    it must stay quiet even though 0 is a known value rather than unknown."""
+    _events_table()
+    task_id = _live_task()
+    _batch("s-quiet", task_id, "w5",
+           started_ago=EVENT_BACKLOG_TOLERANCE + 600)
+
+    anomalies = correlate_layers(
+        [_busy("w5", backlog=0)], [snapshot.get_task(task_id)], [])
+
+    assert "layer2_delivery_broken" not in _types(anomalies), anomalies
+
+
+def test_delivered_events_clear_it_even_with_a_backlog(dlm_db):
+    """A backlog alone is not breakage — a burst can outrun one flush cycle.
+    Events actually arriving is the answer to "is the channel alive"."""
+    _events_table()
+    task_id = _live_task()
+    _batch("s-burst", task_id, "w5",
+           started_ago=EVENT_BACKLOG_TOLERANCE + 600)
+    conn = snapshot._conn()
+    conn.execute(
+        "INSERT INTO events (task_id, server_key, event_type, data, timestamp) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, "w5", "file_done", "{}", time.time() - 60))
+    conn.commit()
+
+    anomalies = correlate_layers(
+        [_busy("w5", backlog=900)], [snapshot.get_task(task_id)], [])
+
+    assert "layer2_delivery_broken" not in _types(anomalies), anomalies
+
+
+def test_a_backlogged_worker_that_just_started_still_gets_its_grace(dlm_db):
+    """The tenure grace applies to the short window too: a worker 3 minutes into
+    its first batch has not been silent, it has not had time to speak."""
+    _events_table()
+    task_id = _live_task()
+    _batch("s-new-backlog", task_id, "w5", started_ago=180)
+
+    anomalies = correlate_layers(
+        [_busy("w5", backlog=50)], [snapshot.get_task(task_id)], [])
+
+    assert "layer2_delivery_broken" not in _types(anomalies), anomalies

@@ -47,7 +47,8 @@ SIDECAR_FIELDS = (
 EVENT_DELIVERY_FLOOR = 5
 
 # How far back Layer 2 events are looked for, and equally the grace a worker
-# gets before its silence is called broken.
+# gets before its silence is called broken — when there is no direct signal to
+# consult. See EVENT_BACKLOG_TOLERANCE below for the fast path.
 #
 # Two hours, not ten minutes, and the reason is that the trigger and the
 # evidence measure different things. The trigger is files_last_5min, which is
@@ -64,10 +65,17 @@ EVENT_DELIVERY_FLOOR = 5
 # "did a file complete recently" gate reads 0 on every running batch and would
 # switch this alert off fleet-wide. A long tolerance is cruder but honest —
 # over two hours even a very large file completes, so total silence is real.
-# The cost is that a channel dying for under two hours goes unreported; the
-# direct signal for that is event_buffer_pending, which reads -1 on all 16
-# workers because nothing writes /data/staging/.event_buffer_status yet.
 EVENT_SILENCE_TOLERANCE = 7200
+
+# The fast path, used when the worker reports a real event_buffer_pending.
+# That column carries the buffer's *backlogged* count (events held past
+# event_buffer.STUCK_AFTER), so a positive value is direct evidence that the
+# worker emitted something and could not deliver it — no inference from file
+# counters required, and no need to wait out a large file. -1/None means the
+# sidecar could not read the buffer's status file (missing, stale, or a worker
+# on older code), and unknown is not zero: those workers keep the two-hour
+# tolerance above rather than being judged on a signal nobody sent.
+EVENT_BACKLOG_TOLERANCE = 900
 
 
 async def verify_all_workers() -> dict:
@@ -252,34 +260,46 @@ def correlate_layers(
 
         # Layer 1 sees file activity but Layer 2 delivered no events.
         if (w.get("files_last_5min") or 0) > EVENT_DELIVERY_FLOOR:
+            # A reported backlog is direct evidence: the worker emitted events
+            # and its buffer could not hand them over. That shortens the wait
+            # from two hours to fifteen minutes. Unknown (-1, or a worker whose
+            # sidecar never read the file) keeps the long tolerance — the whole
+            # point of the -1 is that it must not be read as "no backlog".
+            backlog = w.get("event_buffer_pending")
+            has_backlog = backlog is not None and backlog > 0
+            tolerance = EVENT_BACKLOG_TOLERANCE if has_backlog \
+                else EVENT_SILENCE_TOLERANCE
+
             try:
                 recent_events = _conn().execute(
                     "SELECT COUNT(*) FROM events "
                     "WHERE server_key = ? AND timestamp > ?",
-                    (server_key, now - EVENT_SILENCE_TOLERANCE),
+                    (server_key, now - tolerance),
                 ).fetchone()[0]
             except Exception:
                 recent_events = -1  # events table may not exist yet
 
-            # A worker that started working inside the event window has not
-            # been silent — it has not had time to speak. Sharded mode hid
-            # this: a worker took one shard and held it for hours, so it was
-            # only ever fresh right after a deploy. Pool mode recruits a
-            # worker the moment the window widens, and on 2026-08-09 that
-            # turned every recruitment into a WARNING: w1/w2/w3/w7 were all
-            # flagged 6 minutes into their first batch while their events
-            # were in fact arriving seconds later. An alert that fires on
-            # healthy routine is how a real one gets ignored.
+            # A worker that started working inside the window has not been
+            # silent — it has not had time to speak. Sharded mode hid this: a
+            # worker took one shard and held it for hours, so it was only ever
+            # fresh right after a deploy. Pool mode recruits a worker the
+            # moment the window widens, and on 2026-08-09 that turned every
+            # recruitment into a WARNING: w1/w2/w3/w7 were all flagged 6
+            # minutes into their first batch while their events were in fact
+            # arriving seconds later. An alert that fires on healthy routine is
+            # how a real one gets ignored.
             began = working_since.get(server_key)
-            too_new = began is not None and (now - began) < EVENT_SILENCE_TOLERANCE
+            too_new = began is not None and (now - began) < tolerance
 
             if recent_events == 0 and not too_new:
+                detail = (f"{backlog} events backlogged" if has_backlog
+                          else "buffer backlog unknown")
                 anomalies.append({
                     "type": "layer2_delivery_broken",
                     "server": server_key,
                     "message": f"Worker {server_key} has file activity (Layer 1) "
                                f"but no events received (Layer 2) in "
-                               f"{EVENT_SILENCE_TOLERANCE // 60} min",
+                               f"{tolerance // 60} min ({detail})",
                 })
 
     return anomalies

@@ -81,12 +81,10 @@ POOL_STARVED_ZERO_SAMPLES = 2
 # not discard a real confirmation.
 POOL_STARVED_SAMPLE_GAP_S = 900
 
-# Window weights per priority band. The coordinator's per-wake window is
-# `max(1, floor(P * W_i / sum(W_active)))` — P being alive workers serving the
-# source — so these decide how a busy pool is split between concurrent pool
-# tasks. Priority 0-2 ("P0", the queue-jump band) gets 1.5x the share of
-# everything else; the sum keeps total concurrency bounded by P no matter how
-# many tasks are admitted.
+# Window weights per priority band. The coordinator's per-wake window is this
+# task's share of P — P being alive workers serving the source — so these decide
+# how a busy pool is split between concurrent pool tasks. Priority 0-2 ("P0",
+# the queue-jump band) gets 1.5x the share of everything else.
 POOL_WEIGHT_P0 = 1.5
 POOL_WEIGHT_DEFAULT = 1.0
 POOL_P0_MAX_PRIORITY = 2  # priority <= this is the P0 band
@@ -95,6 +93,56 @@ POOL_P0_MAX_PRIORITY = 2  # priority <= this is the P0 band
 def pool_task_weight(priority: int) -> float:
     """Window weight for one pool task's priority."""
     return POOL_WEIGHT_P0 if (priority or 0) <= POOL_P0_MAX_PRIORITY else POOL_WEIGHT_DEFAULT
+
+
+def pool_window_allocation(active: list[dict], p: int) -> dict[str, int]:
+    """Split P worker slots across the concurrent pool tasks. {task_id: window}
+
+    Largest remainder (Hamilton), not a per-task floor. Flooring each task's
+    share independently discards the residual, and the residual is a whole
+    worker: on 2026-08-09 P=7 was split 1.5/1.0 between two live tasks, which
+    floor()ed to 4 + 2 and left one HK worker idle for the entire run —
+    roughly 10 hours of wall clock across a 19.7 TiB backlog, because
+    per-worker throughput on both tasks was identical (~44 GiB/h), so
+    throughput scales linearly with window and an unassigned slot is simply
+    lost. Handing the residual out by largest fractional part makes
+    `sum(alloc) == P` exactly, so the fleet is never deliberately idle.
+
+    Ties go to whoever came first. `sorted` is stable and the caller passes
+    `active` in the DB's own dispatch order (priority ASC, created_at ASC), so
+    two equally-weighted tasks competing for one leftover slot resolve to the
+    older task — the same first-come rule the dispatch queue already uses,
+    rather than an arbitrary dict or id ordering that would look random to an
+    operator watching which task got the spare worker.
+
+    The floor of 1 is kept: a task whose fair share rounds to zero still gets
+    one slot and makes slow progress instead of stalling until its neighbours
+    finish. That floor is the one case where the total can exceed P (more
+    admitted tasks than workers — bounded by POOL_MAX_CONCURRENT_TASKS), which
+    is pre-existing and deliberate; over-subscription there means batches queue
+    on a busy worker, while the alternative is a task that never starts.
+    """
+    if not active:
+        return {}
+
+    weights = [(t.get("id"), pool_task_weight(t.get("priority") or 0)) for t in active]
+    w_sum = sum(w for _, w in weights)
+    if p <= 0 or w_sum <= 0:
+        # No capacity to divide, or no weight to divide it by. Every task falls
+        # to the floor of 1 rather than to 0, which would deadlock the
+        # coordinator loop: it dispatches nothing and then waits for a
+        # completion that can never arrive.
+        return {tid: 1 for tid, _ in weights}
+
+    exact = [(tid, p * w / w_sum) for tid, w in weights]
+    alloc = {tid: int(share) for tid, share in exact}
+    leftover = p - sum(alloc.values())
+
+    by_remainder = sorted(exact, key=lambda pair: -(pair[1] - int(pair[1])))
+    for tid, _ in by_remainder[:max(0, leftover)]:
+        alloc[tid] += 1
+
+    return {tid: max(1, n) for tid, n in alloc.items()}
 
 
 def pool_task_holds_no_work(task: dict, batch_rows: list[dict]) -> bool:

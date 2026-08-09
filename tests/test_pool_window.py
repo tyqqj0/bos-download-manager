@@ -73,9 +73,11 @@ def test_window_is_full_capacity_for_a_lone_task(db):
 
 
 def test_window_splits_by_weight_between_two_tasks(db):
-    """P0 (priority<=2) takes 1.5x the share of a normal task: with P=7 and
-    weights 1.5 + 1.0, the P0 task gets floor(7*1.5/2.5)=4 and the other
-    floor(7*1.0/2.5)=2. Total <= P, which is what bounds pool concurrency."""
+    """P0 (priority<=2) takes 1.5x the share of a normal task, and the split
+    leaves nothing on the floor: with P=7 and weights 1.5 + 1.0 the exact
+    shares are 4.2 and 2.8, so the P0 task takes 4 and the residual slot goes
+    to the larger fractional part (0.8) — 4 + 3 = 7. Flooring each share
+    independently would have given 4 + 2 and idled a worker."""
     from dlm.web.routes.queue import pool_window_api
 
     _task(db, "t-p0", priority=0)
@@ -86,8 +88,8 @@ def test_window_splits_by_weight_between_two_tasks(db):
     p0 = _call(pool_window_api("t-p0"))
     normal = _call(pool_window_api("t-normal"))
 
-    assert (p0["window"], normal["window"]) == (4, 2)
-    assert p0["window"] + normal["window"] <= p0["p"]
+    assert (p0["window"], normal["window"]) == (4, 3)
+    assert p0["window"] + normal["window"] == p0["p"]
     assert p0["window"] > normal["window"]
 
 
@@ -172,6 +174,75 @@ def test_window_for_unknown_task_is_an_error(db):
 
     out = _call(pool_window_api("t-nope"))
     assert "error" in out
+
+
+# ── the allocation itself: no slot left unassigned ──────────────────
+#
+# The formula used to floor each task's share independently, which throws the
+# residual away. In production on 2026-08-09 that residual was a whole HK
+# worker idling for the length of a 19.7 TiB backlog: per-worker throughput was
+# identical on both live tasks (~44 GiB/h), so an unassigned slot is not
+# absorbed anywhere — it is simply lost throughput.
+
+
+def test_allocation_hands_out_every_slot(db):
+    """sum(window) == P for any weight mix, as long as tasks <= P."""
+    from dlm.web.fleet import pool_window_allocation
+
+    for p in range(1, 12):
+        for priorities in ([0, 5], [0, 0, 5], [5, 5, 5], [0, 5, 5, 9], [0]):
+            if len(priorities) > p:
+                continue        # the floor of 1 legitimately over-subscribes
+            active = [{"id": f"t{i}", "priority": pr}
+                      for i, pr in enumerate(priorities)]
+            alloc = pool_window_allocation(active, p)
+            assert sum(alloc.values()) == p, (p, priorities, alloc)
+            assert all(n >= 1 for n in alloc.values()), (p, priorities, alloc)
+
+
+def test_equal_weights_give_the_leftover_slot_to_whoever_came_first(db):
+    """Two identical tasks, an odd number of workers: the older task takes the
+    spare one. Ties resolve by position because the caller passes `active` in
+    the DB's dispatch order (priority ASC, created_at ASC) and the sort is
+    stable — the same first-come rule the queue already runs on, instead of an
+    ordering that would look arbitrary to whoever is watching the dashboard."""
+    from dlm.web.fleet import pool_window_allocation
+
+    older = {"id": "t-older", "priority": 5}
+    newer = {"id": "t-newer", "priority": 5}
+
+    alloc = pool_window_allocation([older, newer], 7)
+
+    assert (alloc["t-older"], alloc["t-newer"]) == (4, 3)
+    # ...and it is genuinely the order that decides, not the id.
+    flipped = pool_window_allocation([newer, older], 7)
+    assert (flipped["t-newer"], flipped["t-older"]) == (4, 3)
+
+
+def test_the_asking_task_is_last_in_the_tie_break_before_its_status_lands(db):
+    """A task racing its own `downloading` write is the newest competitor by
+    definition, so it must not win the spare slot from a task already running."""
+    from dlm.web.routes.queue import pool_window_api
+
+    _task(db, "t-running", status="downloading", priority=5)
+    _task(db, "t-new", status="pending", priority=5)
+    for k in ("w1", "w2", "w3", "w4", "w5"):
+        _worker(db, k)
+
+    new = _call(pool_window_api("t-new"))
+
+    assert new["p"] == 5
+    assert new["window"] == 2                     # 3 goes to the running task
+    assert new["allocation"] == {"t-running": 3, "t-new": 2}
+
+
+def test_allocation_never_returns_zero_when_there_is_no_capacity(db):
+    """P=0 (or no weight) must floor to 1, not 0: a window of 0 dispatches
+    nothing and then waits for a completion that cannot arrive."""
+    from dlm.web.fleet import pool_window_allocation
+
+    assert pool_window_allocation([{"id": "t1", "priority": 0}], 0) == {"t1": 1}
+    assert pool_window_allocation([], 7) == {}
 
 
 # ── POST /api/pool/batches/release ──────────────────────────────────

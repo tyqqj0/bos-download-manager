@@ -13,11 +13,14 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from collections import deque
 from typing import Optional
+
+from ..constants import EVENT_BUFFER_STATUS_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,18 @@ MAX_BUFFER_SIZE = 5000      # ring buffer capacity (oldest events dropped if ful
 FLUSH_INTERVAL = 5          # batch POST every 5 seconds
 MAX_BATCH_SIZE = 200        # max events per POST
 RETRY_BACKOFF = [1, 2, 5, 10, 30, 60]  # seconds between retries
+
+# Where the sidecar reads this buffer's state from. The two processes are
+# separate — the Temporal worker owns the buffer, the sidecar owns the
+# heartbeat — so a file on the shared staging volume is the channel between
+# them. The path is defined in dlm.constants so both ends cannot drift.
+STATUS_PATH = EVENT_BUFFER_STATUS_FILE
+
+# An event still buffered this long after being emitted is a backlog, not the
+# normal 5-second flush window. Layer 3 samples every 300s, so without this
+# distinction a single sample would routinely catch healthy buffering
+# mid-cycle and call it a broken channel.
+STUCK_AFTER = FLUSH_INTERVAL * 3
 
 
 class EventBuffer:
@@ -39,6 +54,11 @@ class EventBuffer:
         self._flush_task: Optional[asyncio.Task] = None
         self._retry_count = 0
         self._running = False
+        # None, not time.time(): a buffer that has never delivered anything has
+        # not "just succeeded". Nothing has been emitted yet either, so the
+        # stuck count is 0 and no alert can fire off this — but seeding it with
+        # now() would be a lie that survives into the first real failure.
+        self._last_success: Optional[float] = None
 
     def emit(self, event_type: str, data: dict):
         """Add event to buffer (non-blocking, thread-safe via deque)."""
@@ -54,9 +74,52 @@ class EventBuffer:
     def pending_count(self) -> int:
         return len(self._buffer)
 
+    @property
+    def stuck_count(self) -> int:
+        """Buffered events older than STUCK_AFTER — i.e. genuine backlog.
+
+        This, not pending_count, is what the health signal is built on. Every
+        flush cycle leaves events sitting in the buffer for up to
+        FLUSH_INTERVAL seconds by design; a checker sampling every few minutes
+        would catch that healthy state often enough to be useless.
+        """
+        cutoff = time.time() - STUCK_AFTER
+        return sum(1 for e in self._buffer if (e.get("timestamp") or 0) < cutoff)
+
+    def write_status(self):
+        """Publish buffer state for the sidecar to pick up on its next heartbeat.
+
+        Best-effort and never raises: this is an observability side channel, and
+        a full or read-only staging volume must not be able to stop event
+        delivery. Failures land in the debug log because the sidecar already
+        reports the resulting silence as `unknown` (-1) rather than as healthy.
+        """
+        try:
+            STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "server_key": self.server_key,
+                "pending": self.pending_count,
+                "stuck": self.stuck_count,
+                "last_success": self._last_success,
+                "consecutive_failures": self._retry_count,
+                "written_at": time.time(),
+            }
+            # Atomic-ish: the sidecar polls this file on its own schedule, and a
+            # torn read would parse as garbage and report -1. A rename is cheap
+            # insurance against reporting "unknown" for one cycle every 5s.
+            tmp = STATUS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload))
+            tmp.replace(STATUS_PATH)
+        except Exception as e:
+            logger.debug(f"Event buffer status write failed: {e}")
+
     async def start(self):
         """Start the background flush loop."""
         self._running = True
+        # Publish immediately: the file may be left over from the previous
+        # process on this host, and a stale one reads as real state until the
+        # first flush cycle overwrites it.
+        self.write_status()
         self._flush_task = asyncio.create_task(self._flush_loop())
 
     async def stop(self):
@@ -70,6 +133,7 @@ class EventBuffer:
                 pass
         # Best-effort final flush
         await self._flush_once()
+        self.write_status()
 
     async def _flush_loop(self):
         """Periodically flush buffered events to S1."""
@@ -81,6 +145,11 @@ class EventBuffer:
                 break
             except Exception as e:
                 logger.debug(f"Event flush error: {e}")
+            finally:
+                # Outside the try that swallows flush errors, so a failing POST
+                # still publishes its own growing backlog — the case the signal
+                # exists for.
+                self.write_status()
 
     async def _flush_once(self):
         """Attempt to send buffered events to S1."""
@@ -101,6 +170,7 @@ class EventBuffer:
         success = await self._post_events(batch)
         if success:
             self._retry_count = 0
+            self._last_success = time.time()
         else:
             # Put events back — but respect maxlen by dropping oldest if full
             remaining_capacity = MAX_BUFFER_SIZE - len(self._buffer)

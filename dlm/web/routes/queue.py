@@ -1051,17 +1051,15 @@ async def pool_window_api(task_id: str):
     """This task's current window size — how many batches it may keep in
     flight. Called once per coordinator wake by `record_batches_and_window`.
 
-    `window = max(1, floor(P * W_self / sum(W_active)))`, P = alive workers
-    serving this task's source. Computed here, not on the worker, because
-    every input is S1-local state and the weights are fleet policy (fleet.py
-    owns them alongside MIN_SHARD_DISK_GB).
-
-    The floor of 1 is what keeps a task alive when it is outvoted: a task
-    whose fair share rounds to zero still gets one slot and makes progress
-    slowly, rather than stalling until its neighbours finish. The `sum`
-    bounds total pool concurrency at ~P however many tasks are admitted.
+    `window` is this task's share of P (alive workers serving its source),
+    allocated by largest remainder across all concurrent pool tasks so that
+    `sum(window) == P` and no worker slot is left unassigned. Computed here,
+    not on the worker, because every input is S1-local state and the weights
+    are fleet policy (fleet.py owns them alongside MIN_SHARD_DISK_GB).
     """
-    from ..fleet import alive_workers, pool_task_weight, worker_serves
+    from ..fleet import (
+        alive_workers, pool_task_weight, pool_window_allocation, worker_serves,
+    )
 
     def do_query():
         snapshot.init_db()
@@ -1078,22 +1076,31 @@ async def pool_window_api(task_id: str):
         # Active = pool-mode tasks still downloading on the same source. A
         # task competing for a different source's workers doesn't consume
         # this task's P, so it must not dilute the share either.
+        #
+        # get_tasks_by_status orders by priority ASC, created_at ASC, and that
+        # order is load-bearing: pool_window_allocation breaks ties for the
+        # leftover slot by position, so it must arrive in first-come order.
         active = [
             t for t in snapshot.get_tasks_by_status("downloading")
             if (t.get("dispatch_mode") or "sharded") == "pool"
             and (t.get("source") or "hf") == source
         ]
+        # This task may not be in `active` yet (its own status write races the
+        # first wake), so make sure it is counted. Appended, not inserted by
+        # created_at: a task whose row has not even reached `downloading` is
+        # the newest competitor by definition, so last place is its correct
+        # position in the first-come tie-break.
+        if not any(t.get("id") == task_id for t in active):
+            active = active + [task]
+
+        alloc = pool_window_allocation(active, p)
         w_self = pool_task_weight(task.get("priority") or 0)
         w_sum = sum(pool_task_weight(t.get("priority") or 0) for t in active)
-        # This task may not be in `active` yet (its own status write races the
-        # first wake), so make sure it is counted.
-        if not any(t.get("id") == task_id for t in active):
-            w_sum += w_self
 
-        window = max(1, int(p * w_self / w_sum)) if w_sum > 0 else 1
         return {
-            "window": window, "p": p, "weight": w_self,
+            "window": alloc.get(task_id, 1), "p": p, "weight": w_self,
             "weight_sum": w_sum, "active_pool_tasks": len(active),
+            "allocation": alloc,
         }
     return await _run_blocking(do_query)
 

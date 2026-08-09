@@ -12,6 +12,7 @@ As systemd service:
 """
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -19,6 +20,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+from ..constants import EVENT_BUFFER_STATUS_FILE, STAGING_ROOT
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,9 +31,16 @@ logging.basicConfig(
 logger = logging.getLogger("dlm.sidecar")
 
 HEARTBEAT_INTERVAL = 30
-STAGING_PATH = Path("/data/staging")
+STAGING_PATH = STAGING_ROOT
+STATUS_PATH = EVENT_BUFFER_STATUS_FILE
 GB = 1024 ** 3
 MB = 1024 ** 2
+
+# The event buffer rewrites its status file every FLUSH_INTERVAL (5s). Anything
+# older than this means the writer is gone or wedged, so its last value is not
+# evidence of anything. Generous relative to 5s because a loaded worker's flush
+# cycle can slip behind on backoff (up to 60s) without being broken.
+STATUS_MAX_AGE = 300
 
 
 def get_disk_free_gb() -> float:
@@ -88,15 +98,41 @@ def is_temporal_worker_alive() -> tuple[bool, int]:
 
 
 def get_event_buffer_pending() -> int:
-    """Check how many events are pending in the event buffer (if accessible)."""
-    # Read from a shared file that event_buffer writes periodically
+    """Backlogged events in the Temporal worker's event buffer, or -1 = unknown.
+
+    Reports the *stuck* count (events buffered past
+    `event_buffer.STUCK_AFTER`), not the raw buffer length: every flush cycle
+    holds events for a few seconds by design, and Layer 3 samples every 300s,
+    so a raw count would report a healthy buffer as backed up most of the time.
+
+    -1 is load-bearing and must not collapse to 0. A worker process that has
+    died leaves this file frozen at whatever it last wrote, and a frozen `0`
+    would read as "the delivery channel is fine" forever — the precise
+    false-negative this signal exists to remove. So a file older than
+    STATUS_MAX_AGE is unknown, as is a missing or unparseable one.
+    """
     try:
-        status_file = STAGING_PATH / ".event_buffer_status"
-        if status_file.exists():
-            return int(status_file.read_text().strip())
+        status_file = STATUS_PATH
+        if not status_file.exists():
+            return -1
+        if time.time() - status_file.stat().st_mtime > STATUS_MAX_AGE:
+            return -1        # writer is gone or wedged; stale is not healthy
+        raw = status_file.read_text().strip()
+        if not raw:
+            return -1
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return -1
+        if not isinstance(payload, dict):
+            # Pre-2026-08-09 format: the file was documented as a bare count.
+            # json.loads parses "7" successfully, so this is the branch a
+            # legacy file actually lands in, not the ValueError above.
+            return int(payload)
+        value = payload.get("stuck")
+        return int(value) if value is not None else -1
     except Exception:
-        pass
-    return -1
+        return -1
 
 
 def collect_metrics(server_key: str) -> dict:
