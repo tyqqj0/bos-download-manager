@@ -18,9 +18,16 @@ async def list_servers():
     """Get all workers with live status."""
     def _do():
         from ...queue.snapshot import get_workers, init_db
+        from ..fleet import merge_workers
         init_db()
-        workers = get_workers()
-        return {w.get("server_key", w["hostname"]): w for w in workers}
+        # merge, not last-row-wins: every worker reports under two hostnames
+        # (`wN@temporal` = liveness only, `wN@sidecar` = the metrics), so a
+        # dict comprehension over the raw rows keeps whichever the SQL happened
+        # to yield last and drops the other's columns. The Servers tab reads
+        # disk_free_gb off this payload, so that was a coin flip per request:
+        # half the page loads showed "0G free" and hid the cleanup button on a
+        # worker that had just reported its real free space.
+        return {w["server_key"]: w for w in merge_workers(get_workers())}
 
     cached = cache.get_servers()
     if cached:

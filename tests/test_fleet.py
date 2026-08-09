@@ -158,3 +158,28 @@ def test_merge_drops_metrics_from_a_hostname_that_went_quiet():
 
     assert merged.get("files_last_5min") is None
     assert merged.get("download_process_alive") is None
+
+
+def test_servers_endpoint_merges_hostnames_instead_of_last_row_wins(dlm_db):
+    """GET /api/servers built its dict with `{w["server_key"]: w for w in rows}`,
+    so which of a worker's two hostname rows survived was down to SQL row order.
+    The Servers tab reads disk_free_gb off this payload: half the page loads
+    showed "0G free" and hid the `< 50 GB` cleanup button on a worker that had
+    just reported its real free space.
+    """
+    import asyncio
+
+    from dlm.queue.snapshot import update_worker
+    from dlm.web.routes.servers import list_servers
+
+    # Sidecar first, then temporal — the real order, which leaves the
+    # metric-free temporal row as the freshest.
+    update_worker("w1@sidecar", "w1", disk_free_gb=137.5,
+                  files_last_5min=210, event_buffer_pending=0)
+    update_worker("w1@temporal", "w1")
+
+    servers = asyncio.run(list_servers())["servers"]
+
+    assert set(servers) == {"w1"}, servers
+    assert servers["w1"]["disk_free_gb"] == 137.5
+    assert servers["w1"]["event_buffer_pending"] == 0
