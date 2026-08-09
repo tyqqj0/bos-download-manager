@@ -689,7 +689,7 @@ def test_one_bad_row_does_not_stop_the_others(db, monkeypatch):
     assert _status(db, "t-bad")["transfer_status"] == "verifying"
 
 
-# --- the two alerts ----------------------------------------------------------
+# --- the four alerts ---------------------------------------------------------
 
 def test_blocked_raises_a_critical_alert_naming_the_retry_route(db):
     from dlm.web.alerts import CRITICAL, check_alerts
@@ -727,6 +727,82 @@ def test_healthy_transfer_states_raise_nothing(db):
     alerts = check_alerts(db.get_all_tasks(), [])
 
     assert [a for a in alerts if a["type"].startswith("transfer_")] == []
+
+
+def _stale_ready(db, task_id="t-1", age_s=7200):
+    """A `ready` row armed `age_s` ago, relative to real now."""
+    import time
+    _ready(db, task_id, armed_at=time.time() - age_s)
+    return task_id
+
+
+def test_a_ready_row_nobody_dispatches_raises_a_stalled_warning(db):
+    """The only transfer failure the far side cannot see: nothing was posted.
+
+    Without this, a dead web process, a transfer stage wedged past its 600s
+    deadline, or CONSECUTIVE_FAIL_LIMIT stopping the dispatch loop all leave
+    the row sitting in `ready` forever and raise nothing at all.
+    """
+    from dlm.web.alerts import WARNING, check_alerts
+    _stale_ready(db, "t-1")
+
+    alerts = {a["type"]: a for a in check_alerts(db.get_all_tasks(), [])}
+
+    assert alerts["transfer_stalled"]["severity"] == WARNING
+    assert alerts["transfer_stalled"]["task_id"] == "t-1"
+    assert "120 min" in alerts["transfer_stalled"]["message"]
+    # It must point at our own process, not at the far side — the whole point
+    # of this alert is that the far side has nothing to look at.
+    assert "dlm-web" in alerts["transfer_stalled"]["message"]
+
+
+def test_a_stale_ready_row_raises_nothing_while_transfers_are_paused(db):
+    """Paused means "stop posting new ones" — a waiting row is then correct."""
+    from dlm.transfer.arm import set_transfers_paused
+    from dlm.web.alerts import check_alerts
+    _stale_ready(db, "t-1")
+    set_transfers_paused(True)
+    try:
+        alerts = check_alerts(db.get_all_tasks(), [])
+    finally:
+        set_transfers_paused(False)
+
+    assert [a for a in alerts if a["type"] == "transfer_stalled"] == []
+
+
+def test_a_stale_ready_row_raises_nothing_when_every_slot_is_busy(db):
+    """16 in flight is the quota working, not a stall. Alerting here would fire
+    on exactly the busiest, most normal state the system has."""
+    from dlm.transfer.dispatch import MAX_IN_FLIGHT
+    from dlm.web.alerts import check_alerts
+    _stale_ready(db, "t-1")
+    _in_flight(db, MAX_IN_FLIGHT)
+
+    alerts = check_alerts(db.get_all_tasks(), [])
+
+    assert [a for a in alerts if a["type"] == "transfer_stalled"] == []
+
+
+def test_a_freshly_armed_ready_row_raises_nothing(db):
+    """A row armed a minute ago is waiting its turn, by design."""
+    from dlm.web.alerts import check_alerts
+    _stale_ready(db, "t-1", age_s=60)
+
+    alerts = check_alerts(db.get_all_tasks(), [])
+
+    assert [a for a in alerts if a["type"] == "transfer_stalled"] == []
+
+
+def test_a_ready_row_armed_before_the_column_existed_raises_nothing(db):
+    """transfer_armed_at defaults to 0. Treating that as an epoch timestamp
+    would report every such row as stalled for 56 years."""
+    from dlm.web.alerts import check_alerts
+    _task(db, "t-1")
+    _transfer(db, "t-1", transfer_status="ready", transfer_armed_at=0)
+
+    alerts = check_alerts(db.get_all_tasks(), [])
+
+    assert [a for a in alerts if a["type"] == "transfer_stalled"] == []
 
 
 # --- the measurement primitives ---------------------------------------------

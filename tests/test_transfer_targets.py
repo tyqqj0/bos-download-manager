@@ -368,6 +368,32 @@ def test_an_inflight_remote_task_is_reused_instead_of_posting_a_second_import(
     assert state["molmobot-data"]["dcloud_task_id"] == "theirs-1"
 
 
+def test_the_far_side_refusing_to_answer_skips_the_item_instead_of_posting_blind(
+        script, monkeypatch):
+    """The one path left that could put two importers on one directory.
+
+    The re-attach check above is what prevents that, and it needs the remote
+    task list to work. When the list call fails we cannot know whether an
+    import is already running here, so posting anyway would defeat the check
+    entirely — on a directory that may be mid-write. Skip, and let the next
+    run re-check.
+    """
+    dcloud = FakeDCloud()
+
+    def boom(page=1, page_size=50):
+        raise RuntimeError("502 Bad Gateway")
+
+    dcloud.list_async_tasks = boom
+    failed, state = _run(script, monkeypatch, dcloud,
+                         [_item("A"), _item("B")])
+
+    assert dcloud.posted == [], "posted blind with the re-attach check broken"
+    assert failed == ["A", "B"], "a skipped item must make the run exit non-zero"
+    for name in ("A", "B"):
+        assert state[name]["status"] == "skipped"
+        assert "could not list remote async tasks" in state[name]["error"]
+
+
 def test_a_recorded_task_id_still_running_is_reused(script, monkeypatch):
     item = _item("molmobot-data")
     dcloud = FakeDCloud()

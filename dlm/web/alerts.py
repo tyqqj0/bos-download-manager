@@ -44,6 +44,13 @@ _active_alerts: dict[str, dict] = {}  # key → alert dict
 # beyond a few dead files.
 MISSING_ALERT_WINDOW_S = 7 * 86400
 
+# How long a `ready` transfer may sit with quota free before we call it stalled.
+# Generous on purpose: the dispatch stage runs every 60s and is allowed 600s to
+# finish, and it posts at most MAX_PER_CYCLE rows per pass, so a burst of armed
+# rows legitimately takes several cycles to drain. 30 minutes is well past any
+# of that, so a row still waiting here is not waiting its turn.
+TRANSFER_STALL_SECONDS = 1800
+
 
 def _finalized_within(task: dict, window_s: float, now: float) -> bool:
     """Whether this task finished recently enough to still be worth notifying.
@@ -385,10 +392,9 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                 ),
             }
 
-    # Transfers to 地瓜云. Deliberately two alerts, not one per failure mode:
-    # the far side runs its own monitoring of the import jobs, so what we need
-    # here is not a second copy of that — it is the two states where OUR data is
-    # not where it should be and no automation will fix it.
+    # Transfers to 地瓜云. Deliberately few, and none of them a second copy of
+    # the far side's own import monitoring — what we alert on is the states
+    # where OUR data is not where it should be and no automation will fix it.
     #
     #   blocked — never posted. The gates refused the `done` (unbelievable
     #     shard rows, an empty BOS prefix, a rename after arming). CRITICAL
@@ -396,8 +402,10 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
     #   short/failed — posted, then either the far side reported failure or our
     #     own verification found fewer bytes on 地瓜云 than on BOS. WARNING:
     #     the data is still safe on BOS, and the fix is a retry.
+    #   stalled — armed but never posted (below). The one failure the far side
+    #     cannot see, since from their side nothing ever arrived.
     #
-    # No shelf life on either: the reason is on the row, and both clear the
+    # No shelf life on any: the reason is on the row, and they clear the
     # moment a human retries (`POST /api/transfer/{id}/retry`) or the row is
     # revoked. `transfer_error` already carries the specific cause, including
     # prefix drift, so a separate alert type per cause would only re-key the
@@ -433,6 +441,60 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
                     f"the import (the far side skips what is already there)."
                 ),
             }
+
+    # The fourth: our own dispatcher stopped dispatching. The three above all
+    # describe a row the state machine already reached a verdict on. This one
+    # describes the absence of a verdict — a row armed long ago that nobody
+    # picked up — which is the only transfer failure the far side's monitoring
+    # cannot see, because from their side nothing was ever posted.
+    #
+    # Guarded so it fires on a real stall and not on normal waiting. A `ready`
+    # row is *supposed* to sit when transfers are paused, or when all 16 slots
+    # are busy. It is not supposed to sit with quota free and the pause off:
+    # that means the web process is gone, the transfer stage is wedged past its
+    # 600s deadline every cycle, or the far side rejected us twice and
+    # CONSECUTIVE_FAIL_LIMIT stopped the loop — none of which raises anything
+    # else today, all of which need a human to look at the web process.
+    #
+    # WARNING, not CRITICAL: the bytes are safe on BOS and the row dispatches
+    # on its own the moment the cause clears. `blocked` is CRITICAL because it
+    # never self-heals; this one might.
+    ready = [t for t in tasks if t.get("transfer_status") == "ready"]
+    if ready:
+        from ..transfer.arm import transfers_paused
+        from ..transfer.dispatch import MAX_IN_FLIGHT
+
+        # One settings query per tick, and only on a tick that has a `ready`
+        # row at all — not one per task. See snapshot.py's note on
+        # missing_files_count: this function runs every 10s over EVERY
+        # historical task, so anything per-task here is O(all tasks) queries
+        # every 10 seconds.
+        in_flight = sum(1 for t in tasks if t.get("transfer_status") == "transferring")
+        if in_flight < MAX_IN_FLIGHT and not transfers_paused():
+            now = time.time()
+            for t in ready:
+                armed = t.get("transfer_armed_at") or 0
+                # armed_at is 0 on a row armed before the column existed. Age
+                # is unknowable there, so say nothing rather than alert on a
+                # 56-year-old timestamp.
+                if not armed or now - armed < TRANSFER_STALL_SECONDS:
+                    continue
+                task_id = t.get("id", "")
+                name = t.get("name") or task_id
+                mins = int((now - armed) / 60)
+                new_alerts[f"transfer_stalled:{task_id}"] = {
+                    "severity": WARNING,
+                    "type": "transfer_stalled",
+                    "task_id": task_id,
+                    "task_name": t.get("name", ""),
+                    "message": (
+                        f"Transfer of {name} has been queued for {mins} min with "
+                        f"{MAX_IN_FLIGHT - in_flight} slot(s) free and transfers "
+                        f"not paused — our dispatcher is not dispatching. Check "
+                        f"`systemctl status dlm-web` and grep /var/log/dlm-web.log "
+                        f"for 'transfer dispatch'."
+                    ),
+                }
 
     # Log state transitions
     al = _get_alert_logger()

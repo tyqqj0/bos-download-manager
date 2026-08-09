@@ -50,7 +50,8 @@ curl -s http://154.85.43.52:8080/api/transfer \
       for t in json.load(sys.stdin)["tasks"] \
       if t["transfer_status"] in ("blocked","short","failed")]'
 
-# 告警（dashboard 里也有）：transfer_blocked = CRITICAL，transfer_short / transfer_failed = WARNING
+# 告警（dashboard 里也有）：transfer_blocked = CRITICAL，
+# transfer_short / transfer_failed / transfer_stalled = WARNING
 curl -s http://154.85.43.52:8080/api/dashboard | python3 -c \
   'import json,sys; [print(a["severity"], a["type"], a["message"]) for a in json.load(sys.stdin)["alerts"]]'
 
@@ -85,6 +86,13 @@ curl -X POST .../api/transfer/trigger -H 'Content-Type: application/json' -d '{"
 - **`blocked`** — 一个字节都没发出去。`0 shard rows` 意味着这个 `done` 是
   reconciler 推断出来的，不是 workflow 报的，**先确认 BOS 上到底有没有数据**再说。
 
+还有一个不是状态、是告警的情况：**`transfer_stalled`**。它说的不是某条数据有问题，
+而是**我们自己的派发器不派发了**——某行 `ready` 排了 30 分钟以上，同时额度有空、
+`pause` 也没开。真实原因通常是 web 挂了、搬运那一段每轮都超 600s 被放弃，或者远端
+连拒我们两次触发了 `CONSECUTIVE_FAIL_LIMIT`。先看 `systemctl status dlm-web`，
+再 `grep -a "transfer dispatch" /var/log/dlm-web.log | tail`。数据都还在 BOS 上，
+原因一消失它自己就发出去了。
+
 ## 停 / 开
 
 ```bash
@@ -107,6 +115,7 @@ curl -X POST .../api/transfer/pause -H 'Content-Type: application/json' -d '{"pa
 | `MAX_PER_CYCLE` | 4 | 同上 | 每发一个要全量扫一遍 BOS 前缀（3.4 TB ≈ 50 页 list）。一轮发 4 个，一分钟就能爬到 16 |
 | `CONSECUTIVE_FAIL_LIMIT` | 2 | 同上 | 连续两次失败就是那边（或我们的凭据）在拒我们，再试 14 次只是刷日志 |
 | `UNKNOWN_VERIFY_PER_CYCLE` | 2 | 同上 | 远端记录找不到的行，一轮最多量 2 个（每个都要走完两端）。计数不设上限，只限做的活 |
+| `TRANSFER_STALL_SECONDS` | 1800 | `dlm/web/alerts.py` | `ready` 排了这么久还没发出去、且额度有空、且没暂停 → 是我们自己的派发器死了，报 `transfer_stalled` |
 | `TRANSFER_INTERVAL` | 60s | `dlm/web/scheduler.py` | 一轮 poll+dispatch 的间隔；一轮没跑完不会叠第二轮 |
 | `TRANSFER_STAGE_TIMEOUT` | 600s | 同上 | 量多 TB 前缀是几千次 list，60s 会让每一轮都被放弃、永远发不出去 |
 | `RATIO_READY` / `RATIO_MIN` | 0.95 / 0.50 | `dlm/transfer/arm.py` | `DLM_TRANSFER_RATIO_*` 可覆盖。0.50 以下拒发 |

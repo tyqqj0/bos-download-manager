@@ -134,48 +134,53 @@ NULL ──arm──► ready ──dispatch──► transferring ──远端�
 每阶段独立验收、独立回滚。
 
 ### 阶段一
-- [ ] `dlm/transfer/targets.py` 对 7 条已知任务给出正确的 (bucket, prefix, target)：
+- [x] `dlm/transfer/targets.py` 对 7 条已知任务给出正确的 (bucket, prefix, target)：
       6 个模型 → `auwomo-model-open` + `/auwomo-model/{category}/{name}`；
       molmobot-data → `auwomo-data` + `other/molmobot-data/` →
       `/auwomo-datasets/raw-data/other/molmobot-data`。
-- [ ] 显式 `src` 覆盖推导前缀：DL3DV 项仍解析出源 `datasets/DL3DV-ALL-4K/` 和目的
+- [x] 显式 `src` 覆盖推导前缀：DL3DV 项仍解析出源 `datasets/DL3DV-ALL-4K/` 和目的
       `/auwomo-datasets/raw-data/multimodal/DL3DV-ALL-4K`。
-- [ ] 单元测试：一项 poll 超时 → 该项记 `timeout_polling`、**下一项照跑**、退出码非 0。
-- [ ] 单元测试：连续 2 次 import 调用失败 → 停整轮。
-- [ ] 单元测试：远端已有同 (source,target) 的非终态任务 → **不发新 import**，复用其 task_id。
-- [ ] `--manifest` 里带 `type: model` 的项，`import_from_bos` 收到的 `bos_bucket`
+- [x] 单元测试：一项 poll 超时 → 该项记 `timeout_polling`、**下一项照跑**、退出码非 0。
+- [x] 单元测试：连续 2 次 import 调用失败 → 停整轮。
+- [x] 单元测试：远端已有同 (source,target) 的非终态任务 → **不发新 import**，复用其 task_id。
+- [x] `--manifest` 里带 `type: model` 的项，`import_from_bos` 收到的 `bos_bucket`
       是 `auwomo-model-open`。
-- [ ] dry-run 对现有 S1 manifest（`/root/transfer_manifest-phase1b.json`）仍能跑通，
+- [x] dry-run 对现有 S1 manifest（`/root/transfer_manifest-phase1b.json`）仍能跑通，
       已 verified 的项照旧跳过。
 
 ### 阶段二
-- [ ] 新列 ALTER 幂等：对已有 `/data/dlm.db` 跑两次 `init_db()` 不报错、不丢数据。
-- [ ] 单元测试：4 道闸门每道单独拦住（NULL/paused/前缀漂移/shard 未全 done）。
-- [ ] 单元测试：三档比例分别产出 `ready` / `ready`+WARNING / `blocked`+CRITICAL。
-- [ ] 单元测试：reconciler 推断的 done **不触发** arm（只有 `/api/task-progress` 会）。
-- [ ] 单元测试：arm 不改写任务自己的 `status`。
-- [ ] 单元测试：arm 过程中不发起任何外部 HTTP（mock 上断言零调用）。
-- [ ] `POST /transfer/trigger` 与 `/{task_id}/retry` 不再 import Celery，返回后
+- [x] 新列 ALTER 幂等：对已有 `/data/dlm.db` 跑两次 `init_db()` 不报错、不丢数据。
+- [x] 单元测试：4 道闸门每道单独拦住（NULL/paused/前缀漂移/shard 未全 done）。
+- [x] 单元测试：三档比例分别产出 `ready` / `ready`+WARNING / `blocked`+CRITICAL。
+- [x] 单元测试：reconciler 推断的 done **不触发** arm（只有 `/api/task-progress` 会）。
+- [x] 单元测试：arm 不改写任务自己的 `status`。
+- [x] 单元测试：arm 过程中不发起任何外部 HTTP（mock 上断言零调用）。
+- [x] `POST /transfer/trigger` 与 `/{task_id}/retry` 不再 import Celery，返回后
       库里出现 `ready` 行。
-- [ ] `transfer_paused` 写入后重启进程仍为真。
-- [ ] `dlm/transfer/tasks.py` 删除后全套测试仍绿（证明真没人用）。
+- [x] `transfer_paused` 写入后重启进程仍为真。
+- [x] `dlm/transfer/tasks.py` 删除后全套测试仍绿（证明真没人用）。
 
 ### 阶段三
-- [ ] 单元测试：在飞 16 条时不再发新的；在飞 15 条时只发 1 条。
-- [ ] 单元测试：每轮新发不超过 4 条，即使 ready 有 50 条。
-- [ ] 单元测试：`transfer_paused` 为真 → 一条都不发。
-- [ ] 单元测试：FIFO——`transfer_armed_at` 最早的先发。
-- [ ] 单元测试：远端成功但 `jfs < bos` → `short`，**不是** `done`。
-- [ ] 单元测试：scope 有多余子项 → `short` + 告警。
-- [ ] 单元测试：4 条告警各自能被 `check_alerts` 产出。
-- [ ] `tests/test_event_loop_safety.py` 仍绿（新 stage 必须走 `_blocking_stage`）。
-- [ ] 全套测试（当前 754）仍绿。
+- [x] 单元测试：在飞 16 条时不再发新的；在飞 15 条时只发 1 条。
+- [x] 单元测试：每轮新发不超过 4 条，即使 ready 有 50 条。
+- [x] 单元测试：`transfer_paused` 为真 → 一条都不发。
+- [x] 单元测试：FIFO——`transfer_armed_at` 最早的先发。
+- [x] 单元测试：远端成功但 `jfs < bos` → `short`，**不是** `done`。
+- [x] 单元测试：scope 有多余子项 → `short` + 告警。
+- [x] 单元测试：4 条告警各自能被 `check_alerts` 产出（`blocked`/`short`/`failed`/`stalled`）。
+- [x] `tests/test_event_loop_safety.py` 仍绿（新 stage 必须走 `_blocking_stage`）。
+- [x] 全套测试仍绿（754 → 876）。
 
 ### 端到端（molmobot-data，3.40 TB，`other/molmobot-data/`）
-- [ ] 部署前先只读实测 BOS 该前缀的字节数与对象数。
-- [ ] 手动触发 → `ready` → 派发器发出 import → `transferring` +
-      `transfer_task_id` 落库 → 远端完成 → `verifying` → `done`。
-- [ ] 网页能看到整条状态变化；BOS 侧字节数与对象数**前后一致**（搬运只读 BOS）。
+- [x] 部署前先只读实测 BOS 该前缀的字节数与对象数。
+- [x] 部分完成（2026-08-10 02:38）：手动触发 → `ready` → 派发器发出 import →
+      `transferring` + `transfer_task_id`（`245943e0…beccca7a13b1`）落库。
+      远端状态 `运行中`，源/目的两端地址与 `endpoint_source` 重建的一致。
+- [ ] 待远端完成后确认：`verifying` → `done`。**实测前缀 10.32 TB / 4,765 obj**，
+      是 shard 行记的 3.40 TB 的 3.03 倍——验证分母用的是派发时实测的
+      `transfer_bos_bytes`（10,319,743,556,111），不是 `SUM(shards.total_bytes)`，
+      正是为这种情形准备的。
+- [ ] 待远端完成后确认：网页能看到整条状态变化；BOS 侧字节数与对象数前后一致。
 
 ## 7. 明确不做（YAGNI）
 
