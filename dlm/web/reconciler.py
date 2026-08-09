@@ -427,8 +427,10 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
                         "message": (
                             f"Pool task {t.get('name', t['id'])} ({source}): "
                             f"{queue_name} has 0 activity pollers and no batch "
-                            f"reported by a {source} worker recently "
-                            f"({zeros} consecutive samples)"
+                            f"reported by a worker on it recently "
+                            f"({zeros} consecutive samples). Both halves of that "
+                            f"reading arrive here over the network — check this "
+                            f"web process too before concluding the fleet is dead"
                         ),
                     })
                     alerted_task_ids.add(t["id"])
