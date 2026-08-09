@@ -194,7 +194,61 @@ def test_shard_modal_heading_branches_pool_vs_sharded():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4. Review finding M5 — doctorFix's toast drops skipped_pool_tasks
+# 4. The shard-count input is sharded-only (pool has shipped)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The input was left visible and unconditionally submitted while pool was
+# still landing, with a note in app.js saying the mode-awareness would follow.
+# Pool is now the server default, so the form's most prominent numeric field
+# is one that does nothing for the mode almost every new task uses: someone
+# types "6 workers", the task recruits whatever the dispatch window allows,
+# and the number they set is never read (tasks.py:347 only stores it, and only
+# the sharded coordinator reads it).
+
+
+def test_effective_dispatch_mode_falls_back_to_the_server_default():
+    """The gate has to key off the mode the task will ACTUALLY get. The form's
+    own value is '' whenever the user has not overridden it, so reading
+    addForm.dispatch_mode alone would show the sharded-only input on a pool
+    cluster — the exact bug this closes."""
+    appjs = (STATIC / "app.js").read_text()
+    start = appjs.index("effectiveDispatchMode()")
+    body = appjs[start:appjs.index("},", start)]
+    assert "this.addForm.dispatch_mode || this.defaultDispatchMode" in body
+
+
+def test_shard_count_input_is_hidden_unless_the_task_will_be_sharded():
+    index = (STATIC / "index.html").read_text()
+    start = index.index("Shards (workers)")
+    # walk back to the enclosing row that carries the gate
+    row = index[index.rindex("<div", 0, index.rindex("<div", 0, start)):start]
+    assert "effectiveDispatchMode() === 'sharded'" in row
+    assert "x-show" in row
+
+
+def test_submit_add_sends_shard_count_only_for_sharded():
+    """A pool task must not carry a shard_count at all. Sending 0 would be
+    harmless today (tasks.py:347 gates on > 0) but it re-establishes the field
+    as part of every pool submission, which is how the stale max_workers got
+    written in the first place."""
+    appjs = (STATIC / "app.js").read_text()
+    start = appjs.index("async submitAdd()")
+    body = appjs[start:appjs.index("async restartWorker", start)]
+    assert "if (this.effectiveDispatchMode() === 'sharded')" in body
+    assert "body.shard_count" in body
+    # not an unconditional key in the body literal
+    assert "shard_count: Number(" not in body
+
+
+def test_the_pool_ships_later_comment_is_gone():
+    """The note that deferred this ("the form's mode-awareness lands after pool
+    ships") is now false, and a false comment about a gate is worse than none."""
+    appjs = (STATIC / "app.js").read_text()
+    assert "lands after pool ships" not in appjs
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5. Review finding M5 — doctorFix's toast drops skipped_pool_tasks
 # ═══════════════════════════════════════════════════════════════════════
 
 

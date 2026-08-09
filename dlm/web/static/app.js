@@ -28,6 +28,14 @@ function app() {
         // so the add-form select can show the live server default instead of
         // a client-side guess.
         defaultDispatchMode: '',
+        // What the task will actually be dispatched as: the explicit form choice
+        // if there is one, otherwise whatever the server default resolves to.
+        // Before the first /api/dashboard reply defaultDispatchMode is '', so
+        // this reads '' too — the shard input stays hidden rather than flashing
+        // for a moment on a pool cluster.
+        effectiveDispatchMode() {
+            return this.addForm.dispatch_mode || this.defaultDispatchMode;
+        },
         transferTasks: [],
         transferSummary: {},
         transferPaused: false,
@@ -265,16 +273,19 @@ function app() {
                     type: this.addForm.type,
                     priority: this.addForm.priority,
                     no_dispatch: this.addForm.no_dispatch,
-                    // 0 = "let the server pick" — sharded mode only. Pool mode
-                    // ignores it (it sizes its own batches), so it is sent
-                    // unconditionally rather than gated on dispatch_mode: the
-                    // form's mode-awareness lands after pool ships.
-                    shard_count: Number(this.addForm.shard_count) || 0,
                 };
                 // '' means "server default" (see addForm init) — omit the key
                 // entirely so the backend applies fleet.DEFAULT_DISPATCH_MODE
                 // instead of receiving an explicit empty-string override.
                 if (this.addForm.dispatch_mode) body.dispatch_mode = this.addForm.dispatch_mode;
+                // 0 = "let the server pick", and only sharded mode has anything
+                // to pick — pool sizes its own batches from the filelist. Sent
+                // only for sharded so a pool task cannot carry a max_workers
+                // that nothing reads (tasks.py:347) and that the UI would then
+                // display as if it meant something.
+                if (this.effectiveDispatchMode() === 'sharded') {
+                    body.shard_count = Number(this.addForm.shard_count) || 0;
+                }
                 const res = await fetch('/api/tasks', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},

@@ -1002,12 +1002,16 @@
                     </select>
                 </div>
             </div>
-            <div class="grid grid-cols-2 gap-3">
+            <!-- Sharded mode only. Pool cuts its own fixed-size batches from the
+                 filelist, so under pool this input has no effect at all — showing
+                 it there invites someone to set "6 workers" and watch the task
+                 recruit whatever the dispatch window allows. -->
+            <div class="grid grid-cols-2 gap-3" x-show="effectiveDispatchMode() === 'sharded'">
                 <div>
                     <label class="text-xs text-gray-400">Shards (workers)</label>
                     <input x-model.number="addForm.shard_count" type="number" min="0" max="16" placeholder="0"
                            class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
-                    <div class="text-xs text-gray-500 mt-1">Sharded mode only — 0 = auto, capped at the idle workers for this source. Pool mode sizes its own batches.</div>
+                    <div class="text-xs text-gray-500 mt-1">0 = auto, capped at the idle workers for this source.</div>
                 </div>
             </div>
             <div class="flex items-center gap-2">
