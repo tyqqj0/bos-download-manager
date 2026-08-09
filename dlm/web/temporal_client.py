@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from datetime import timedelta
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from temporalio.client import Client
 
@@ -374,7 +374,7 @@ async def pending_activities(workflow_id: str) -> list[dict]:
 
 
 def live_pool_batch_count(source: str, now: float | None = None) -> int:
-    """Worker-reported running batches for this source — the busy/dead tiebreak.
+    """Worker-reported running batches on this source's pool queue — the busy/dead tiebreak.
 
     BLOCKING (SQLite): call from a thread, never straight off the event loop.
 
@@ -384,18 +384,39 @@ def live_pool_batch_count(source: str, now: float | None = None) -> int:
     registered this queue" produce the identical reading. This is the
     disambiguator both the dispatch gate and the pool patrol consult before
     they act on a zero: a nonzero count means a live worker wrote to a batch
-    row of this source inside POOL_LIVE_BATCH_WINDOW_S.
+    row on this queue inside POOL_LIVE_BATCH_WINDOW_S.
+
+    `source` is normalised to its queue's canonical source before the count,
+    because one pool queue is one worker pool: a `huggingface` task and an
+    `hf` task share pool-hf and must vouch for each other.
     """
     from ..queue.snapshot import count_live_pool_batches, init_db
-    from .fleet import POOL_LIVE_BATCH_WINDOW_S
+    from .fleet import POOL_LIVE_BATCH_WINDOW_S, pool_queue_source
 
     init_db()
     ref = time.time() if now is None else now
-    return count_live_pool_batches(source, ref - POOL_LIVE_BATCH_WINDOW_S)
+    return count_live_pool_batches(
+        pool_queue_source(source), ref - POOL_LIVE_BATCH_WINDOW_S
+    )
 
 
-async def pool_queue_is_served(client: Client, source: str, queue_name: str) -> bool:
-    """True if this source's pool queue has a live consumer.
+class PoolQueueService(NamedTuple):
+    """Why a pool queue counts as served (or not) — see pool_queue_is_served.
+
+    `served` is the answer both callers act on. `pollers` is kept because
+    served-with-zero-pollers means something different from served-with-a-free-
+    worker: the first is a saturated fleet, where a batch activity sitting
+    SCHEDULED is ordinary queueing rather than starvation.
+    """
+    served: bool
+    pollers: int
+    live_batches: int
+
+
+async def pool_queue_is_served(
+    client: Client, source: str, queue_name: str
+) -> PoolQueueService:
+    """Whether this source's pool queue has a live consumer, and on what evidence.
 
     Raises whatever the describe RPC raises — callers differ on what an
     unknown answer means (the gate refuses fail-closed, the patrol stays
@@ -403,7 +424,7 @@ async def pool_queue_is_served(client: Client, source: str, queue_name: str) -> 
     """
     pollers = await _pool_poller_count(client, queue_name)
     if pollers > 0:
-        return True
+        return PoolQueueService(True, pollers, 0)
     live = await asyncio.get_running_loop().run_in_executor(
         None, live_pool_batch_count, source
     )
@@ -413,8 +434,7 @@ async def pool_queue_is_served(client: Client, source: str, queue_name: str) -> 
             f"reported recently — the fleet is saturated, not absent "
             f"(one batch per pool worker, so a busy worker stops polling)"
         )
-        return True
-    return False
+    return PoolQueueService(live > 0, 0, live)
 
 
 async def start_pool_download(task_dict: dict, task_queue: str | None = None):
@@ -476,7 +496,7 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
     # AST scan only inspects the handler's own body, so this indirection is
     # invisible to it.
     try:
-        served = await pool_queue_is_served(client, source, queue_name)
+        service = await pool_queue_is_served(client, source, queue_name)
     except Exception as e:
         msg = (
             f"pool gate: liveness probe for {queue_name} failed: {type(e).__name__}: {e} "
@@ -486,11 +506,11 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
         )
         logger.critical(msg)
         raise PoolPollerGateError(msg) from e
-    if not served:
+    if not service.served:
         msg = (
             f"pool gate rejected task {task_dict.get('id')}: {queue_name} has "
-            f"0 activity pollers and no pool batch reported by a {source} "
-            f"worker in the last {POOL_LIVE_BATCH_WINDOW_S}s — nothing would "
+            f"0 activity pollers and no worker on that queue reported a running "
+            f"pool batch in the last {POOL_LIVE_BATCH_WINDOW_S}s — nothing would "
             f"drain this queue (is a pool worker registered on {queue_name}?)"
         )
         logger.critical(msg)

@@ -100,12 +100,28 @@ POOL_STARVED_SAMPLE_GAP_S = 900
 # reporting. 240s is 16 consecutive missed reports before a live worker stops
 # vouching for its queue.
 #
+# The one phase this does NOT cover is run_pool_batch's preflight: after the
+# assign + status=running POSTs, the batch-list fetch and the BOS HEAD sweep
+# (activities.py `_head_skip_filter`, up to 500 objects) run before
+# PipelineEngine — and therefore before the speed reporter — exists, writing
+# nothing to SQLite. That phase is budgeted by POOL_BATCH_HEARTBEAT (10 min),
+# so a slow BOS can leave a genuinely live batch's row stale here, which reads
+# as a dead fleet: a new pool task is refused (it retries every 30s, so it
+# recovers on its own) and a sustained case can raise a false pool_starved.
+# Raising this window is not the fix — the A10 bound below leaves it no room.
+# The fix is to make the preflight heartbeater POST shard-progress too, so the
+# claim above becomes literally true; that is worker code, hence a worker
+# deploy, hence not folded into this web-only change.
+#
 # It is deliberately kept well under one patrol interval, because it delays
 # trigger 1: the first unserved sample cannot land until the rows have gone
 # stale. Worst case now 240 + 2x300 = 840s from the fleet going quiet to
-# CRITICAL, still inside A10's 15-minute detection bound. A window of 20 min
-# (two Temporal batch heartbeats — the wrong constant to reason from) would
-# have pushed that past 25 min and quietly broken the drill.
+# CRITICAL, still inside A10's 15-minute detection bound — with only 60s of
+# slack, and the patrol's real cadence is 300s plus one scheduler iteration, so
+# tests/test_pool_observability.py asserts the arithmetic rather than leaving
+# the next edit of either constant to rediscover it. A window of 20 min (two
+# Temporal batch heartbeats — the wrong constant to reason from) would have
+# pushed that past 25 min and quietly broken the drill.
 POOL_LIVE_BATCH_WINDOW_S = int(os.environ.get("DLM_POOL_LIVE_BATCH_WINDOW_S", "240"))
 
 # Window weights per priority band. The coordinator's per-wake window is this
@@ -515,6 +531,25 @@ def worker_serves(server_key: str, source: str) -> bool:
     """
     wanted = "modelscope" if source == "modelscope" else "hf"
     return source_for_worker(server_key) == wanted
+
+
+def pool_queue_source(source: str) -> str:
+    """The canonical source of the pool queue a task of `source` dispatches to.
+
+    workflows.pool_task_queue sends everything that is not `modelscope` to
+    pool-hf, and worker_serves above routes every such worker to the HK fleet,
+    so `hf`, `huggingface`, `wget` and a typo all share one queue and one
+    worker pool. Anything asking "is that queue being served" must therefore
+    bucket the same way, or it asks about a subset: /api/queue/add does not
+    validate `source` (routes/queue.py takes it from the body or the parsed
+    repo), so a task created as `huggingface` really does reach the HK workers
+    and really does share pool-hf with the `hf` tasks.
+
+    Kept here rather than in workflows.py because that module must stay
+    replay-deterministic and is the workers' code; this is a web-side mirror of
+    its one-line rule, and tests/test_pool_dispatch.py asserts the two agree.
+    """
+    return "modelscope" if source == "modelscope" else "hf"
 
 
 SHARED_COORDINATOR_QUEUE = "download-workers"

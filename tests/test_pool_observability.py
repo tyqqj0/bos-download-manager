@@ -364,6 +364,117 @@ def test_a_busy_fleet_on_another_source_does_not_vouch_for_this_one(db, monkeypa
     assert [a["task_id"] for a in alerts] == ["t-hf-dead"]
 
 
+def test_two_sources_on_one_queue_cannot_double_count_the_confirmation(db, monkeypatch):
+    """The confirmation streak is keyed by queue, so it must be sampled by queue.
+
+    pool_task_queue sends every non-modelscope source to pool-hf and
+    /api/queue/add does not validate `source`, so `hf` and `huggingface` tasks
+    coexist on one queue. Grouping the patrol by raw source would run the
+    trigger twice per cycle against the same _POOL_ZERO_POLLER_SAMPLES entry,
+    reaching CRITICAL on the FIRST cycle and throwing away the confirmation
+    that exists because Temporal's poller list is a recency view.
+    """
+    from dlm.web import reconciler
+
+    _task(db, "t-a", status="downloading", mode="pool", source="hf")
+    _abandoned_batch(db, "t-a", "s-a-0")
+    _task(db, "t-b", status="downloading", mode="pool", source="huggingface")
+    _abandoned_batch(db, "t-b", "s-b-0", server="w2")
+    _stub_pending_activities(monkeypatch, {})
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
+
+    tasks = [db.get_task("t-a"), db.get_task("t-b")]
+    assert asyncio.run(reconciler.inspect_pool_tasks(tasks)) == []  # sample 1 of 2
+    alerts = asyncio.run(reconciler.inspect_pool_tasks(tasks))
+    assert sorted(a["task_id"] for a in alerts) == ["t-a", "t-b"]
+    assert {a["trigger"] for a in alerts} == {"no_pollers"}
+
+
+def test_scheduled_stuck_is_not_reported_on_a_saturated_queue(db, monkeypatch):
+    """#91 made this state reachable, so trigger 2 must not call it starvation.
+
+    A pool worker takes ONE batch at a time and a batch may run for hours
+    (POOL_BATCH_START_TO_CLOSE = 12h), while the window's share is sized
+    against ALIVE workers. So a second task admitted onto a full fleet has its
+    first batches SCHEDULED behind the first task's, and at the 900s mark
+    trigger 2 would raise `pool_starved` about ordinary queueing — the same
+    false positive #90 removed from trigger 1, one trigger over.
+    """
+    from dlm.web import reconciler
+    from dlm.web.fleet import POOL_STARVED_SCHEDULED_S
+
+    # Task A holds the whole fleet; its rows are fresh, so the queue is served
+    # with zero pollers = saturated.
+    _task(db, "t-holder", status="downloading", mode="pool", source="hf")
+    for i in range(7):
+        db.upsert_shard({"id": f"s-hold-{i}", "task_id": "t-holder",
+                         "shard_index": i, "status": "running",
+                         "server": f"w{i + 1}", "updated_at": time.time()})
+    # Task B was just admitted and is waiting its turn.
+    _task(db, "t-waiter", status="downloading", mode="pool", source="hf")
+    db.upsert_shard({"id": "s-wait-0", "task_id": "t-waiter", "shard_index": 0,
+                     "status": "pending"})
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
+    _stub_pending_activities(monkeypatch, {
+        "pool-t-waiter": [{"activity_type": "run_pool_batch", "state": "SCHEDULED",
+                           "attempt": 1,
+                           "scheduled_at": time.time() - POOL_STARVED_SCHEDULED_S - 1,
+                           "last_started_at": None}],
+    })
+
+    tasks = [db.get_task("t-holder"), db.get_task("t-waiter")]
+    for _ in range(3):  # past the confirmation requirement, in case of leakage
+        assert asyncio.run(reconciler.inspect_pool_tasks(tasks)) == []
+
+
+def test_scheduled_stuck_still_fires_when_a_worker_is_free(db, monkeypatch):
+    """The exemption is saturation-only. With an idle poller on the queue, a
+    batch aged out in SCHEDULED means the free worker is not taking it, which
+    is the anomaly trigger 2 exists for."""
+    from dlm.web import reconciler
+    from dlm.web.fleet import POOL_STARVED_SCHEDULED_S
+
+    _task(db, "t-free", status="downloading", mode="pool", source="hf")
+    db.upsert_shard({"id": "s-free-0", "task_id": "t-free", "shard_index": 0,
+                     "status": "running", "server": "w1",
+                     "updated_at": time.time()})
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=4))
+    _stub_pending_activities(monkeypatch, {
+        "pool-t-free": [{"activity_type": "run_pool_batch", "state": "SCHEDULED",
+                         "attempt": 1,
+                         "scheduled_at": time.time() - POOL_STARVED_SCHEDULED_S - 1,
+                         "last_started_at": None}],
+    })
+
+    alerts = asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-free")]))
+    assert [(a["severity"], a["trigger"]) for a in alerts] == [("warning", "scheduled_stuck")]
+
+
+def test_the_a10_detection_bound_still_holds_arithmetically():
+    """The bound this whole trigger is graded on, asserted rather than narrated.
+
+    A10 requires a dead pool fleet to be detected within 15 minutes. Detection
+    cannot happen before the batch rows go stale (POOL_LIVE_BATCH_WINDOW_S),
+    and then needs POOL_STARVED_ZERO_SAMPLES consecutive patrol cycles
+    (RECONCILE_INTERVAL apart) to confirm. POOL_LIVE_BATCH_WINDOW_S was
+    originally set to 1200s, which pushed this to ~1800s and silently
+    invalidated the drill with every test still green — so the arithmetic is a
+    test now, not a comment.
+    """
+    from dlm.web.fleet import POOL_LIVE_BATCH_WINDOW_S, POOL_STARVED_ZERO_SAMPLES
+    from dlm.web.scheduler import RECONCILE_INTERVAL
+
+    A10_DETECTION_BOUND_S = 900
+    worst_case = POOL_LIVE_BATCH_WINDOW_S + POOL_STARVED_ZERO_SAMPLES * RECONCILE_INTERVAL
+    assert worst_case <= A10_DETECTION_BOUND_S, (
+        f"worst-case pool_starved detection is {worst_case}s, past A10's "
+        f"{A10_DETECTION_BOUND_S}s: window={POOL_LIVE_BATCH_WINDOW_S}, "
+        f"samples={POOL_STARVED_ZERO_SAMPLES}, cycle={RECONCILE_INTERVAL}. "
+        f"The real cadence is one cycle plus a scheduler iteration, so this "
+        f"has no slack to spend."
+    )
+
+
 def test_scheduled_stuck_triggers_warning_pool_starved(db, monkeypatch):
     from dlm.web import reconciler
     from dlm.web.fleet import POOL_STARVED_SCHEDULED_S

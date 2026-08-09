@@ -709,28 +709,39 @@ def get_running_shards(include_stopped_tasks: bool = False) -> list:
     return [dict(r) for r in rows]
 
 
-def count_live_pool_batches(source: str, since: float) -> int:
-    """Running pool batch rows for `source` that a worker reported on since `since`.
+def count_live_pool_batches(queue_source: str, since: float) -> int:
+    """Running pool batch rows on `queue_source`'s pool queue, reported since `since`.
 
-    Evidence that some worker process is alive and draining this source's pool
+    Evidence that some worker process is alive and draining that pool
     queue, for the two callers that cannot get that answer from
     DescribeTaskQueue: a pool worker runs one batch at a time, so a fully-busy
     fleet stops polling and reads identically to a fleet that never registered
     the queue (see fleet.POOL_LIVE_BATCH_WINDOW_S).
 
-    Both conditions past `status = 'running'` are worker-originated writes,
-    which is what makes the count evidence rather than bookkeeping:
+    `queue_source` is `modelscope` or `hf` — a QUEUE, not a task's raw source
+    column. One queue is one worker pool, and workflows.pool_task_queue sends
+    every non-modelscope source to pool-hf, so matching `t.source` exactly
+    would count a subset: with an `hf` task saturating HK and a `huggingface`
+    task asking, the answer would be 0 and the live fleet would read as dead.
+    Pass fleet.pool_queue_source(task_source); the WHERE clause below mirrors
+    pool_task_queue's rule and nothing else may be assumed about the column.
+
+    All three conditions are worker-originated writes, which is what makes the
+    count evidence rather than bookkeeping:
       - `server` is only ever set by POST /api/shards/assign, which
-        `run_pool_batch` calls from the worker that claimed the batch (in
-        preflight, before the disk check, so a claimed batch counts
-        immediately). A dispatched-but-unclaimed row has a fresh `updated_at`
-        (upsert_shard stamps it) and no server, and must not count.
+        `run_pool_batch` calls from the worker that claimed the batch. A
+        dispatched-but-unclaimed row has a fresh `updated_at` (upsert_shard
+        stamps it) and no server, and must not count.
+      - `status = 'running'` arrives with the POST /api/shards/status that
+        immediately follows the assign, so a row counts from the start of
+        preflight — but only once that second POST lands. If it fails, the row
+        keeps `pending` and this correctly declines to vouch for it.
       - `updated_at` is bumped by POST /api/shard-progress, which the same
-        activity sends on a 15s throttle for as long as the batch runs. The
+        activity sends on a 15s throttle for as long as the pipeline runs. The
         one non-worker writer of pool rows,
         reconciler.reclaim_orphaned_shards, skips pool rows outright and
-        writes `failed` (terminal) when it does write, so it cannot fake
-        freshness here.
+        writes `failed` (terminal) when it does write; zero_stale_speeds
+        touches `speed_mbps` only. Neither can fake freshness here.
 
     The parent task's status is deliberately NOT filtered. It would be nearly
     redundant — /api/shard-progress and /api/shards/status both refuse to
@@ -738,22 +749,21 @@ def count_live_pool_batches(source: str, since: float) -> int:
     question here is "is a worker process alive", and if one somehow does
     report, that answer is yes regardless of what the operator did to the
     task. Rows of a stopped task age out of the window on their own.
-
-    `source` is matched exactly, while workflows.pool_task_queue buckets
-    everything that is not `modelscope` onto pool-hf. Those agree because the
-    only two sources that reach dispatch are `hf` and `modelscope`
-    (fleet.worker_serves routes no worker to anything else, so a task with a
-    third source is never claimed). A third real source sharing pool-hf would
-    have to make this per-queue rather than per-source — and would also
-    collide on the patrol's queue-keyed sample streak.
     """
     conn = _conn()
+    # Mirrors workflows.pool_task_queue: pool-ms is exactly `modelscope`,
+    # pool-hf is everything else (including NULL and '').
+    source_clause = (
+        "t.source = 'modelscope'" if queue_source == "modelscope"
+        else "COALESCE(t.source, '') != 'modelscope'"
+    )
     row = conn.execute(
         "SELECT COUNT(*) FROM shards s JOIN tasks t ON t.id = s.task_id "
-        "WHERE s.status = 'running' AND t.dispatch_mode = 'pool' AND t.source = ? "
+        "WHERE s.status = 'running' AND t.dispatch_mode = 'pool' "
+        f"AND {source_clause} "
         "AND s.server IS NOT NULL AND s.server != '' "
         "AND COALESCE(s.updated_at, 0) > ?",
-        (source, since),
+        (since,),
     ).fetchone()
     return int(row[0]) if row else 0
 

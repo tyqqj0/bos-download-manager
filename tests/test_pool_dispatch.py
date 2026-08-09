@@ -292,6 +292,42 @@ def test_pool_gate_live_batches_are_per_source(db, monkeypatch):
     assert tc.live_pool_batch_count("hf") == 0
 
 
+def test_pool_queue_source_mirrors_the_workflow_routing_rule():
+    """fleet.pool_queue_source is a web-side copy of workflows.pool_task_queue's
+    one-line rule (that module has to stay replay-deterministic and is the
+    workers' code, so the web cannot route through it). If the two ever
+    disagree, the liveness count asks about a different worker pool than the
+    one the batch was dispatched to."""
+    from dlm.temporal.workflows import pool_task_queue
+    from dlm.web.fleet import pool_queue_source
+
+    for source in ("hf", "huggingface", "modelscope", "wget", "", "HF"):
+        canonical = pool_queue_source(source)
+        assert pool_task_queue(source) == pool_task_queue(canonical), source
+        assert canonical in ("hf", "modelscope")
+
+
+def test_pool_gate_live_batches_are_counted_per_queue_not_per_source_string(db):
+    """One pool queue is one worker pool, so tasks sharing it vouch for each other.
+
+    /api/queue/add does not validate `source` (routes/queue.py takes it from
+    the body or the parsed repo) and fleet.worker_serves routes every
+    non-modelscope source to the HK fleet, so a task created as `huggingface`
+    really does run on pool-hf alongside the `hf` tasks. Matching t.source
+    exactly would answer 0 for it while HK is saturated — the gate would refuse
+    it forever, which is exactly the bug #91 set out to remove.
+    """
+    import dlm.web.temporal_client as tc
+
+    _task(db, "t-hf", status="downloading", mode="pool", source="hf")
+    _live_batch(db, "t-hf", "t-hf-b0", server="w1")
+
+    assert tc.live_pool_batch_count("huggingface") == 1
+    assert tc.live_pool_batch_count("hf") == 1
+    # ...and the ModelScope queue is still a separate pool.
+    assert tc.live_pool_batch_count("modelscope") == 0
+
+
 def test_pool_gate_ignores_sharded_batch_rows(db, monkeypatch):
     """Sharded shards run as child workflows on per-worker queues and say
     nothing about whether anyone polls the pool queue."""

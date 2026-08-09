@@ -321,7 +321,9 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
     that window, not 5 minutes. Triggers
     2/3 (SCHEDULED aged out / attempt climbing) catch the slower failure
     shapes a poller-count check alone would miss (see the plan-vs-timers
-    analysis in decision A). All three emit the same alert type, keyed per
+    analysis in decision A). Trigger 2 is skipped on a queue trigger 1 found
+    saturated, where a queued batch is waiting its turn rather than starving.
+    All three emit the same alert type, keyed per
     task so the existing `_active_alerts` de-dupe in alerts.py collapses
     repeats.
     """
@@ -342,10 +344,18 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
     alerts: list[dict] = []
     alerted_task_ids: set = set()
 
-    # Trigger 1: zero ACTIVITY pollers on a source with a downloading pool
+    # Trigger 1: zero ACTIVITY pollers on a pool queue with a downloading pool
     # task holding >=1 non-terminal batch row. One poller-count RPC per
-    # affected source (not per task) — reused via T7's existing helper.
-    by_source: dict[str, list[dict]] = {}
+    # affected queue (not per task) — reused via T7's existing helper.
+    #
+    # Grouped by QUEUE, not by the raw `source` column, because one queue is
+    # one worker pool: pool_task_queue sends every non-modelscope source to
+    # pool-hf, and /api/queue/add does not validate source. Keying by source
+    # would let an `hf` task and a `huggingface` task each contribute a sample
+    # to the same _POOL_ZERO_POLLER_SAMPLES[queue_name] entry in a single
+    # cycle, reaching CRITICAL after one cycle instead of the two the
+    # confirmation is supposed to require.
+    by_queue: dict[str, list[dict]] = {}
     for t in pool_tasks:
         try:
             batches = get_shards_by_task(t["id"])
@@ -353,9 +363,14 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
             logger.error(f"Pool patrol: cannot read batch rows for {t['id']}: {e}")
             continue
         if any(b.get("status") not in _ROW_TERMINAL for b in batches):
-            by_source.setdefault(t.get("source") or "hf", []).append(t)
+            by_queue.setdefault(pool_task_queue(t.get("source") or "hf"), []).append(t)
 
-    if by_source:
+    # queue_name -> True when it is served but has no idle poller, i.e. every
+    # worker is inside a batch. Triggers 2/3 read this: on a saturated queue a
+    # SCHEDULED batch is waiting its turn, which is not starvation.
+    saturated_queues: dict[str, bool] = {}
+
+    if by_queue:
         try:
             client = await connected_client()
         except Exception as e:
@@ -363,10 +378,10 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
             client = None
 
         if client is not None:
-            for source, tasks_for_source in by_source.items():
-                queue_name = pool_task_queue(source)
+            for queue_name, tasks_for_source in by_queue.items():
+                source = tasks_for_source[0].get("source") or "hf"
                 try:
-                    served = await pool_queue_is_served(client, source, queue_name)
+                    service = await pool_queue_is_served(client, source, queue_name)
                 except Exception as e:
                     # Decision B: an RPC failure is not evidence of anything,
                     # so it stays silent — and it is not a healthy sample
@@ -379,7 +394,8 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
                         f"batch-row read; treating as no sample"
                     )
                     continue
-                if served:
+                if service.served:
+                    saturated_queues[queue_name] = service.pollers == 0
                     _POOL_ZERO_POLLER_SAMPLES.pop(queue_name, None)
                     continue
                 # One zero is not fleet death: Temporal's poller list is a
@@ -393,6 +409,7 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
                 if zeros < POOL_STARVED_ZERO_SAMPLES:
                     logger.warning(
                         f"Pool patrol: {queue_name} reported 0 activity pollers "
+                        f"and no worker on it reported a running batch recently "
                         f"(sample {zeros}/{POOL_STARVED_ZERO_SAMPLES}) — waiting for "
                         f"the next cycle to confirm before alerting"
                     )
@@ -428,10 +445,25 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
             logger.error(f"Pool patrol: pending_activities failed for {t['id']}: {e}")
             continue
 
+        # On a saturated queue, waiting is the design. Every pool worker takes
+        # ONE batch at a time and a batch may legitimately run for hours
+        # (POOL_BATCH_START_TO_CLOSE = 12h), while the window's share is sized
+        # against ALIVE workers of the source — so a second task admitted onto
+        # a full fleet has its first batches SCHEDULED behind the first task's,
+        # and trigger 2 would call that `pool_starved` at the 900s mark. Before
+        # #91 the gate refused that admission outright, so the state did not
+        # exist; now it does, and this is the same false positive #90 removed
+        # from trigger 1, one trigger over. Trigger 3 (attempt climbing) is not
+        # exempted: retries mean the batch is being picked up and failing,
+        # which saturation does not explain.
+        starved_is_meaningful = not saturated_queues.get(
+            pool_task_queue(t.get("source") or "hf"), False
+        )
+
         for row in rows:
             if row.get("state") == "SCHEDULED" and row.get("scheduled_at") is not None:
                 age = now - row["scheduled_at"]
-                if age > POOL_STARVED_SCHEDULED_S:
+                if age > POOL_STARVED_SCHEDULED_S and starved_is_meaningful:
                     alerts.append({
                         "severity": "warning",
                         "type": "pool_starved",
