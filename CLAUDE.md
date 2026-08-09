@@ -8,6 +8,9 @@ Multi-server dataset download manager. Coordinates 16 worker nodes downloading d
 - **Web UI**: http://154.85.43.52:8080
 - **State**: SQLite on S1 (`dlm/queue/snapshot.py`) — the ONLY state source. Legacy BOS state.json is dead (kept only in one-shot migrate scripts).
 - **Data buckets**: `auwomo-data` (datasets, keys = `{category}/{name}/{repo_path}`), `auwomo-model-open` (models, keys = `{name}/{repo_path}`)
+- **搬运（BOS→地瓜云）**: 自动，下载 `done` 即排队。用法/排障看
+  **[`docs/runbooks/transfer.md`](docs/runbooks/transfer.md)** — 状态机、`/api/transfer` 三个按钮、
+  手动脚本、额度常量、验证到底验了什么，都在那一页。只有 `blocked`/`short`/`failed` 需要人。
 
 ## Architecture (Temporal, since 2026-07)
 
@@ -94,6 +97,12 @@ curl -X POST .../api/tasks/{id}/skip        # terminate workflows, THEN revoke (
 
 # Inspect
 curl .../api/dashboard ; curl .../api/tasks/{id}/shards ; curl .../api/doctor
+
+# 搬运（BOS→地瓜云）。全部用法见 docs/runbooks/transfer.md
+curl .../api/transfer                                  # 每行的 transfer_status + summary + paused
+curl -X POST .../api/transfer/{task_id}/retry           # 重排一个 blocked/short/failed
+curl -X POST .../api/transfer/pause -d '{"paused":true}'   # 停发新的（在飞的照常跑完并验证）
+python3 scripts/transfer_import.py --execute --only NAME   # 手动车道（干跑是默认）
 ```
 
 ## Hard Constraints
