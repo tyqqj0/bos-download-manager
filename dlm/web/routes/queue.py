@@ -4,11 +4,13 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
 import asyncio
 from fastapi import APIRouter, HTTPException
 
+from ...core.bos import bos_target
 from ...core.naming import shard_row_id
 from ...queue import snapshot
 from ..fleet import TERMINAL_STATUSES
@@ -97,6 +99,17 @@ async def add_to_queue(body: dict):
 
     task_id = _next_task_id()
 
+    # `bos_path` is descriptive, never authoritative — the transfer gate reads
+    # `dispatch_prefix` (written at dispatch) and never this column. It is
+    # filled anyway because this route left it NULL on every task it ever
+    # created (RoboDojo, Manipulation-Kitchen-Demos, AgiBotWorld-Beta-BJ,
+    # RealOmin), which made the column look like a bug rather than a record.
+    # Same derivation as the other creation route (routes/tasks.py:318): the
+    # prefix only, from the same three fields, via the one function that decides
+    # it.
+    _, bos_path = bos_target(SimpleNamespace(
+        type=task_type, name=name, category=category))
+
     task_meta = {
         "id": task_id,
         "name": name,
@@ -104,6 +117,7 @@ async def add_to_queue(body: dict):
         "source": source,
         "type": task_type,
         "category": category,
+        "bos_path": bos_path,
         "status": "pending",
         "priority": priority,
         "size_gb": 0,

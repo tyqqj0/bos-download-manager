@@ -39,10 +39,15 @@ app.conf.update(
         "sep": ":",
         "queue_order_strategy": "priority",
     },
-    task_routes={
-        "dlm.transfer.tasks.transfer_to_juicefs": {"queue": "transfers"},
-    },
 )
 
-app.autodiscover_tasks(["dlm.transfer"])
-app.conf.include = ["dlm.transfer.tasks"]
+# No task_routes / autodiscover / include any more: dlm.transfer.tasks was the
+# only Celery task left in the repo and it is gone (2026-08-10). It transferred
+# BOS -> 地瓜云 by posting to a broker that has had no consumer since the Celery
+# download path was retired on 2026-06-30, and it wrote the task's own `status`
+# — the bug the transfer state machine exists to avoid. Transfers now run in the
+# web process (dlm/transfer/arm.py + the scheduler's transfer stages).
+#
+# This module stays because two live callers still import it: /api/servers reads
+# the broker to report Redis reachability, and queue/signals.py takes REDIS_URL
+# from here. It defines no tasks.

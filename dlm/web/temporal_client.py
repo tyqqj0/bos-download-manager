@@ -541,6 +541,31 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
     return handle
 
 
+def _record_dispatch_prefix(task: dict):
+    """Freeze the upload prefix this dispatch will use, for the transfer gate.
+
+    Here rather than in the two route handlers that create tasks because this
+    function is the single funnel every dispatch passes through — sharded, pool,
+    /queue/add, /queue/retry, the reconciler and doctor's repair path all arrive
+    here, and each of them re-dispatches with whatever name/category the row
+    holds NOW. That value is what the uploader will use, so it is the only
+    prefix a later transfer may read from; recomputing `bos_target()` at
+    transfer time would follow a rename the uploader never saw.
+
+    Best effort by design: a task that cannot record its prefix must still be
+    dispatched. The consequence of a miss is a NULL column, which the transfer
+    drift gate treats as "unknown, skip me" — the byte-ratio band still applies.
+    """
+    from ..queue import snapshot
+    from ..transfer.targets import plan_from_mapping
+
+    try:
+        snapshot.set_dispatch_prefix(task["id"], plan_from_mapping(task).source)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"could not record dispatch_prefix for "
+                       f"{task.get('id')}: {exc}")
+
+
 async def start_task_download(task: dict):
     """Dispatch entry point: routes a task to its coordinator by dispatch_mode.
 
@@ -564,6 +589,7 @@ async def start_task_download(task: dict):
 
     mode = task.get("dispatch_mode") or "sharded"
     queue = coordinator_queue(task.get("source") or "hf")
+    _record_dispatch_prefix(task)
     if mode == "sharded":
         return await start_sharded_download(task, task_queue=queue)
     if mode == "pool":

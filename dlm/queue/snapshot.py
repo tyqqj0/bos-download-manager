@@ -136,6 +136,17 @@ def init_db():
         );
 
         CREATE INDEX IF NOT EXISTS idx_missing_task ON missing_files(task_id);
+
+        -- Process-lifetime-independent flags. The one that forced this table
+        -- into existence is `transfer_paused`: it lived in the web process's
+        -- in-memory `cache`, so the pause button worked until the next web
+        -- restart and then silently un-paused itself. Anything an operator
+        -- toggles and expects to stay toggled belongs here, not in `cache`.
+        CREATE TABLE IF NOT EXISTS settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT,
+            updated_at REAL
+        );
     """)
     conn.commit()
 
@@ -179,6 +190,33 @@ def init_db():
         # max(10, 0.5%), but a hardcoded 100 in alerts would call it a WARNING.
         # 0 means "not finalized yet" ⇒ no CRITICAL verdict is possible.
         ("missing_files_limit", "INTEGER", "0"),
+        # ── transfer (BOS → 地瓜云) bookkeeping ──────────────────────────────
+        # `{bucket}/{prefix}` as computed at the moment the download was
+        # dispatched (temporal_client.start_task_download, the single funnel for
+        # both dispatch modes). This is the ONLY trustworthy record of where the
+        # uploader actually wrote: `bos_path` is historically dirty (measured
+        # 2026-08-10 — molmobot's column holds a 地瓜云 destination path) and
+        # recomputing `bos_target()` at transfer time reads the CURRENT
+        # name/category, so an operator renaming a finished task silently moves
+        # the prefix. NULL on every row that predates this column ⇒ the drift
+        # gate has nothing to compare and skips itself; it must not reject.
+        ("dispatch_prefix", "TEXT", "NULL"),
+        # The source `{bucket}/{prefix}` frozen at arm time. The dispatcher uses
+        # this verbatim and never re-derives — same rename hazard as above.
+        ("transfer_prefix", "TEXT", "NULL"),
+        # `SUM(shards.total_bytes)` at arm time: the bytes THIS round dispatched.
+        # Not `size_gb` (measured 3 accurate / 9 short) and never plus
+        # `resume_skipped_gb` (accumulates across rounds — RoboDojo reads 715.7
+        # vs 5518.2 GB). Used as the ratio denominator, so a resumed task's
+        # ratio is legitimately >1 and the bands are deliberately one-sided.
+        ("transfer_bytes", "INTEGER", "0"),
+        # Arm timestamp: FIFO order for the dispatcher, and the only way to see
+        # a row that has been `ready` for a suspiciously long time.
+        ("transfer_armed_at", "REAL", "0"),
+        # Bytes actually measured on the far side after the remote import
+        # reported success, so a short transfer is queryable rather than living
+        # only inside an error string. 0 = not verified yet.
+        ("transfer_verified_bytes", "INTEGER", "0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")
@@ -206,6 +244,40 @@ CLAIM_RESET_PHASE_SQL = (
     "coordinator_phase = CASE WHEN dispatch_mode = 'pool' "
     "THEN 'listing' ELSE coordinator_phase END"
 )
+
+
+def get_setting(key: str, default=None):
+    """Read a persisted operator flag. Returns `default` when unset."""
+    conn = _conn()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value):
+    """Persist an operator flag. Stored as TEXT — callers coerce."""
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+        "updated_at = excluded.updated_at",
+        (key, str(value), time.time()),
+    )
+    conn.commit()
+
+
+def set_dispatch_prefix(task_id: str, prefix: str):
+    """Record where this dispatch will upload to (`{bucket}/{prefix}`).
+
+    Written at dispatch, read by the transfer drift gate. Overwrites on every
+    re-dispatch on purpose: the newest dispatch is the one whose uploader is
+    running, so it is the prefix a later transfer must match.
+    """
+    conn = _conn()
+    conn.execute(
+        "UPDATE tasks SET dispatch_prefix = ?, updated_at = ? WHERE id = ?",
+        (prefix, time.time(), task_id),
+    )
+    conn.commit()
 
 
 def upsert_task(task: dict):

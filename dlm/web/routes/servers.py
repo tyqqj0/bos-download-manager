@@ -214,6 +214,17 @@ async def task_progress(body: dict):
                           # Only `done`: a `failed` report with no error text is
                           # better served by a stale reason than by none.
                           clear_error=(status == "done" and not body.get("error")))
+            # Transfer arming hangs off THIS route on purpose: it is the one
+            # place a coordinator workflow reports its own completion. The
+            # reconciler's inferred `done` (reconciler.py, from shard rows) must
+            # never arm — that inference is how t-20260805-460d45 became a
+            # `done` task with nothing downloaded, and `completed_at` cannot
+            # distinguish the two afterwards. Advisory: `arm_quietly` swallows
+            # its own failures so transfer bookkeeping can never fail a
+            # worker's progress report.
+            if status == "done":
+                from ...transfer.arm import arm_quietly
+                arm_quietly(task_id)
             return {"ok": True, "completed": status}
 
         kwargs = {}
