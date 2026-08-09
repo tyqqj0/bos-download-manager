@@ -40,6 +40,14 @@ async def get_transfer_status():
                 "transfer_error": t.get("transfer_error"),
                 "transfer_prefix": t.get("transfer_prefix"),
                 "transfer_bytes": t.get("transfer_bytes", 0),
+                # The verification denominator, and the only number that makes
+                # `transfer_verified_bytes` mean anything. Measured 2026-08-10 on
+                # molmobot-data: shard rows said 3.40 TB, the prefix held 10.32 TB.
+                # Exposing the numerator without this was a number with no scale —
+                # and on a `short` row it left the shortfall unreadable without
+                # opening SQLite by hand.
+                "transfer_bos_bytes": t.get("transfer_bos_bytes", 0),
+                "transfer_bos_objects": t.get("transfer_bos_objects", 0),
                 "transfer_verified_bytes": t.get("transfer_verified_bytes", 0),
                 "transfer_armed_at": t.get("transfer_armed_at", 0),
                 "bos_path": t.get("bos_path", ""),

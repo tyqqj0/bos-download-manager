@@ -462,6 +462,30 @@ def test_the_status_route_counts_the_new_states_apart(armable):
     assert summary["failed"] == 0 and summary["transferred"] == 0
 
 
+def test_the_status_route_exposes_the_verification_denominator(armable):
+    """`transfer_verified_bytes` alone is a number with no scale.
+
+    Measured against the live API on 2026-08-10, right after molmobot-data
+    landed: the route returned `transfer_verified_bytes: 10319748599808` and
+    `transfer_bos_bytes: None`, so nothing on the web said what that had been
+    compared against. On a `short` row the same omission hides the shortfall.
+    """
+    from dlm.web.routes import transfer as transfer_routes
+
+    conn = armable._conn()
+    conn.execute(
+        "UPDATE tasks SET transfer_bos_bytes = ?, transfer_bos_objects = ?, "
+        "transfer_verified_bytes = ? WHERE id = 't-1'",
+        (10319743556111, 4765, 10319748599808))
+    conn.commit()
+
+    row = next(t for t in asyncio.run(transfer_routes.get_transfer_status())["tasks"]
+               if t["id"] == "t-1")
+    assert row["transfer_bos_bytes"] == 10319743556111
+    assert row["transfer_bos_objects"] == 4765
+    assert row["transfer_verified_bytes"] == 10319748599808
+
+
 # ── the dispatch-time prefix record ───────────────────────────────────────
 
 

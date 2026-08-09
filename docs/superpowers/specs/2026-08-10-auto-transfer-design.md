@@ -171,16 +171,20 @@ NULL ──arm──► ready ──dispatch──► transferring ──远端�
 - [x] `tests/test_event_loop_safety.py` 仍绿（新 stage 必须走 `_blocking_stage`）。
 - [x] 全套测试仍绿（754 → 876）。
 
-### 端到端（molmobot-data，3.40 TB，`other/molmobot-data/`）
+### 端到端（molmobot-data，`other/molmobot-data/`）
 - [x] 部署前先只读实测 BOS 该前缀的字节数与对象数。
-- [x] 部分完成（2026-08-10 02:38）：手动触发 → `ready` → 派发器发出 import →
-      `transferring` + `transfer_task_id`（`245943e0…beccca7a13b1`）落库。
-      远端状态 `运行中`，源/目的两端地址与 `endpoint_source` 重建的一致。
-- [ ] 待远端完成后确认：`verifying` → `done`。**实测前缀 10.32 TB / 4,765 obj**，
-      是 shard 行记的 3.40 TB 的 3.03 倍——验证分母用的是派发时实测的
-      `transfer_bos_bytes`（10,319,743,556,111），不是 `SUM(shards.total_bytes)`，
-      正是为这种情形准备的。
-- [ ] 待远端完成后确认：网页能看到整条状态变化；BOS 侧字节数与对象数前后一致。
+- [x] 手动触发 → `ready` → 派发器发出 import → `transferring` + `transfer_task_id`
+      （`245943e0…beccca7a13b1`）落库。源/目的两端地址与 `endpoint_source` 重建的一致。
+- [x] `verifying` → `done`（2026-08-10 03:07:08，全程 28 分 09 秒，≈6.1 GB/s）。
+      **实测前缀 10.32 TB / 4,765 obj**，是 shard 行记的 3.40 TB 的 3.03 倍——验证
+      分母用的是派发时实测的 `transfer_bos_bytes`（10,319,743,556,111），不是
+      `SUM(shards.total_bytes)`，正是为这种情形准备的。落地
+      10,319,748,599,808 B ≥ 派发字节，多出的 4.8 MB 是地瓜云侧的目录/块开销。
+- [x] 网页能看到整条状态变化；BOS 侧字节数与对象数前后一致（`transfer_error`
+      为空即第三项检查通过，源前缀在搬运期间没被改动）。
+      这一步顺带查出并修掉一个真 bug：`GET /api/transfer` 手写字段表时漏了
+      `transfer_bos_bytes` / `transfer_bos_objects`，于是网页只给出验证的分子、
+      不给分母——`short` 行的差额也就无法在网页上读出来。已补上并加回归测试。
 
 ## 7. 明确不做（YAGNI）
 
