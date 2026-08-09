@@ -30,10 +30,9 @@ Failure handling is deliberately asymmetric:
   - A remote import that reports failure becomes `failed` and stays there. It
     needs a human to decide whether to retry, and the manual button is how.
   - A row whose remote record we can no longer find (the list is capped at the
-    newest 500 and the far side holds 672) is measured instead of guessed: a
-    complete target lands `done`, an incomplete one stays `transferring` with
-    the shortfall recorded. Nothing here writes `short` on the strength of a
-    missing record.
+    newest 500) is measured instead of guessed: a complete target lands `done`,
+    an incomplete one stays `transferring` with the shortfall recorded. Nothing
+    here writes `short` on the strength of a missing record.
 """
 
 import logging
@@ -61,11 +60,12 @@ MAX_PER_CYCLE = 4
 CONSECUTIVE_FAIL_LIMIT = 2
 
 # In-flight rows whose remote record we cannot find that get measured in one
-# poll pass. `inflight.fetch_tasks` reads the newest 500 records and the far
-# side already holds 672, so a long-running import WILL fall off the list —
-# without this the row would sit in `transferring` forever, holding one of the
-# 16 slots and raising nothing. Bounded because each measurement is a full walk
-# of both ends, and the whole stage has 600s.
+# poll pass. `inflight.fetch_tasks` reads the newest 500 records, which as
+# measured on 2026-08-10 reach back about six weeks — so an import falls off
+# this window only if 500 newer ones are posted while it runs. Uncommon, but the
+# cost of assuming it cannot happen is a row sitting in `transferring` forever,
+# holding one of the 16 slots and raising nothing. Bounded because each
+# measurement is a full walk of both ends, and the whole stage has 600s.
 UNKNOWN_VERIFY_PER_CYCLE = 2
 
 

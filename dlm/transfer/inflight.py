@@ -98,6 +98,15 @@ def fetch_tasks(client, max_pages: int = 5, page_size: int = 100) -> list:
 
     One call refreshes every in-flight transfer at once, which is why the
     dispatcher can poll 16 concurrent imports with O(1) HTTP rather than O(N).
+
+    "Newest first" is measured, not assumed (2026-08-10, against the live API):
+    all 500 records came back in strictly descending `created_at`, and an import
+    posted seconds earlier was at index 0. The same measurement bounds how deep
+    500 records reach — back to 2026-06-28, about six weeks — so a long import
+    only falls off this window if 500 newer ones are posted during its lifetime.
+    Unlikely, but not impossible, and the cost of being wrong is a row stuck in
+    `transferring` forever; `dispatch.poll_transfers` handles the absence by
+    measuring the target instead of guessing (see UNKNOWN_VERIFY_PER_CYCLE).
     """
     out = []
     for page in range(1, max_pages + 1):
