@@ -170,8 +170,8 @@ class _FakeClient:
 
 def _live_batch(db, task_id, shard_id, *, server="w1", age_s=0.0):
     """A running batch row as a worker would have left it: claimed (server set
-    by /queue/shard-assign) and progressed (updated_at bumped by
-    /queue/shard-progress). `age_s` backdates the last report."""
+    by POST /api/shards/assign) and progressed (updated_at bumped by POST
+    /api/shard-progress). `age_s` backdates the last report."""
     db.upsert_shard({"id": shard_id, "task_id": task_id, "shard_index": 0,
                      "status": "running", "server": server,
                      "updated_at": time.time() - age_s})
@@ -350,7 +350,7 @@ def test_pool_gate_refuses_fail_closed_on_rpc_failure(db, monkeypatch, caplog):
     with caplog.at_level(logging.CRITICAL, logger="dlm.web"):
         with pytest.raises(tc.PoolPollerGateError):
             asyncio.run(tc.start_pool_download(task))
-    assert any("describe_task_queue RPC failed" in r.message for r in caplog.records)
+    assert any("liveness probe for pool-hf failed" in r.message for r in caplog.records)
     assert fake_client.started == []
 
 

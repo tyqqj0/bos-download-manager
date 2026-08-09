@@ -72,8 +72,9 @@ POOL_STARVED_ATTEMPT = 3  # T10's pre-restart check treats attempt>=3 as "a huma
 # matching-service failover, or a fleet that has just reconnected can return
 # an empty list while every worker is healthy — the same reason
 # temporal_client.start_pool_download wraps its own poller check in
-# try/except. Two consecutive samples cost one 300s patrol cycle to confirm,
-# which still lands inside A10's 15-minute detection bound.
+# try/except. Two consecutive samples cost one 300s patrol cycle to confirm;
+# with POOL_LIVE_BATCH_WINDOW_S's staleness delay on top, the whole trigger
+# still lands inside A10's 15-minute detection bound (see below).
 POOL_STARVED_ZERO_SAMPLES = 2
 # ...and "consecutive" means consecutive patrol cycles, not any two samples
 # ever taken: a zero recorded before an idle stretch says nothing about the
@@ -88,12 +89,24 @@ POOL_STARVED_SAMPLE_GAP_S = 900
 # pollers as a fleet that never registered the queue at all. Measured
 # 2026-08-09: HK 7/7 busy -> pool-hf = 0 pollers, BJ 9/9 idle -> pool-ms = 9.
 # The tie-breaker is a worker-originated batch report: if some worker has
-# written to a running pool batch row of this source within this window, the
-# queue demonstrably has a live consumer. Two batch heartbeats
-# (POOL_BATCH_HEARTBEAT = 10 min) of slack, so one missed report is not
-# mistaken for a dead fleet — and a fleet that really dies goes stale here
-# within 20 minutes and the alert fires as designed.
-POOL_LIVE_BATCH_WINDOW_S = int(os.environ.get("DLM_POOL_LIVE_BATCH_WINDOW_S", "1200"))
+# written to a running pool batch row of this source inside this window, the
+# queue demonstrably has a live consumer.
+#
+# Sized against the write that actually lands in SQLite, which is NOT the
+# Temporal heartbeat: run_pool_batch's progress_fn POSTs /api/shard-progress
+# (bumping shards.updated_at) on a 15s throttle, driven by PipelineEngine's
+# speed reporter — SPEED_REPORT_INTERVAL=15, called unconditionally every
+# interval while the batch is not done, so even a stalled-but-alive batch keeps
+# reporting. 240s is 16 consecutive missed reports before a live worker stops
+# vouching for its queue.
+#
+# It is deliberately kept well under one patrol interval, because it delays
+# trigger 1: the first unserved sample cannot land until the rows have gone
+# stale. Worst case now 240 + 2x300 = 840s from the fleet going quiet to
+# CRITICAL, still inside A10's 15-minute detection bound. A window of 20 min
+# (two Temporal batch heartbeats — the wrong constant to reason from) would
+# have pushed that past 25 min and quietly broken the drill.
+POOL_LIVE_BATCH_WINDOW_S = int(os.environ.get("DLM_POOL_LIVE_BATCH_WINDOW_S", "240"))
 
 # Window weights per priority band. The coordinator's per-wake window is this
 # task's share of P — P being alive workers serving the source — so these decide

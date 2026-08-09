@@ -309,15 +309,16 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
     scheduler loop, so a failed RPC is logged and skipped, not raised.
 
     Trigger 1 (nothing draining the queue) is what A10's drill exercises. It
-    fires on the SECOND consecutive unserved sample, i.e. ~600s after the
-    fleet stops draining (two 300s cycles) — one zero can just be Temporal's
-    recency-based poller view, and A10 also grades false positives. "Unserved"
-    is not "zero pollers": a pool worker runs one batch at a time, so a fully
-    busy fleet stops polling and reads exactly like a dead one, and this
-    trigger screamed CRITICAL every ~20 min at a healthy saturated HK fleet
-    until #90. pool_queue_is_served corroborates a zero against recent
-    worker-written batch rows; a fleet that really dies goes stale inside
-    POOL_LIVE_BATCH_WINDOW_S and the alert fires as designed. Triggers
+    fires on the SECOND consecutive unserved sample — one zero can just be
+    Temporal's recency-based poller view, and A10 also grades false positives.
+    "Unserved" is not "zero pollers": a pool worker runs one batch at a time,
+    so a fully busy fleet stops polling and reads exactly like a dead one, and
+    this trigger screamed CRITICAL every ~20 min at a healthy saturated HK
+    fleet until #90. pool_queue_is_served corroborates a zero against recent
+    worker-written batch rows, which puts the detection bound at
+    POOL_LIVE_BATCH_WINDOW_S (rows must go stale first) plus two patrol cycles
+    — worst case ~840s, so a drill that stops the pool fleet must wait out
+    that window, not 5 minutes. Triggers
     2/3 (SCHEDULED aged out / attempt climbing) catch the slower failure
     shapes a poller-count check alone would miss (see the plan-vs-timers
     analysis in decision A). All three emit the same alert type, keyed per
@@ -373,7 +374,9 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
                     # flapping frontend must not be able to suppress the
                     # alert by resetting confirmation on every other cycle.
                     logger.error(
-                        f"Pool patrol: poller-count RPC failed for {queue_name}: {e}"
+                        f"Pool patrol: liveness probe failed for {queue_name} "
+                        f"({type(e).__name__}: {e}) — describe_task_queue or the "
+                        f"batch-row read; treating as no sample"
                     )
                     continue
                 if served:

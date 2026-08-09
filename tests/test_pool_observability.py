@@ -1612,7 +1612,7 @@ def test_pool_gate_rpc_failure_is_distinguishable_from_under_polling(db, monkeyp
             asyncio.run(tc.start_pool_download(task))
 
     messages = [r.message for r in caplog.records]
-    assert any("describe_task_queue RPC failed" in m for m in messages), messages
+    assert any("liveness probe for pool-hf failed" in m for m in messages), messages
     # Distinguishable from the "rejected task ... has N poller(s)" wording
     # the under-polling branch uses (test_pool_dispatch.py's existing
     # test_pool_gate_rejects_and_alerts_when_pollers_below_alive_workers).

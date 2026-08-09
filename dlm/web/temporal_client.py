@@ -462,7 +462,10 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
     # still refuse (raise PoolPollerGateError, no fallback to sharded); only
     # the log message and the exception's message differ, so a human
     # scanning the log — or a future alert keyed on message content — can
-    # tell them apart.
+    # tell them apart. The probe now has two failure sources (the RPC and the
+    # SQLite read below), so the message names the probe rather than one of
+    # them, and carries the exception type to separate a gRPC error from an
+    # sqlite3.OperationalError.
     #
     # The batch-row half of pool_queue_is_served takes SQLite's write lock via
     # init_db(), so it runs in an executor there rather than on the event loop:
@@ -476,8 +479,9 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
         served = await pool_queue_is_served(client, source, queue_name)
     except Exception as e:
         msg = (
-            f"pool gate: describe_task_queue RPC failed for {queue_name}: {e} "
-            f"(network/RPC issue — refusing dispatch fail-closed, this is NOT "
+            f"pool gate: liveness probe for {queue_name} failed: {type(e).__name__}: {e} "
+            f"(the probe is describe_task_queue plus a SQLite batch-row read — "
+            f"either can raise; refusing dispatch fail-closed, this is NOT "
             f"necessarily under-polling)"
         )
         logger.critical(msg)

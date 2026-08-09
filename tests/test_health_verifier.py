@@ -301,7 +301,7 @@ def test_a_long_gap_between_finished_files_is_not_broken_delivery(dlm_db):
 
     The trigger (files_last_5min = `find -mmin -5`) counts files being WRITTEN;
     the events counted against it are emitted only when a file FINISHES. w5 was
-    flagged on 2026-08-09 at done_bytes 8.7/34.3 GB and 176 MB/s with four
+    flagged on 2026-08-09 at done_bytes 8.7/34.3 GB and 176 Mbps with four
     ~1.4 GB files in flight — nothing had finished for 16 minutes, its buffer
     flushes every 5s, and its last events matched its previous batch's last
     completion to the second. Nothing was late; there was nothing to send.

@@ -720,20 +720,32 @@ def count_live_pool_batches(source: str, since: float) -> int:
 
     Both conditions past `status = 'running'` are worker-originated writes,
     which is what makes the count evidence rather than bookkeeping:
-      - `server` is only ever set by /api/queue/shard-assign, which the batch
-        activity calls from the worker that claimed it. A dispatched-but-
-        unclaimed row has a fresh `updated_at` (upsert_shard stamps it) and no
-        server, and must not count.
-      - `updated_at` is bumped by /api/queue/shard-progress. The one non-worker
-        writer of pool rows, reconciler.reclaim_orphaned_shards, skips pool
-        rows outright and writes `failed` (terminal) when it does write, so it
-        cannot fake freshness here.
+      - `server` is only ever set by POST /api/shards/assign, which
+        `run_pool_batch` calls from the worker that claimed the batch (in
+        preflight, before the disk check, so a claimed batch counts
+        immediately). A dispatched-but-unclaimed row has a fresh `updated_at`
+        (upsert_shard stamps it) and no server, and must not count.
+      - `updated_at` is bumped by POST /api/shard-progress, which the same
+        activity sends on a 15s throttle for as long as the batch runs. The
+        one non-worker writer of pool rows,
+        reconciler.reclaim_orphaned_shards, skips pool rows outright and
+        writes `failed` (terminal) when it does write, so it cannot fake
+        freshness here.
 
-    The parent task's status is deliberately NOT filtered: a paused task's
-    in-flight batches keep reporting for a while, and a report from a live
-    worker is a live worker regardless of what the operator did to the task.
-    Rows belonging to a genuinely stopped task age out of the window on their
-    own.
+    The parent task's status is deliberately NOT filtered. It would be nearly
+    redundant — /api/shard-progress and /api/shards/status both refuse to
+    write once the parent is terminal, and pause releases the rows — but the
+    question here is "is a worker process alive", and if one somehow does
+    report, that answer is yes regardless of what the operator did to the
+    task. Rows of a stopped task age out of the window on their own.
+
+    `source` is matched exactly, while workflows.pool_task_queue buckets
+    everything that is not `modelscope` onto pool-hf. Those agree because the
+    only two sources that reach dispatch are `hf` and `modelscope`
+    (fleet.worker_serves routes no worker to anything else, so a task with a
+    third source is never claimed). A third real source sharing pool-hf would
+    have to make this per-queue rather than per-source — and would also
+    collide on the patrol's queue-keyed sample streak.
     """
     conn = _conn()
     row = conn.execute(

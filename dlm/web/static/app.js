@@ -476,8 +476,9 @@ function app() {
 
         // speed_mbps is megaBITS per second: pipeline.py computes
         // speed_bps * 8 / 1_000_000 and the worker heartbeat logs it as "Mbps".
-        // This rendered it as "MB/s", i.e. 8x high — a fleet honestly moving
-        // 119 MB/s displayed "1030 MB/s". Decimal steps, to match the unit.
+        // This rendered it as "MB/s", i.e. 8x high — a fleet at 1030 Mbps
+        // (~1 Gbps, ~129 MB/s) read as "1030 MB/s", which is more than the
+        // HK uplink can carry. Decimal steps, to match the unit.
         formatSpeed(mbps) {
             if (!mbps || mbps <= 0) return '0 Mbps';
             if (mbps >= 1000) return `${(mbps / 1000).toFixed(1)} Gbps`;
