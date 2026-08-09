@@ -24,6 +24,8 @@ import ast
 import inspect
 import pathlib
 
+import pytest
+
 WEB = pathlib.Path(__file__).resolve().parent.parent / "dlm" / "web"
 
 
@@ -71,7 +73,16 @@ def _function(tree: ast.AST, name: str) -> ast.AST:
     raise AssertionError(f"{name} not found — did it get renamed?")
 
 
-def test_every_scheduler_stage_has_a_deadline():
+# Every coroutine that runs on the loop forever. `background_scheduler` drives
+# most stages inline; `_transfer_cycle` is driven by `asyncio.create_task` from
+# it, so its awaits are on the same loop and need the same deadlines — but a
+# `create_task` call is not an `ast.Await`, so checking only the scheduler body
+# would let an unbounded await inside the cycle through unseen.
+LOOP_COROUTINES = ("background_scheduler", "_transfer_cycle")
+
+
+@pytest.mark.parametrize("fn_name", LOOP_COROUTINES)
+def test_every_scheduler_stage_has_a_deadline(fn_name):
     """A hang in any stage stops the loop for good; try/except does not catch it.
 
     `loop.run_in_executor` is NOT a deadline — it hands work to a thread and
@@ -80,7 +91,7 @@ def test_every_scheduler_stage_has_a_deadline():
     unbounded DCloud login. Only wrappers that actually impose a timeout
     count; `_blocking_stage` is checked separately below.
     """
-    loop = _function(_tree("scheduler.py"), "background_scheduler")
+    loop = _function(_tree("scheduler.py"), fn_name)
 
     awaited = [
         n for n in _own_body(loop)
@@ -94,7 +105,7 @@ def test_every_scheduler_stage_has_a_deadline():
             continue
         bare.append(called[0] if called else "?")
 
-    assert not bare, f"scheduler awaits without a deadline: {bare}"
+    assert not bare, f"{fn_name} awaits without a deadline: {bare}"
 
 
 def test_the_blocking_stage_wrapper_actually_imposes_the_timeout():
@@ -110,9 +121,17 @@ def test_the_blocking_stage_wrapper_actually_imposes_the_timeout():
         )
 
     src = (WEB / "scheduler.py").read_text()
-    assert "loop.run_in_executor" not in src.split("async def background_scheduler")[1], (
-        "background_scheduler still calls run_in_executor directly — route it "
-        "through _blocking_stage"
+    # Everything from the first loop coroutine's definition onward. Splitting on
+    # `background_scheduler` alone silently excluded `_transfer_cycle`, which is
+    # defined above it — the tail of the file is what must be clean, so start the
+    # window at whichever coroutine comes first.
+    starts = [src.index(f"async def {n}") for n in LOOP_COROUTINES
+              if f"async def {n}" in src]
+    assert len(starts) == len(LOOP_COROUTINES), (
+        f"a loop coroutine went missing from scheduler.py: {LOOP_COROUTINES}")
+    assert "loop.run_in_executor" not in src[min(starts):], (
+        "a scheduler loop coroutine still calls run_in_executor directly — "
+        "route it through _blocking_stage"
     )
 
 

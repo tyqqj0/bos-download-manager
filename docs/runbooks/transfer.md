@@ -30,6 +30,14 @@ NULL ──arm──> ready ──dispatch──> transferring ──远端成�
 
 任务自己的 `status` 永远不被搬运代码改写。下载状态和搬运状态是两件事。
 
+一个例外要知道：远端任务列表只返回最新 500 条，而那边已有 672 条，所以**跑得久的
+import 会从列表里掉出去**。这时我们不猜，改去量目的端：量够了就 `done`，不够就**留在
+`transferring`** 并把差额写进 `transfer_error`（写成 `remote record not found; ...`）。
+所以看到一个 `transferring` 带 `remote record not found` 是正常的——那是"还在拷或者
+已经死了，我们只知道现在还不够"。它每轮都会重新量。真的死了会一直停在那，
+`/api/transfer` 上一眼能看出来。**不会**因为找不到记录就判 `short`：那会诱导人去对
+一个还在写的目录再发一个 import。
+
 ## 看现在什么情况
 
 ```bash
@@ -87,7 +95,8 @@ curl -X POST .../api/transfer/pause -H 'Content-Type: application/json' -d '{"pa
 暂停是持久化的（存 SQLite settings），web 重启不会偷偷恢复。暂停时：不 arm、不派发；
 已经在飞的 import 继续跑完并正常验证（我们停的是"发新的"，不是掐远端）。
 
-彻底关掉自动搬运：各服务器 `.env` 里 `DLM_AUTO_TRANSFER=off`，重启 web。
+彻底关掉自动搬运：**S1** 的 `.env` 里 `DLM_AUTO_TRANSFER=off`，`systemctl restart dlm-web`。
+只有 S1 需要改——arm 和派发都只在 web 进程里跑，worker 不参与搬运。
 `pause` 是临时闸，环境变量是长期开关。
 
 ## 额度和节奏（不要随手改）
@@ -97,6 +106,7 @@ curl -X POST .../api/transfer/pause -H 'Content-Type: application/json' -d '{"pa
 | `MAX_IN_FLIGHT` | 16 | `dlm/transfer/dispatch.py` | 用户 2026-08-10 定的。那边带宽几十 Gb/s，且搬运是他们在拷，我们的上限是礼貌不是吞吐 |
 | `MAX_PER_CYCLE` | 4 | 同上 | 每发一个要全量扫一遍 BOS 前缀（3.4 TB ≈ 50 页 list）。一轮发 4 个，一分钟就能爬到 16 |
 | `CONSECUTIVE_FAIL_LIMIT` | 2 | 同上 | 连续两次失败就是那边（或我们的凭据）在拒我们，再试 14 次只是刷日志 |
+| `UNKNOWN_VERIFY_PER_CYCLE` | 2 | 同上 | 远端记录找不到的行，一轮最多量 2 个（每个都要走完两端）。计数不设上限，只限做的活 |
 | `TRANSFER_INTERVAL` | 60s | `dlm/web/scheduler.py` | 一轮 poll+dispatch 的间隔；一轮没跑完不会叠第二轮 |
 | `TRANSFER_STAGE_TIMEOUT` | 600s | 同上 | 量多 TB 前缀是几千次 list，60s 会让每一轮都被放弃、永远发不出去 |
 | `RATIO_READY` / `RATIO_MIN` | 0.95 / 0.50 | `dlm/transfer/arm.py` | `DLM_TRANSFER_RATIO_*` 可覆盖。0.50 以下拒发 |
@@ -107,7 +117,7 @@ curl -X POST .../api/transfer/pause -H 'Content-Type: application/json' -d '{"pa
 一次性的、或者闸门拒了而你已经人工核实过数据没问题的，走脚本。
 
 ```bash
-cd /root/bos-download-manager   # S1
+cd /root/code/bos-download-manager   # S1
 
 # 干跑（默认就是干跑，会打印每一项的两端地址和字节）
 python3 scripts/transfer_import.py

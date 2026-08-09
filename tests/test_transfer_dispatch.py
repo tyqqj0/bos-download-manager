@@ -15,9 +15,12 @@ Two properties, both learned the hard way:
    result is `short`, which is a different word on purpose.
 
 The fakes below stand in for BOS and 地瓜云. Both real clients are HTTP, and the
-point of these tests is the state machine, not their wire format — the wire
-format is pinned where it matters (`inflight.endpoint_source` must equal what
-`import_from_bos` posts) by asserting on the recorded call arguments.
+point of these tests is the state machine, not their wire format. The one piece
+of wire format that the state machine depends on is pinned by the last test in
+this file: `inflight.endpoint_source` must reproduce exactly the `endpoint`
+string `DCloudClient.import_from_bos` posts, because that string is what the
+re-attach check matches on. Every fake here builds its `source` field by calling
+`endpoint_source`, so nothing else in the suite would notice if the two drifted.
 """
 
 from __future__ import annotations
@@ -27,8 +30,8 @@ import pytest
 from dlm.constants import DATA_BUCKET
 from dlm.transfer import dispatch as dispatch_mod
 from dlm.transfer.dispatch import (
-    MAX_IN_FLIGHT, MAX_PER_CYCLE, dispatch_ready_transfers, plan_for_row,
-    poll_transfers,
+    MAX_IN_FLIGHT, MAX_PER_CYCLE, UNKNOWN_VERIFY_PER_CYCLE,
+    dispatch_ready_transfers, plan_for_row, poll_transfers,
 )
 from dlm.transfer.measure import bos_stats, bos_top_children
 from dlm.transfer.verify import verify_transfer
@@ -573,14 +576,56 @@ def test_a_verifying_row_re_verifies_without_the_remote_record(db, monkeypatch):
     assert _status(db)["transfer_status"] == "done"
 
 
-def test_a_remote_record_that_aged_off_the_list_is_counted_not_guessed(db, monkeypatch):
+def test_a_remote_record_that_aged_off_the_list_is_measured_not_guessed(db, monkeypatch):
+    """`fetch_tasks` reads the newest 500 records and the far side holds 672, so
+    a long import WILL vanish from the list. An incomplete target is not proof
+    the import died — "still copying" measures identically — so the row keeps
+    its `transferring` slot and records what the measurement saw. Writing
+    `short` here would invite a human to post a second importer onto a
+    directory a live import is still writing."""
     _transferring(db)
     bos, dcloud = _install(monkeypatch, FakeBos({}), FakeDCloud(tasks=[]))
 
     report = poll_transfers()
 
     assert report["unknown_remote"] == 1
-    assert _status(db)["transfer_status"] == "transferring"
+    row = _status(db)
+    assert row["transfer_status"] == "transferring"
+    assert "remote record not found" in row["transfer_error"]
+
+
+def test_an_aged_off_record_whose_target_is_complete_lands_done(db, monkeypatch):
+    """The escape hatch. A complete target IS proof, whatever the list says —
+    without this the row holds one of the 16 slots forever and alerts nothing."""
+    _transferring(db, bos_bytes=1000)
+    bos, dcloud = _install(
+        monkeypatch,
+        FakeBos({"other/molmobot-data/episodes/a": 1000}),
+        FakeDCloud(tree=_tree(1000), tasks=[]))
+
+    report = poll_transfers()
+
+    row = _status(db)
+    assert row["transfer_status"] == "done"
+    assert row["transfer_verified_bytes"] == 1000
+    assert report["unknown_remote"] == 1
+    assert report["done"][0]["task_id"] == "t-1"
+    assert "remote record not found" in report["done"][0]["detail"]
+
+
+def test_only_two_aged_off_rows_are_measured_per_pass(db, monkeypatch):
+    """Each measurement walks both ends; the stage has 600s. All of them are
+    still counted — the bound is on the work, not on the reporting."""
+    for i in range(4):
+        _transferring(db, task_id=f"t-{i}", remote_id=f"remote-{i}")
+    bos, dcloud = _install(monkeypatch, FakeBos({}), FakeDCloud(tasks=[]))
+
+    report = poll_transfers()
+
+    assert report["unknown_remote"] == 4
+    measured = [i for i in range(4)
+                if _status(db, f"t-{i}")["transfer_error"] is not None]
+    assert len(measured) == UNKNOWN_VERIFY_PER_CYCLE
 
 
 def test_a_row_with_no_dispatch_measurement_cannot_verify_clean(db, monkeypatch):
@@ -717,3 +762,45 @@ def test_verify_treats_an_unlistable_scope_as_unknown_not_as_extras():
     assert verdict["status"] == "done"
     assert verdict["extra_children"] is None
     assert "scope check skipped" in verdict["detail"]
+
+
+# --- the wire format the re-attach check depends on --------------------------
+
+def test_the_posted_endpoint_is_exactly_what_endpoint_source_reconstructs():
+    """Two importers on one directory is the failure this pins shut.
+
+    Re-attach works by matching `inflight.endpoint_source(bucket, prefix)`
+    against the `source` field the far side echoes back — which is the
+    `endpoint` string `import_from_bos` posted. Nothing else ties those two
+    f-strings together: they live in different modules, and every fake in this
+    file builds its `source` by calling `endpoint_source`, so a drift in either
+    one would keep the whole suite green while the live re-attach silently never
+    matched and posted a second import onto a live directory.
+    """
+    from dlm.transfer import inflight
+    from dlm.transfer.dcloud import DCloudClient
+
+    posted = {}
+
+    class _R:
+        @staticmethod
+        def raise_for_status():
+            pass
+
+        @staticmethod
+        def json():
+            return {"status": 0, "data": "remote-42"}
+
+    client = DCloudClient("u", "p")
+    client._http.post = lambda url, json=None, timeout=None: (
+        posted.update(json), _R)[1]
+
+    task_id = client.import_from_bos(
+        bos_ak="ak", bos_sk="sk", bos_bucket=DATA_BUCKET,
+        bos_path="other/molmobot-data/", target_path=TARGET)
+
+    assert task_id == "remote-42"
+    assert posted["endpoint"] == inflight.endpoint_source(
+        DATA_BUCKET, "other/molmobot-data/")
+    # And the default endpoint domain is the one endpoint_source assumes.
+    assert posted["endpoint"].endswith("bj.bcebos.com/other/molmobot-data/")

@@ -193,9 +193,25 @@ async def register_bos_data(body: dict):
             "downloaded_gb": 0,
             "created_at": now,
             "completed_at": now,
-            "transfer_status": "queued" if auto_transfer else None,
+            # NOT "queued". Nothing has consumed that word since the Celery
+            # download path was decommissioned (2026-06-30), and under the
+            # transfer state machine it is a dead end: `ready` is what the
+            # dispatcher selects, and `trigger` skips any row whose
+            # transfer_status is already non-NULL. Leaving it NULL is what keeps
+            # the row reachable. Arming it here would not help either — a
+            # registered task has no shard rows, so the believability gate would
+            # write `blocked` and raise a CRITICAL alert on every registration.
+            "transfer_status": None,
         })
-        return {"ok": True, "task_id": task_id, "name": name}
+        result = {"ok": True, "task_id": task_id, "name": name}
+        if auto_transfer:
+            result["transfer_note"] = (
+                "Automatic transfer does not apply to registered data: it has no "
+                "shard rows, so the believability gate refuses it. Use "
+                "scripts/transfer_import.py (see docs/runbooks/transfer.md), or "
+                "POST /api/transfer/trigger to see the gate's verdict."
+            )
+        return result
 
     result = await _run_blocking(do_register)
     return result

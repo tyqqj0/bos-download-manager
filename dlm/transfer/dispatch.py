@@ -29,6 +29,11 @@ Failure handling is deliberately asymmetric:
     same rule, same reason, as `scripts/transfer_import.py`.
   - A remote import that reports failure becomes `failed` and stays there. It
     needs a human to decide whether to retry, and the manual button is how.
+  - A row whose remote record we can no longer find (the list is capped at the
+    newest 500 and the far side holds 672) is measured instead of guessed: a
+    complete target lands `done`, an incomplete one stays `transferring` with
+    the shortfall recorded. Nothing here writes `short` on the strength of a
+    missing record.
 """
 
 import logging
@@ -54,6 +59,14 @@ MAX_PER_CYCLE = 4
 # Dispatch failures in a row before the cycle gives up. Mirrors
 # CONSECUTIVE_ITEM_FAIL_LIMIT in scripts/transfer_import.py.
 CONSECUTIVE_FAIL_LIMIT = 2
+
+# In-flight rows whose remote record we cannot find that get measured in one
+# poll pass. `inflight.fetch_tasks` reads the newest 500 records and the far
+# side already holds 672, so a long-running import WILL fall off the list —
+# without this the row would sit in `transferring` forever, holding one of the
+# 16 slots and raising nothing. Bounded because each measurement is a full walk
+# of both ends, and the whole stage has 600s.
+UNKNOWN_VERIFY_PER_CYCLE = 2
 
 
 def _clients():
@@ -252,10 +265,19 @@ def dispatch_ready_transfers() -> dict:
     return report
 
 
-def _verify_and_write(bos, dcloud, row) -> dict:
+def _verify_and_write(bos, dcloud, row, only_if_clean: bool = False) -> dict:
     """Run the three checks and record the verdict. Idempotent — re-running it
     changes nothing but the timestamp, which is what lets a row that died
-    mid-verification simply be verified again."""
+    mid-verification simply be verified again.
+
+    `only_if_clean` is for a row whose remote record we can no longer find. A
+    complete target is proof enough to land `done`; an incomplete one is NOT
+    proof of failure — "still importing, record aged off the list" and "the
+    import died" measure identically, and writing `short` on a live import
+    would invite a human to post a second importer onto the same directory. So
+    an incomplete measurement only records what it saw and leaves the row where
+    it was, to be measured again next pass.
+    """
     task_id, name = row["id"], row.get("name") or row["id"]
     plan = plan_for_row(row)
     verdict = verify_transfer(
@@ -263,6 +285,11 @@ def _verify_and_write(bos, dcloud, row) -> dict:
         int(row.get("transfer_bos_bytes") or 0),
         int(row.get("transfer_bos_objects") or 0),
     )
+    if only_if_clean and verdict["status"] != "done":
+        _update(task_id, transfer_error=f"remote record not found; {verdict['detail']}")
+        logger.warning(f"transfer in limbo: {name} — remote record not found and "
+                       f"the target is not complete yet: {verdict['detail']}")
+        return verdict
     # A clean `done` carries no error text — but a `done` whose source prefix
     # changed underneath it keeps the note, because that is the one thing about
     # a successful transfer somebody still needs to look at.
@@ -301,6 +328,7 @@ def poll_transfers() -> dict:
         logger.error(f"transfer poll: remote task list failed: {e}")
         return report
     by_id = {t.get("task_id"): t for t in remote_tasks}
+    unknown_measured = 0
 
     for row in rows:
         task_id, name = row["id"], row.get("name") or row["id"]
@@ -314,6 +342,15 @@ def poll_transfers() -> dict:
                 remote = by_id.get(remote_id) if remote_id else None
                 if remote is None:
                     report["unknown_remote"] += 1
+                    if unknown_measured >= UNKNOWN_VERIFY_PER_CYCLE:
+                        continue
+                    unknown_measured += 1
+                    verdict = _verify_and_write(bos, dcloud, row, only_if_clean=True)
+                    if verdict["status"] == "done":
+                        report["done"].append(
+                            {"task_id": task_id, "name": name,
+                             "jfs_bytes": verdict["jfs_bytes"],
+                             "detail": f"remote record not found; {verdict['detail']}"})
                     continue
                 state = inflight.classify(remote.get("status"))
                 if state == "running":
@@ -345,4 +382,5 @@ def poll_transfers() -> dict:
 
 
 __all__ = ["CONSECUTIVE_FAIL_LIMIT", "MAX_IN_FLIGHT", "MAX_PER_CYCLE",
+           "UNKNOWN_VERIFY_PER_CYCLE",
            "dispatch_ready_transfers", "plan_for_row", "poll_transfers"]

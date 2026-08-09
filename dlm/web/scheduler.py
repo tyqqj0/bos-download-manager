@@ -16,10 +16,15 @@ _executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
 # legitimately run for minutes (a 3.4 TB prefix is ~50 BOS list pages per
 # dispatched row, and verification lists both ends), and an abandoned stage
 # keeps its thread — so on the shared pool one wedged far side would strand a
-# thread that the dashboard and the staging GC need. Two slots: only one
-# transfer pass runs at a time, so the second is headroom for a pass whose
-# thread is still stuck on a call that timed out.
-TRANSFER_EXECUTOR_WORKERS = 2
+# thread that the dashboard and the staging GC need.
+#
+# One slot, deliberately. `_transfer_cycle` awaits poll then dispatch in
+# sequence, so a second slot buys no parallelism — all it buys is the ability
+# for an abandoned thread (a stage that blew the 600s deadline but is still
+# stuck inside a BOS or DCloud call) to run *concurrently with the next cycle*
+# and post an import the new cycle is also about to post. One slot makes the
+# next cycle queue behind the stuck one instead, which is the safe failure.
+TRANSFER_EXECUTOR_WORKERS = 1
 _transfer_executor = ThreadPoolExecutor(max_workers=TRANSFER_EXECUTOR_WORKERS)
 
 DASHBOARD_INTERVAL = 10

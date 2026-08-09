@@ -376,9 +376,19 @@ def execute_plan(bos, dcloud, cfg, plan, state):
                 task_id=prior_task_id,
             )
         except Exception as e:
-            running = None
-            log(f"WARN [{name}] could not list remote async tasks ({e}) — "
-                f"posting a new import")
+            # We could not find out whether an import is already running here.
+            # Posting anyway is the one path left in the system that can put two
+            # importers on one directory — which is exactly what the re-attach
+            # check above exists to prevent, and what this file's header
+            # promises not to do. Skip the item; the next run re-checks.
+            log(f"SKIP [{name}] could not list remote async tasks ({e}) — "
+                f"refusing to post blind (a second importer on one directory "
+                f"is worse than a delay). Re-run when the far side answers.")
+            failed.append(name)
+            state[name].update(status="skipped",
+                               error=f"could not list remote async tasks: {e}")
+            save_state(state)
+            continue
         if running is not None:
             task_id = running.get("task_id")
             consecutive_call_failures = 0
