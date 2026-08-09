@@ -95,7 +95,116 @@ def pool_task_weight(priority: int) -> float:
     return POOL_WEIGHT_P0 if (priority or 0) <= POOL_P0_MAX_PRIORITY else POOL_WEIGHT_DEFAULT
 
 
-def pool_window_allocation(active: list[dict], p: int) -> dict[str, int]:
+# A coordinator that has not yet recorded a single batch is still on the first
+# pass of its window loop, where `window` is hardcoded to 1
+# (workflows.py:_run_window_loop) and is only replaced by the allocator's
+# number after the first `record_batches_and_window` returns. Slots handed to
+# such a task beyond the one it holds cannot be dispatched by anyone until its
+# first batch finishes, however long that takes.
+POOL_RAMP_SLOTS = 1
+
+
+def pool_task_slot_cap(batch_rows: list[dict]) -> int:
+    """How many worker slots this pool task can actually put to work.
+
+    The allocator splits P by weight alone, which silently assumes every task
+    can absorb whatever share it is given. Two ways that is false, both
+    observed in production on 2026-08-09 with 3 of 7 HK workers idle:
+
+    1. **Batches exhausted.** molmobot-data wound down to `pending=0` with one
+       batch still running, yet held its full 3-slot share until its status
+       flipped to `done` and it left the `active` list. RealOmin had 725
+       pending batches and could not have those 2 slots.
+    2. **Still ramping.** robocasa365 was allocated 4 slots (its priority
+       band gives it 1.5x weight against RealOmin's 1.0) while its own
+       coordinator window was still 1, because no batch of its had reported
+       yet — and its first batch was the XET-slow one, so those 3 slots stayed
+       dead for 17 hours and counting.
+
+    Both reduce to the same thing: an allocation is only worth something if the
+    task can dispatch into it, and a ramping task's ceiling is 1 regardless of
+    how many batches wait behind it.
+
+    `failed` rows count toward the ceiling. `run()` re-enters the window loop a
+    second time over `outcome["failed"]` (workflows.py, step 6), and by then
+    every row is terminal: nothing resets a failed row to `pending`, and
+    `record_batches_and_window` writes the terminal row *before* it asks for the
+    window, so a `running + pending` ceiling would read 0 through the entire
+    retry round and floor its window to 1. That would serialize the retry pass —
+    N failed batches one after another at up to POOL_BATCH_START_TO_CLOSE each,
+    with the rest of the fleet idle — which is the very failure this function
+    exists to prevent, moved to a later phase and made worse than before the
+    cap existed.
+
+    That makes the ceiling loose in one state. A task winding down round 1 (one
+    batch running, no pending, six already failed) presents exactly the rows a
+    task mid-retry-round does (one batch running, six not yet re-dispatched).
+
+    The discriminator IS available: step 6 writes `f"retrying {n} failed
+    batches"` into `tasks.phase` immediately before it re-enters the loop
+    (workflows.py), round 1 writes `f"pool: {n} batches"`, nothing else touches
+    `phase` for a pool task mid-run, and `get_tasks_by_status` is `SELECT *` so
+    `active` already carries it at no extra query. A phase-matched cap would be
+    tight in both states. It is deliberately NOT done here, because its failure
+    mode is silent and severe: edit that f-string, or add any task-level
+    progress ping for pool mode, and the cap silently reverts to `running +
+    pending` — the ratchet below, at 42%, with nothing in the logs. Doing it
+    safely means hoisting the literal into a shared constant imported by both
+    workflows.py and this module, plus a test pinning the exact string the
+    workflow emits (and an `endswith` guard, since `retry_task` writes a bare
+    `phase="retrying"`). That is a larger change than the one this fix is, and
+    `phase` is documented elsewhere in this codebase as ephemeral — true for
+    sharded, incidentally false for pool, enforced nowhere. Tracked as a
+    follow-up; until then the ambiguity is resolved in favour of over-counting:
+
+    - Over-count (this choice): for any task that has accumulated a failed
+      batch, the molmobot fix above is disabled for the whole tail of its run —
+      every wake where `running + pending` is below its weighted share. The
+      over-count is bounded by that share, not by the failed count, and 200
+      done + 6 failed + 1 running measures 4 of 7 slots, which is exactly the
+      pre-#89 number. A missed improvement, not a new harm: `running + pending
+      + failed` counts all of a task's non-done rows, so it can never allocate
+      below what the task can dispatch, and in every state it is either better
+      than the previous behaviour or identical to it.
+    - Under-count (`(running + pending) or failed`, which is tight for
+      wind-down): the loop waits FIRST_COMPLETED, so after each record
+      `running` equals the number still in flight and the truthy `or` masks the
+      failed queue. Any formula returning `<= running` is a fixed point — the
+      window can only grow when the cap exceeds the in-flight count — so it
+      ratchets 7,6,5,4,3,2,1 and recovers only when the last batch lands.
+      Simulated over 100 retried batches at P=7: mean window 3.94 vs 6.73, a
+      sustained 42% loss for the whole retry pass. `running + pending +
+      min(failed, 1)` is worse still: a permanent window of 1.
+
+    A loose ceiling only ever degrades toward the weight-only behaviour that
+    shipped before this function. A tight one that reads 0, or that ratchets
+    down, breaks the fleet.
+
+    A task with no batch rows at all is still listing/chunking and caps at 0 —
+    the allocator's floor of 1 then gives it a nominal slot it does not use,
+    which is the pre-existing over-subscription the floor already documents.
+
+    The ramp heuristic reads terminal rows as "past the ramp", which would be
+    wrong for a coordinator that restarts at window 1 in front of rows from an
+    earlier generation. No such path exists: resume, retry, reshard, the
+    reconciler's re-dispatch and doctor's fix all call `delete_shards_by_task`
+    first, and a pool coordinator carries no workflow retry policy, so it never
+    silently restarts itself either. The `failed` term cannot perturb the ramp
+    branch either: any row that adds to `failed` also makes `reported` true, so
+    the branch is only reachable when `failed == 0`.
+    """
+    running = sum(1 for r in batch_rows if r.get("status") == "running")
+    pending = sum(1 for r in batch_rows if r.get("status") == "pending")
+    failed = sum(1 for r in batch_rows if r.get("status") == "failed")
+    dispatchable = running + pending + failed
+    reported = any(r.get("status") in ("done", "failed") for r in batch_rows)
+    if not reported:
+        return min(dispatchable, max(POOL_RAMP_SLOTS, running))
+    return dispatchable
+
+
+def pool_window_allocation(active: list[dict], p: int,
+                           caps: dict[str, int] | None = None) -> dict[str, int]:
     """Split P worker slots across the concurrent pool tasks. {task_id: window}
 
     Largest remainder (Hamilton), not a per-task floor. Flooring each task's
@@ -117,10 +226,27 @@ def pool_window_allocation(active: list[dict], p: int) -> dict[str, int]:
 
     The floor of 1 is kept: a task whose fair share rounds to zero still gets
     one slot and makes slow progress instead of stalling until its neighbours
-    finish. That floor is the one case where the total can exceed P (more
-    admitted tasks than workers — bounded by POOL_MAX_CONCURRENT_TASKS), which
-    is pre-existing and deliberate; over-subscription there means batches queue
-    on a busy worker, while the alternative is a task that never starts.
+    finish. The floor is the only case where the total can exceed P, and there
+    are two of them: more admitted tasks than workers (bounded by
+    POOL_MAX_CONCURRENT_TASKS), and a task capped below the floor. Both are
+    deliberate; over-subscription there means a batch queues on a busy worker,
+    while the alternative is a task that never starts.
+
+    `caps` (from pool_task_slot_cap, keyed by task id; a missing or None entry
+    means uncapped) bounds each task by what it can actually dispatch into.
+    With caps the invariant generalises from `sum(alloc) == P` to
+    `sum(alloc) == min(P, sum(caps))`, plus one slot for each task whose cap
+    falls below the floor: slots no task can use are left unassigned rather than
+    handed to a task that would sit on them, which is the whole point — a
+    reserved-but-undispatchable slot is strictly worse than an unassigned one,
+    because the reservation also hides the idleness. A task capped at 0 is the
+    floor's exception and is harmless: cap 0 means it has no dispatchable batch
+    at all, so the window loop exits without using the nominal slot, and because
+    it consumed nothing during distribution the other tasks still receive all
+    of P.
+    Distribution is iterative, not one pass: when a task clamps to its cap, its
+    surplus is re-split by weight among the tasks that still have room, and
+    that repeats until either the slots run out or every task is capped.
     """
     if not active:
         return {}
@@ -134,13 +260,46 @@ def pool_window_allocation(active: list[dict], p: int) -> dict[str, int]:
         # completion that can never arrive.
         return {tid: 1 for tid, _ in weights}
 
-    exact = [(tid, p * w / w_sum) for tid, w in weights]
-    alloc = {tid: int(share) for tid, share in exact}
-    leftover = p - sum(alloc.values())
+    caps = caps or {}
+    # Normalized once, up front: this is a public fleet primitive, and a
+    # negative cap would make `slots = p - sum(alloc)` exceed p (handing out
+    # more than P on the next round) while a float would raise from the
+    # remainder slice. Neither is reachable from pool_task_slot_cap, and
+    # neither should depend on that staying true.
+    caps = {tid: max(0, int(c)) for tid, c in caps.items() if c is not None}
+    weight_of = dict(weights)
+    alloc = {tid: 0 for tid, _ in weights}
+    # Order preserved from `active` (the DB's priority ASC, created_at ASC) so
+    # the stable sort below keeps resolving ties first-come, round after round.
+    open_ids = [tid for tid, _ in weights]
+    slots = p
 
-    by_remainder = sorted(exact, key=lambda pair: -(pair[1] - int(pair[1])))
-    for tid, _ in by_remainder[:max(0, leftover)]:
-        alloc[tid] += 1
+    while slots > 0 and open_ids:
+        round_weight = sum(weight_of[tid] for tid in open_ids)
+        if round_weight <= 0:
+            break
+
+        exact = [(tid, slots * weight_of[tid] / round_weight) for tid in open_ids]
+        share = {tid: int(x) for tid, x in exact}
+        leftover = slots - sum(share.values())
+        by_remainder = sorted(exact, key=lambda pair: -(pair[1] - int(pair[1])))
+        for tid, _ in by_remainder[:max(0, leftover)]:
+            share[tid] += 1
+
+        capped = []
+        for tid in open_ids:
+            want = alloc[tid] + share[tid]
+            cap = caps.get(tid)
+            if cap is not None and want >= cap:
+                alloc[tid] = cap
+                capped.append(tid)
+            else:
+                alloc[tid] = want
+
+        slots = p - sum(alloc.values())
+        if not capped:
+            break               # nothing clamped, so this round placed every slot
+        open_ids = [tid for tid in open_ids if tid not in capped]
 
     return {tid: max(1, n) for tid, n in alloc.items()}
 

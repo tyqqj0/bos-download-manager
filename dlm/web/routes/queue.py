@@ -1058,7 +1058,8 @@ async def pool_window_api(task_id: str):
     are fleet policy (fleet.py owns them alongside MIN_SHARD_DISK_GB).
     """
     from ..fleet import (
-        alive_workers, pool_task_weight, pool_window_allocation, worker_serves,
+        alive_workers, pool_task_slot_cap, pool_task_weight,
+        pool_window_allocation, worker_serves,
     )
 
     def do_query():
@@ -1093,14 +1094,44 @@ async def pool_window_api(task_id: str):
         if not any(t.get("id") == task_id for t in active):
             active = active + [task]
 
-        alloc = pool_window_allocation(active, p)
+        # Weight alone would reserve slots for a task that cannot dispatch into
+        # them — a task whose batches are exhausted, or one still on its
+        # coordinator's first pass (window hardcoded to 1). See
+        # pool_task_slot_cap. One row read per active task, bounded by
+        # POOL_MAX_CONCURRENT_TASKS and paid once per coordinator wake.
+        def cap_of(tid: str) -> int | None:
+            # None = uncapped. A DB hiccup on this read must not 500 the
+            # endpoint: `record_batches_and_window` raises for status, the
+            # activity exhausts its retries, and `run()` then reports the whole
+            # task FAILED. Degrading to the weight-only split costs at most some
+            # idle slots until the next wake; the alternative kills the task.
+            try:
+                return pool_task_slot_cap(snapshot.get_shards_by_task(tid))
+            except Exception as e:
+                # Logged, not silent: the response deliberately exposes `caps`
+                # so an operator can tell "the split" from "the ceiling", and a
+                # swallowed failure emits caps={tid: null} — indistinguishable
+                # from a task that is legitimately uncapped. Without this line
+                # the fleet quietly serves pre-#89 allocations and nothing
+                # explains the idle workers.
+                logger.warning(f"pool-window: cap unavailable for {tid}, "
+                               f"treating as uncapped: {e}")
+                return None
+
+        caps = {t.get("id"): cap_of(t.get("id") or "") for t in active}
+
+        alloc = pool_window_allocation(active, p, caps)
         w_self = pool_task_weight(task.get("priority") or 0)
         w_sum = sum(pool_task_weight(t.get("priority") or 0) for t in active)
 
         return {
             "window": alloc.get(task_id, 1), "p": p, "weight": w_self,
             "weight_sum": w_sum, "active_pool_tasks": len(active),
-            "allocation": alloc,
+            # `caps` is returned for the same reason the allocation is: when a
+            # worker sits idle, the answer to "why didn't this task get it" is
+            # either the split or the ceiling, and an operator should not have
+            # to guess which.
+            "allocation": alloc, "caps": caps,
         }
     return await _run_blocking(do_query)
 
