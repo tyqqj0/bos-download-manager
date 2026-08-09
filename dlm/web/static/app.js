@@ -474,12 +474,16 @@ function app() {
             return classes[status] || 'bg-gray-700 text-gray-300';
         },
 
+        // speed_mbps is megaBITS per second: pipeline.py computes
+        // speed_bps * 8 / 1_000_000 and the worker heartbeat logs it as "Mbps".
+        // This rendered it as "MB/s", i.e. 8x high — a fleet honestly moving
+        // 119 MB/s displayed "1030 MB/s". Decimal steps, to match the unit.
         formatSpeed(mbps) {
-            if (!mbps || mbps <= 0) return '0 MB/s';
-            if (mbps >= 1024) return `${(mbps / 1024).toFixed(1)} GB/s`;
-            if (mbps >= 100) return `${Math.round(mbps)} MB/s`;
-            if (mbps >= 10) return `${mbps.toFixed(0)} MB/s`;
-            return `${mbps.toFixed(1)} MB/s`;
+            if (!mbps || mbps <= 0) return '0 Mbps';
+            if (mbps >= 1000) return `${(mbps / 1000).toFixed(1)} Gbps`;
+            if (mbps >= 100) return `${Math.round(mbps)} Mbps`;
+            if (mbps >= 10) return `${mbps.toFixed(0)} Mbps`;
+            return `${mbps.toFixed(1)} Mbps`;
         },
 
         formatEta(seconds) {

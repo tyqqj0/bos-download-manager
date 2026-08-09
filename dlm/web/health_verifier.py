@@ -55,7 +55,7 @@ EVENT_DELIVERY_FLOOR = 5
 # `find -mmin -5` — files whose mtime moved, i.e. files being WRITTEN. The
 # evidence is events, which are only emitted when a file FINISHES. On TB-scale
 # datasets those diverge for a long time: on 2026-08-09 w5 was flagged with its
-# batch at done_bytes 8.7/34.3 GB, 176 MB/s, four ~1.4 GB files in flight and
+# batch at done_bytes 8.7/34.3 GB, 176 Mbps, four ~1.4 GB files in flight and
 # none finished for 16 minutes, its last events matching its previous batch's
 # last completion to the second. The buffer flushes every 5s, so nothing was
 # late — there was nothing to send.

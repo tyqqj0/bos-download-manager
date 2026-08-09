@@ -36,7 +36,7 @@ def status_cmd(as_json):
     click.echo(f"\n  任务: {total} 总计 | {by_status.get('downloading', 0)} 下载中 | "
                f"{by_status.get('pending', 0)} 排队 | {by_status.get('done', 0)} 完成 | "
                f"{by_status.get('failed', 0)} 失败")
-    click.echo(f"  速度: ↓{dl_speed:.1f} MB/s  ↑{ul_speed:.1f} MB/s")
+    click.echo(f"  速度: ↓{dl_speed:.1f} Mbps  ↑{ul_speed:.1f} Mbps")
     click.echo(f"  总量: {dl_tb:.1f}T / {est_tb:.1f}T")
 
     # Workers
@@ -77,7 +77,7 @@ def status_cmd(as_json):
             phase = dl.get("phase", "")
             shards = dl.get("shard_servers", [])
 
-            speed_str = f"{speed:.1f}MB/s" if speed > 0 else "-"
+            speed_str = f"{speed:.1f}Mbps" if speed > 0 else "-"
             bar = _bar(pct)
 
             if shards and len(shards) > 1:
@@ -86,7 +86,7 @@ def status_cmd(as_json):
                 click.echo(f"      [{shard_str}] ({len(shards)} shards)")
                 click.echo(f"      {bar} {pct:.0f}%  {speed_str}")
                 for s in shards:
-                    ss = f"{s.get('speed_mbps',0):.1f}MB/s" if s.get("speed_mbps", 0) > 0 else f"{s.get('done_pct',0):.0f}%"
+                    ss = f"{s.get('speed_mbps',0):.1f}Mbps" if s.get("speed_mbps", 0) > 0 else f"{s.get('done_pct',0):.0f}%"
                     click.echo(f"        {s['server']}: {ss}")
             else:
                 click.echo(f"    ↓ {name} @ {srv}")

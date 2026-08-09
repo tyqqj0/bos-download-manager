@@ -71,7 +71,7 @@ def _print_table(tasks):
         size_str = _format_size(t)
         speed = ""
         if t["status"] == "downloading" and t.get("speed_mbps", 0) > 0:
-            speed = f"{t['speed_mbps']:.1f}MB/s"
+            speed = f"{t['speed_mbps']:.1f}Mbps"
         shards = ""
         ts = t.get("total_shards", 0)
         ds = t.get("done_shards", 0)
@@ -100,7 +100,7 @@ def _print_live(tasks):
         name = t["name"][:28] if len(t["name"]) > 28 else t["name"]
         srv = t.get("server") or "-"
         pct = f"{t.get('progress_pct', 0):.0f}%" if t.get("progress_pct") else "-"
-        speed = f"{t['speed_mbps']:.1f}MB/s" if t.get("speed_mbps", 0) > 0 else "-"
+        speed = f"{t['speed_mbps']:.1f}Mbps" if t.get("speed_mbps", 0) > 0 else "-"
         size_str = _format_size(t)
         ts = t.get("total_shards", 0)
         ds = t.get("done_shards", 0)
@@ -109,7 +109,7 @@ def _print_live(tasks):
 
     click.echo("")
     total_speed = sum(t.get("speed_mbps", 0) for t in tasks)
-    click.echo(f"{len(tasks)} 个任务下载中, 总速度: {total_speed:.1f} MB/s")
+    click.echo(f"{len(tasks)} 个任务下载中, 总速度: {total_speed:.1f} Mbps")
 
 
 def _format_size(t):
