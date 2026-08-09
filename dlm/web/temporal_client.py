@@ -11,6 +11,7 @@ normally while nothing is dispatched or reconciled ever again.
 import asyncio
 import logging
 import os
+import time
 from datetime import timedelta
 from typing import Optional
 
@@ -262,15 +263,19 @@ async def start_sharded_download(task_dict: dict, task_queue: str | None = None)
 
 
 class PoolPollerGateError(RuntimeError):
-    """Raised when a pool task's activity queue is under-polled.
+    """Raised when a pool task's activity queue has no live consumer.
 
     Pool workers register activities on the shared pool-hf/pool-ms queue but
-    no workflow, so a start that lands with fewer live activity pollers than
-    the fleet's alive-worker count for that source would sit batches on a
-    queue nothing is draining — indistinguishable from "dispatched fine"
-    until the schedule_to_close timeout fires, hours later. Refusing here,
-    loudly, is the only way this gate has teeth: a silent fallback to
-    sharded would defeat it outright.
+    no workflow, so a start that lands on a queue nothing is draining would
+    sit its batches there — indistinguishable from "dispatched fine" until
+    the schedule_to_close timeout fires, hours later. Refusing here, loudly,
+    is the only way this gate has teeth: a silent fallback to sharded would
+    defeat it outright.
+
+    "No live consumer" means zero ACTIVITY pollers AND no recent batch report
+    from a worker of that source. Both halves are needed because zero pollers
+    alone is also what a 100%-busy fleet looks like — see
+    pool_queue_is_served.
     """
 
 
@@ -368,20 +373,48 @@ async def pending_activities(workflow_id: str) -> list[dict]:
     return rows
 
 
-def _expected_pool_pollers(source: str) -> int:
-    """Alive workers that would serve this source's pool queue.
+def live_pool_batch_count(source: str, now: float | None = None) -> int:
+    """Worker-reported running batches for this source — the busy/dead tiebreak.
 
-    '池预期' per the plan: the number of currently-alive workers routed to
-    this source (`fleet.alive_workers` + `fleet.worker_serves`) — the same
-    fleet-state primitives auto_dispatch_pending uses to pick idle workers,
-    not a re-derivation.
+    BLOCKING (SQLite): call from a thread, never straight off the event loop.
+
+    Zero ACTIVITY pollers on a pool queue is ambiguous by construction — a pool
+    worker holds one batch at a time and a Temporal worker at its concurrency
+    limit stops polling, so "every worker is busy" and "no worker ever
+    registered this queue" produce the identical reading. This is the
+    disambiguator both the dispatch gate and the pool patrol consult before
+    they act on a zero: a nonzero count means a live worker wrote to a batch
+    row of this source inside POOL_LIVE_BATCH_WINDOW_S.
     """
-    from ..queue.snapshot import get_workers, init_db
-    from .fleet import alive_workers, worker_serves
+    from ..queue.snapshot import count_live_pool_batches, init_db
+    from .fleet import POOL_LIVE_BATCH_WINDOW_S
 
     init_db()
-    workers = alive_workers(get_workers())
-    return sum(1 for w in workers if worker_serves(w.get("server_key") or "", source))
+    ref = time.time() if now is None else now
+    return count_live_pool_batches(source, ref - POOL_LIVE_BATCH_WINDOW_S)
+
+
+async def pool_queue_is_served(client: Client, source: str, queue_name: str) -> bool:
+    """True if this source's pool queue has a live consumer.
+
+    Raises whatever the describe RPC raises — callers differ on what an
+    unknown answer means (the gate refuses fail-closed, the patrol stays
+    silent), so neither judgement is made here.
+    """
+    pollers = await _pool_poller_count(client, queue_name)
+    if pollers > 0:
+        return True
+    live = await asyncio.get_running_loop().run_in_executor(
+        None, live_pool_batch_count, source
+    )
+    if live > 0:
+        logger.info(
+            f"{queue_name} has 0 activity pollers but {live} running batch(es) "
+            f"reported recently — the fleet is saturated, not absent "
+            f"(one batch per pool worker, so a busy worker stops polling)"
+        )
+        return True
+    return False
 
 
 async def start_pool_download(task_dict: dict, task_queue: str | None = None):
@@ -403,28 +436,23 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
 
     Mode gate (plan change #2): refuses to start — raising
     PoolPollerGateError rather than falling back to sharded — if that pool
-    queue's live ACTIVITY pollers are fewer than the fleet's alive-worker
-    count for this task's source.
+    queue has no live consumer at all. "No live consumer" is deliberately
+    NOT "fewer pollers than alive workers", which is what this gate asked
+    until #91: a pool worker runs one batch at a time, so a fully-loaded
+    fleet reports zero pollers and the old comparison refused every dispatch
+    precisely when the pool was working (measured 2026-08-09: HK 7/7 busy ->
+    pool-hf = 0 pollers, and the rejection count decayed 14 -> 9 -> 8 -> 0 as
+    the fleet filled). See pool_queue_is_served.
     """
     from ..temporal.models import TaskInput
     from ..temporal.workflows import PoolDownloadWorkflow, pool_task_queue
-    from .fleet import SHARED_COORDINATOR_QUEUE
+    from .fleet import POOL_LIVE_BATCH_WINDOW_S, SHARED_COORDINATOR_QUEUE
 
     source = task_dict.get("source", "hf")
     coordinator = task_queue or SHARED_COORDINATOR_QUEUE
     client = await connected_client()
 
     queue_name = pool_task_queue(source)
-    # init_db() takes SQLite's write lock, so _expected_pool_pollers must not
-    # run on the event loop: start_pool_download is awaited straight from the
-    # /queue/preempt and /doctor/fix handlers, which push every other SQLite
-    # touch through run_blocking. Bounded at busy_timeout (5s), but that is
-    # 5s of accept() gap for the whole web server. See
-    # tests/test_event_loop_safety.py — its AST scan only inspects the
-    # handler's own body, so this indirection is invisible to it.
-    expected = await asyncio.get_running_loop().run_in_executor(
-        None, _expected_pool_pollers, source
-    )
     # T7 review (routed to T9): the describe RPC uses the SDK default
     # retry=False, so a transient gRPC blip refuses the dispatch — the
     # correct fail-closed direction — but on its own raises the same kind of
@@ -435,8 +463,17 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
     # the log message and the exception's message differ, so a human
     # scanning the log — or a future alert keyed on message content — can
     # tell them apart.
+    #
+    # The batch-row half of pool_queue_is_served takes SQLite's write lock via
+    # init_db(), so it runs in an executor there rather than on the event loop:
+    # start_pool_download is awaited straight from the /queue/preempt and
+    # /doctor/fix handlers, which push every other SQLite touch through
+    # run_blocking. Bounded at busy_timeout (5s), but that is 5s of accept()
+    # gap for the whole web server. See tests/test_event_loop_safety.py — its
+    # AST scan only inspects the handler's own body, so this indirection is
+    # invisible to it.
     try:
-        actual = await _pool_poller_count(client, queue_name)
+        served = await pool_queue_is_served(client, source, queue_name)
     except Exception as e:
         msg = (
             f"pool gate: describe_task_queue RPC failed for {queue_name}: {e} "
@@ -445,11 +482,12 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
         )
         logger.critical(msg)
         raise PoolPollerGateError(msg) from e
-    if actual < expected:
+    if not served:
         msg = (
             f"pool gate rejected task {task_dict.get('id')}: {queue_name} has "
-            f"{actual} activity poller(s), expected >= {expected} alive "
-            f"{source} worker(s)"
+            f"0 activity pollers and no pool batch reported by a {source} "
+            f"worker in the last {POOL_LIVE_BATCH_WINDOW_S}s — nothing would "
+            f"drain this queue (is a pool worker registered on {queue_name}?)"
         )
         logger.critical(msg)
         raise PoolPollerGateError(msg)
@@ -474,7 +512,7 @@ async def start_pool_download(task_dict: dict, task_queue: str | None = None):
     )
     logger.info(
         f"Started pool workflow {workflow_id} on queue {coordinator} "
-        f"({actual} activity pollers on {queue_name})"
+        f"(batches on {queue_name}, which has a live consumer)"
     )
     return handle
 

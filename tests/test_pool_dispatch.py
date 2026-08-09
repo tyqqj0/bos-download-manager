@@ -8,9 +8,11 @@ reach it. This file exercises the five things that make it reachable:
 
 1. start_task_download routes on dispatch_mode (missing/NULL -> sharded).
 2. start_pool_download's mode gate: refuses (raises + logs CRITICAL) when
-   the pool activity queue has fewer live pollers than alive workers for
-   that source; proceeds when it has enough. The gRPC describe call is
-   stubbed — nothing here needs a live Temporal server.
+   nothing is draining that source's pool queue — no activity pollers AND no
+   recent batch report from one of its workers; proceeds otherwise, including
+   on a saturated fleet, which reports zero pollers because a pool worker
+   holds one batch at a time (#91). The gRPC describe call is stubbed —
+   nothing here needs a live Temporal server.
 3. auto_dispatch_pending's per-source pool admission cap
    (fleet.POOL_MAX_CONCURRENT_TASKS), independent of admission on other
    sources.
@@ -166,13 +168,30 @@ class _FakeClient:
         return "fake-pool-handle"
 
 
-def test_pool_gate_rejects_and_alerts_when_pollers_below_alive_workers(db, monkeypatch, caplog):
+def _live_batch(db, task_id, shard_id, *, server="w1", age_s=0.0):
+    """A running batch row as a worker would have left it: claimed (server set
+    by /queue/shard-assign) and progressed (updated_at bumped by
+    /queue/shard-progress). `age_s` backdates the last report."""
+    db.upsert_shard({"id": shard_id, "task_id": task_id, "shard_index": 0,
+                     "status": "running", "server": server,
+                     "updated_at": time.time() - age_s})
+
+
+def test_pool_gate_rejects_when_no_pollers_and_no_live_batches(db, monkeypatch, caplog):
+    """The one thing this gate exists for: nothing is draining the queue.
+
+    No pollers AND no worker has reported a batch — the shape of a fleet that
+    never registered pool-hf at all. Alive-worker count is deliberately NOT
+    part of the test: 2 workers are alive here and the gate still refuses,
+    because "alive" is a heartbeat to the web server and says nothing about
+    whether the worker process registered this queue.
+    """
     import dlm.web.temporal_client as tc
 
     _worker(db, "w1")
-    _worker(db, "w2")  # 2 alive hf workers -> expected >= 2 pollers
+    _worker(db, "w2")
 
-    fake_client = _FakeClient(poller_count=1)  # only 1 poller
+    fake_client = _FakeClient(poller_count=0)
 
     async def fake_connected(timeout=None):
         return fake_client
@@ -188,13 +207,109 @@ def test_pool_gate_rejects_and_alerts_when_pollers_below_alive_workers(db, monke
     assert fake_client.started == []  # refused before ever starting the workflow
 
 
-def test_pool_gate_proceeds_when_pollers_meet_alive_workers(db, monkeypatch):
+def test_pool_gate_proceeds_on_saturated_fleet_with_zero_pollers(db, monkeypatch):
+    """#91 regression: a 100%-busy pool fleet must still accept new tasks.
+
+    A pool worker holds one batch at a time (max_concurrent_activities=1) and
+    a Temporal worker at its concurrency limit stops polling, so a fully
+    loaded fleet reports zero pollers — identical to a dead one. The old gate
+    compared pollers against alive workers and therefore refused every
+    dispatch exactly when the pool was working. Running batch rows are the
+    tiebreak.
+    """
     import dlm.web.temporal_client as tc
 
     _worker(db, "w1")
-    _worker(db, "w2")  # 2 alive hf workers
+    _worker(db, "w2")
+    _task(db, "t-busy", status="downloading", mode="pool", source="hf")
+    _live_batch(db, "t-busy", "t-busy-b0", server="w1")
+    _live_batch(db, "t-busy", "t-busy-b1", server="w2")
 
-    fake_client = _FakeClient(poller_count=2)  # exactly meets expectation
+    fake_client = _FakeClient(poller_count=0)
+
+    async def fake_connected(timeout=None):
+        return fake_client
+    monkeypatch.setattr(tc, "connected_client", fake_connected)
+
+    task = {"id": "t-gate-busy", "source": "hf", "name": "x", "repo_id": "org/x"}
+    handle = asyncio.run(tc.start_pool_download(task))
+
+    assert handle == "fake-pool-handle"
+    assert len(fake_client.started) == 1
+
+
+def test_pool_gate_rejects_when_batch_rows_are_stale(db, monkeypatch, caplog):
+    """The corroboration must not outlive the workers it corroborates.
+
+    A worker that dies mid-batch leaves its row `running` forever — only the
+    report age distinguishes that from a live batch, so a row older than
+    POOL_LIVE_BATCH_WINDOW_S must not vouch for anything.
+    """
+    import dlm.web.temporal_client as tc
+    from dlm.web.fleet import POOL_LIVE_BATCH_WINDOW_S
+
+    _worker(db, "w1")
+    _task(db, "t-dead", status="downloading", mode="pool", source="hf")
+    _live_batch(db, "t-dead", "t-dead-b0", age_s=POOL_LIVE_BATCH_WINDOW_S + 60)
+
+    fake_client = _FakeClient(poller_count=0)
+
+    async def fake_connected(timeout=None):
+        return fake_client
+    monkeypatch.setattr(tc, "connected_client", fake_connected)
+
+    task = {"id": "t-gate-stale", "source": "hf", "name": "x", "repo_id": "org/x"}
+
+    with caplog.at_level(logging.CRITICAL, logger="dlm.web"):
+        with pytest.raises(tc.PoolPollerGateError):
+            asyncio.run(tc.start_pool_download(task))
+    assert fake_client.started == []
+
+
+def test_pool_gate_ignores_unclaimed_batch_rows(db, monkeypatch):
+    """A dispatched-but-unclaimed row proves nothing: upsert_shard stamps
+    updated_at at creation, so freshness alone would let the coordinator
+    vouch for workers that never picked the batch up. Only `server` — written
+    by the claiming worker — makes a row evidence."""
+    import dlm.web.temporal_client as tc
+
+    _task(db, "t-unclaimed", status="downloading", mode="pool", source="hf")
+    db.upsert_shard({"id": "t-unclaimed-b0", "task_id": "t-unclaimed",
+                     "shard_index": 0, "status": "running", "server": "",
+                     "updated_at": time.time()})
+
+    assert tc.live_pool_batch_count("hf") == 0
+
+
+def test_pool_gate_live_batches_are_per_source(db, monkeypatch):
+    """A busy ModelScope fleet must not vouch for the HF pool queue."""
+    import dlm.web.temporal_client as tc
+
+    _task(db, "t-ms", status="downloading", mode="pool", source="modelscope")
+    _live_batch(db, "t-ms", "t-ms-b0", server="bj1")
+
+    assert tc.live_pool_batch_count("modelscope") == 1
+    assert tc.live_pool_batch_count("hf") == 0
+
+
+def test_pool_gate_ignores_sharded_batch_rows(db, monkeypatch):
+    """Sharded shards run as child workflows on per-worker queues and say
+    nothing about whether anyone polls the pool queue."""
+    import dlm.web.temporal_client as tc
+
+    _task(db, "t-shd", status="downloading", mode="sharded", source="hf")
+    _live_batch(db, "t-shd", "t-shd-s0", server="w1")
+
+    assert tc.live_pool_batch_count("hf") == 0
+
+
+def test_pool_gate_proceeds_when_pollers_present(db, monkeypatch):
+    import dlm.web.temporal_client as tc
+
+    _worker(db, "w1")
+    _worker(db, "w2")
+
+    fake_client = _FakeClient(poller_count=2)
 
     async def fake_connected(timeout=None):
         return fake_client
@@ -209,6 +324,34 @@ def test_pool_gate_proceeds_when_pollers_meet_alive_workers(db, monkeypatch):
     started = fake_client.started[0]
     assert started["task_queue"] == "download-workers"  # coordinator, not the batch queue
     assert started["id"] == "pool-t-gate-ok"
+
+
+def test_pool_gate_refuses_fail_closed_on_rpc_failure(db, monkeypatch, caplog):
+    """An unknown answer is not a green light — and its log line must be
+    distinguishable from a real "nothing is draining this queue"."""
+    import dlm.web.temporal_client as tc
+
+    _worker(db, "w1")
+    _task(db, "t-rpc", status="downloading", mode="pool", source="hf")
+    _live_batch(db, "t-rpc", "t-rpc-b0", server="w1")  # would pass, if we got that far
+
+    fake_client = _FakeClient(poller_count=0)
+
+    async def boom(req, timeout=None):
+        raise RuntimeError("grpc unavailable")
+    fake_client.service_client.workflow_service.describe_task_queue = boom
+
+    async def fake_connected(timeout=None):
+        return fake_client
+    monkeypatch.setattr(tc, "connected_client", fake_connected)
+
+    task = {"id": "t-gate-rpc", "source": "hf", "name": "x", "repo_id": "org/x"}
+
+    with caplog.at_level(logging.CRITICAL, logger="dlm.web"):
+        with pytest.raises(tc.PoolPollerGateError):
+            asyncio.run(tc.start_pool_download(task))
+    assert any("describe_task_queue RPC failed" in r.message for r in caplog.records)
+    assert fake_client.started == []
 
 
 def test_pool_gate_uses_activity_task_queue_type():

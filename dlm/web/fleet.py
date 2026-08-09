@@ -81,6 +81,20 @@ POOL_STARVED_ZERO_SAMPLES = 2
 # not discard a real confirmation.
 POOL_STARVED_SAMPLE_GAP_S = 900
 
+# ...and even a confirmed zero is not evidence on its own. A pool worker runs
+# ONE batch at a time (__main__.py pins max_concurrent_activities=1 on the pool
+# queue), and a Temporal worker at its concurrency limit STOPS POLLING — so a
+# fleet with every worker busy on a batch reports exactly the same zero
+# pollers as a fleet that never registered the queue at all. Measured
+# 2026-08-09: HK 7/7 busy -> pool-hf = 0 pollers, BJ 9/9 idle -> pool-ms = 9.
+# The tie-breaker is a worker-originated batch report: if some worker has
+# written to a running pool batch row of this source within this window, the
+# queue demonstrably has a live consumer. Two batch heartbeats
+# (POOL_BATCH_HEARTBEAT = 10 min) of slack, so one missed report is not
+# mistaken for a dead fleet — and a fleet that really dies goes stale here
+# within 20 minutes and the alert fires as designed.
+POOL_LIVE_BATCH_WINDOW_S = int(os.environ.get("DLM_POOL_LIVE_BATCH_WINDOW_S", "1200"))
+
 # Window weights per priority band. The coordinator's per-wake window is this
 # task's share of P — P being alive workers serving the source — so these decide
 # how a busy pool is split between concurrent pool tasks. Priority 0-2 ("P0",

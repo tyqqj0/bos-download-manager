@@ -709,6 +709,43 @@ def get_running_shards(include_stopped_tasks: bool = False) -> list:
     return [dict(r) for r in rows]
 
 
+def count_live_pool_batches(source: str, since: float) -> int:
+    """Running pool batch rows for `source` that a worker reported on since `since`.
+
+    Evidence that some worker process is alive and draining this source's pool
+    queue, for the two callers that cannot get that answer from
+    DescribeTaskQueue: a pool worker runs one batch at a time, so a fully-busy
+    fleet stops polling and reads identically to a fleet that never registered
+    the queue (see fleet.POOL_LIVE_BATCH_WINDOW_S).
+
+    Both conditions past `status = 'running'` are worker-originated writes,
+    which is what makes the count evidence rather than bookkeeping:
+      - `server` is only ever set by /api/queue/shard-assign, which the batch
+        activity calls from the worker that claimed it. A dispatched-but-
+        unclaimed row has a fresh `updated_at` (upsert_shard stamps it) and no
+        server, and must not count.
+      - `updated_at` is bumped by /api/queue/shard-progress. The one non-worker
+        writer of pool rows, reconciler.reclaim_orphaned_shards, skips pool
+        rows outright and writes `failed` (terminal) when it does write, so it
+        cannot fake freshness here.
+
+    The parent task's status is deliberately NOT filtered: a paused task's
+    in-flight batches keep reporting for a while, and a report from a live
+    worker is a live worker regardless of what the operator did to the task.
+    Rows belonging to a genuinely stopped task age out of the window on their
+    own.
+    """
+    conn = _conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM shards s JOIN tasks t ON t.id = s.task_id "
+        "WHERE s.status = 'running' AND t.dispatch_mode = 'pool' AND t.source = ? "
+        "AND s.server IS NOT NULL AND s.server != '' "
+        "AND COALESCE(s.updated_at, 0) > ?",
+        (source, since),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
 def get_task_servers(task_id: str) -> list:
     """Machines currently running work for a task, in both dispatch modes.
 
