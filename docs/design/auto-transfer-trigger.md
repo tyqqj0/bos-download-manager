@@ -17,10 +17,18 @@
 | 部件 | 位置 | 状态 |
 |---|---|---|
 | 目的端 import API 封装 | `dlm/transfer/dcloud.py:107` `import_from_bos()` | 可用，服务端复制，我方只读 |
-| 进度轮询 `transferring → done/failed` | `dlm/web/scheduler.py:130` `_poll_transfers()`，60s | 可用，只推进别人入队的行 |
-| 手动触发 / 重试 / 暂停开关 | `dlm/web/routes/transfer.py` + `app.js:533` | 可用，前端已有暂停按钮 |
+| 进度轮询 `transferring → done/failed` | `dlm/web/scheduler.py:130` `_poll_transfers()`，60s | 可用，只推进别人入队的行；但**远端报成功就直接写 done，没做任何验证**（2026-08-10 更正） |
+| 手动触发 / 重试 / 暂停开关 | `dlm/web/routes/transfer.py` + `app.js:533` | ~~可用~~ **也是死的**（2026-08-10 更正，见下） |
 | DB 字段 | `tasks.transfer_status / transfer_task_id / transfer_error` | 已存在 |
 | **自动触发** | 原 `dlm/transfer/tasks.py` Celery 任务 | **死了**（Celery 下载链路 2026-06-30 废弃） |
+
+> **2026-08-10 更正**：上表"手动触发 / 重试 / 暂停开关 = 可用"这一行是**错的**，和
+> 同表最后一行自相矛盾。`POST /transfer/trigger`（`routes/transfer.py:77`）和
+> `POST /transfer/{task_id}/retry`（:109）都在调
+> `transfer_to_juicefs.apply_async(queue="transfers")`——也就是往同表判为"死了"的那个
+> Celery broker 投递；`POST /transfer/pause` 只写内存 `cache`，web 一重启就失效。
+> 网页把三个都渲染成正常控件，所以**点了没反应也不报错**。
+> 修复方案见 `docs/superpowers/specs/2026-08-10-auto-transfer-design.md` 阶段二。
 
 旧 Celery 版有两个必须抛弃的设计缺陷：
 1. 它**直接改任务自己的 `status`**（`status="transferring"` → `status="done"`），
