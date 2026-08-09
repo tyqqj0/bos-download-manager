@@ -201,5 +201,11 @@ NULL ──arm──► ready ──dispatch──► transferring ──远端�
   重跑是安全的（旧任务已终态，不会撞并发），但要先查是哪 2 个对象（很可能是
   0 字节对象，和 RoboDojo 同类问题）。
 - **`PhysicalAI-Robotics-Locomanipulation`**：`done` 但 0 条 shard 行 → 闸门 4 会
-  拦住它，永远不会自动 arm。这是对的（不可验证就不搬），但需要一条
-  `transfer_blocked` 之外的信号让人知道它被拦了。
+  拦住它。这是对的（不可验证就不搬）。**实现比这条早先的记法走得更远**：闸门 4 拒绝
+  时会 `_write(task_id, "blocked", detail)`（`dlm/transfer/arm.py:200`），于是它自带
+  `transfer_blocked` CRITICAL，不需要再造一条信号。真正的缺口比这窄——自动 arm 只挂
+  在 coordinator 自己报 `done` 的那一次（`routes/servers.py:225`），历史 `done` 行
+  没有任何东西去扫，所以这条任务根本走不到闸门 4，一直是 `transfer_status = NULL`
+  的静默状态。要它出声，得先有人按 `POST /api/transfer/trigger`；按了就会看到
+  `blocked` + 告警。这是故意的（reconciler 推断出来的 `done` 绝不能 arm），代价就是
+  积压需要人推一把。
