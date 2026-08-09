@@ -187,6 +187,21 @@ def _stub_pending_activities(monkeypatch, rows_by_workflow_id):
     monkeypatch.setattr(tc, "pending_activities", fake_pending)
 
 
+def _abandoned_batch(db, task_id, shard_id, *, server="w1"):
+    """A running batch row whose worker died: still `running` (nothing rewrites
+    it), but no report inside POOL_LIVE_BATCH_WINDOW_S.
+
+    Trigger 1's zero-poller reading is only evidence of death once the batch
+    rows stop corroborating it (#90) — a row left at its default fresh
+    `updated_at` describes a SATURATED fleet, which is the false positive the
+    trigger used to fire on, so every dead-fleet test has to backdate."""
+    from dlm.web.fleet import POOL_LIVE_BATCH_WINDOW_S
+
+    db.upsert_shard({"id": shard_id, "task_id": task_id, "shard_index": 0,
+                     "status": "running", "server": server,
+                     "updated_at": time.time() - POOL_LIVE_BATCH_WINDOW_S - 60})
+
+
 def test_no_pollers_triggers_critical_pool_starved_only_after_confirmation(db, monkeypatch):
     """Temporal's poller list is a recency view — a frontend restart, a
     matching-service failover or a fleet that just reconnected can report
@@ -198,8 +213,7 @@ def test_no_pollers_triggers_critical_pool_starved_only_after_confirmation(db, m
     assert POOL_STARVED_ZERO_SAMPLES == 2  # one confirmation cycle (300s)
 
     _task(db, "t-nopoll", status="downloading", mode="pool", source="hf")
-    db.upsert_shard({"id": "s-nopoll-0", "task_id": "t-nopoll", "shard_index": 0,
-                      "status": "running", "server": "w1"})
+    _abandoned_batch(db, "t-nopoll", "s-nopoll-0")
 
     _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
     _stub_pending_activities(monkeypatch, {})
@@ -245,8 +259,7 @@ def test_a_failed_poller_rpc_neither_alerts_nor_clears_the_streak(db, monkeypatc
     from dlm.web import reconciler
 
     _task(db, "t-rpcfail", status="downloading", mode="pool", source="hf")
-    db.upsert_shard({"id": "s-rf-0", "task_id": "t-rpcfail", "shard_index": 0,
-                      "status": "running", "server": "w1"})
+    _abandoned_batch(db, "t-rpcfail", "s-rf-0")
     _stub_pending_activities(monkeypatch, {})
     _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
 
@@ -274,8 +287,7 @@ def test_a_stale_zero_sample_does_not_count_as_consecutive(db, monkeypatch):
     from dlm.web.fleet import POOL_STARVED_SAMPLE_GAP_S
 
     _task(db, "t-stale-sample", status="downloading", mode="pool", source="hf")
-    db.upsert_shard({"id": "s-ss2-0", "task_id": "t-stale-sample", "shard_index": 0,
-                      "status": "running", "server": "w1"})
+    _abandoned_batch(db, "t-stale-sample", "s-ss2-0")
     _stub_pending_activities(monkeypatch, {})
     _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
 
@@ -287,6 +299,69 @@ def test_a_stale_zero_sample_does_not_count_as_consecutive(db, monkeypatch):
             count, at - POOL_STARVED_SAMPLE_GAP_S - 1)
 
     assert asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-stale-sample")])) == []
+
+
+def test_a_saturated_fleet_never_alerts_no_matter_how_many_zero_samples(db, monkeypatch):
+    """#90, the false positive this trigger actually produced in production.
+
+    A pool worker holds ONE batch at a time (max_concurrent_activities=1) and a
+    Temporal worker at its concurrency limit stops polling, so HK at 7/7 busy
+    reported pool-hf = 0 pollers and the patrol screamed `critical:
+    pool_starved` every ~20-25 minutes at a fleet that was downloading at full
+    rate. Confirmation cycles cannot fix that — the reading is stably zero for
+    as long as the fleet stays busy — so no number of samples may alert while
+    workers are still reporting batches."""
+    from dlm.web import reconciler
+
+    _task(db, "t-saturated", status="downloading", mode="pool", source="hf")
+    # Fresh rows, i.e. workers reporting normally: the whole fleet is busy.
+    for i in range(7):
+        db.upsert_shard({"id": f"s-sat-{i}", "task_id": "t-saturated",
+                         "shard_index": i, "status": "running",
+                         "server": f"w{i + 1}", "updated_at": time.time()})
+    _stub_pending_activities(monkeypatch, {})
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
+
+    for _ in range(4):  # twice the confirmation requirement
+        assert asyncio.run(
+            reconciler.inspect_pool_tasks([db.get_task("t-saturated")])) == []
+
+
+def test_a_dead_fleet_still_alerts_once_batch_reports_go_stale(db, monkeypatch):
+    """The other half of #90: the corroboration must not become a mute button.
+
+    Same zero-poller reading as the saturated case, but the batch rows stopped
+    being updated — a fleet that died mid-batch. This must still reach
+    CRITICAL, within POOL_LIVE_BATCH_WINDOW_S of the last report."""
+    from dlm.web import reconciler
+
+    _task(db, "t-reallydead", status="downloading", mode="pool", source="hf")
+    _abandoned_batch(db, "t-reallydead", "s-rd-0")
+    _stub_pending_activities(monkeypatch, {})
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
+
+    assert asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-reallydead")])) == []
+    alerts = asyncio.run(reconciler.inspect_pool_tasks([db.get_task("t-reallydead")]))
+    assert [(a["severity"], a["trigger"]) for a in alerts] == [("critical", "no_pollers")]
+
+
+def test_a_busy_fleet_on_another_source_does_not_vouch_for_this_one(db, monkeypatch):
+    """Corroboration is per pool queue: pool-ms being saturated says nothing
+    about whether anything polls pool-hf."""
+    from dlm.web import reconciler
+
+    _task(db, "t-hf-dead", status="downloading", mode="pool", source="hf")
+    _abandoned_batch(db, "t-hf-dead", "s-hfd-0")
+    _task(db, "t-ms-busy", status="downloading", mode="pool", source="modelscope")
+    db.upsert_shard({"id": "s-msb-0", "task_id": "t-ms-busy", "shard_index": 0,
+                     "status": "running", "server": "bj1", "updated_at": time.time()})
+    _stub_pending_activities(monkeypatch, {})
+    _stub_connected_client(monkeypatch, _FakeClient(poller_count=0))
+
+    tasks = [db.get_task("t-hf-dead"), db.get_task("t-ms-busy")]
+    assert asyncio.run(reconciler.inspect_pool_tasks(tasks)) == []
+    alerts = asyncio.run(reconciler.inspect_pool_tasks(tasks))
+    assert [a["task_id"] for a in alerts] == ["t-hf-dead"]
 
 
 def test_scheduled_stuck_triggers_warning_pool_starved(db, monkeypatch):
@@ -480,8 +555,7 @@ def test_reconcile_wires_pool_starved_into_its_report(db, monkeypatch):
     _stub_pending_activities(monkeypatch, {})
 
     _task(db, "t-wired", status="downloading", mode="pool", source="hf")
-    db.upsert_shard({"id": "s-wired-0", "task_id": "t-wired", "shard_index": 0,
-                      "status": "running", "server": "w1"})
+    _abandoned_batch(db, "t-wired", "s-wired-0")
 
     # Two passes: trigger 1 needs a confirming sample (review finding I8), so
     # a single reconcile() legitimately reports nothing here.

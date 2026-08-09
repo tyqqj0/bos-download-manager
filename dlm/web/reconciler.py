@@ -308,10 +308,16 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
     RPC is best-effort: an inspection pass must never be able to stop the
     scheduler loop, so a failed RPC is logged and skipped, not raised.
 
-    Trigger 1 (no pollers) is what A10's drill exercises. It fires on the
-    SECOND consecutive zero-poller sample, i.e. ~600s after the fleet's
-    pollers go to zero (two 300s cycles) — one zero can just be Temporal's
-    recency-based poller view, and A10 also grades false positives. Triggers
+    Trigger 1 (nothing draining the queue) is what A10's drill exercises. It
+    fires on the SECOND consecutive unserved sample, i.e. ~600s after the
+    fleet stops draining (two 300s cycles) — one zero can just be Temporal's
+    recency-based poller view, and A10 also grades false positives. "Unserved"
+    is not "zero pollers": a pool worker runs one batch at a time, so a fully
+    busy fleet stops polling and reads exactly like a dead one, and this
+    trigger screamed CRITICAL every ~20 min at a healthy saturated HK fleet
+    until #90. pool_queue_is_served corroborates a zero against recent
+    worker-written batch rows; a fleet that really dies goes stale inside
+    POOL_LIVE_BATCH_WINDOW_S and the alert fires as designed. Triggers
     2/3 (SCHEDULED aged out / attempt climbing) catch the slower failure
     shapes a poller-count check alone would miss (see the plan-vs-timers
     analysis in decision A). All three emit the same alert type, keyed per
@@ -322,9 +328,9 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
     from ..temporal.workflows import pool_task_queue
     from .temporal_client import (
         POOL_DOWNLOAD_ID_PREFIX,
-        _pool_poller_count,
         connected_client,
         pending_activities,
+        pool_queue_is_served,
     )
 
     pool_tasks = [t for t in downloading if (t.get("dispatch_mode") or "sharded") == "pool"]
@@ -359,7 +365,7 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
             for source, tasks_for_source in by_source.items():
                 queue_name = pool_task_queue(source)
                 try:
-                    pollers = await _pool_poller_count(client, queue_name)
+                    served = await pool_queue_is_served(client, source, queue_name)
                 except Exception as e:
                     # Decision B: an RPC failure is not evidence of anything,
                     # so it stays silent — and it is not a healthy sample
@@ -370,7 +376,7 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
                         f"Pool patrol: poller-count RPC failed for {queue_name}: {e}"
                     )
                     continue
-                if pollers > 0:
+                if served:
                     _POOL_ZERO_POLLER_SAMPLES.pop(queue_name, None)
                     continue
                 # One zero is not fleet death: Temporal's poller list is a
@@ -396,11 +402,12 @@ async def inspect_pool_tasks(downloading: list[dict]) -> list[dict]:
                         "task_name": t.get("name", ""),
                         "source": source,
                         "trigger": "no_pollers",
-                        "pollers": pollers,
+                        "pollers": 0,
                         "zero_samples": zeros,
                         "message": (
                             f"Pool task {t.get('name', t['id'])} ({source}): "
-                            f"{queue_name} has 0 activity pollers "
+                            f"{queue_name} has 0 activity pollers and no batch "
+                            f"reported by a {source} worker recently "
                             f"({zeros} consecutive samples)"
                         ),
                     })
