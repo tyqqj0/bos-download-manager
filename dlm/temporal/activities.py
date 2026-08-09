@@ -916,6 +916,15 @@ BATCH_MAX_BYTES = 32 * 1024 ** 3  # 32 GiB
 # argument silently corrupts `task_input`.
 POOL_MAX_BATCHES_DEFAULT = POOL_MAX_BATCHES
 
+# How often run_pool_batch's preflight vouches for itself in SQLite. Sized
+# against dlm.web.fleet.POOL_LIVE_BATCH_WINDOW_S (240s), which is the window
+# inside which a running batch row must have been written to for its queue to
+# count as having a live consumer: 30s leaves 8 consecutive missed reports of
+# slack, and matches the cadence PipelineEngine's speed reporter takes over at.
+# A module constant rather than a literal so a test can drive the loop without
+# waiting half a minute for the second iteration.
+POOL_PREFLIGHT_BEAT_S = 30
+
 
 def _chunk_files(
     files: list[dict], max_files: int = BATCH_MAX_FILES, max_bytes: int = BATCH_MAX_BYTES
@@ -1314,10 +1323,53 @@ async def run_pool_batch(
     # same pattern as filter_filelist_against_bos / chunk_filelist.
     preflight_done = False
 
+    # Only armed once the row is actually `running`: bumping a still-`pending`
+    # row vouches for nothing (fleet.py's liveness probe reads running batch
+    # rows only), and posting before the assign lands would write progress for
+    # a batch this worker may yet be told to drop.
+    batch_is_running = False
+
+    def _vouch_for_this_batch() -> None:
+        """Bump `shards.updated_at` so a live preflight is not read as a dead pool.
+
+        Temporal heartbeats never reach SQLite, and this phase runs before
+        PipelineEngine — and therefore before its speed reporter — exists. So
+        between `status=running` and `engine.run()` the row would go untouched
+        for however long the batch-list fetch plus the BOS HEAD sweep take, a
+        span budgeted by POOL_BATCH_HEARTBEAT (10 min) against
+        fleet.POOL_LIVE_BATCH_WINDOW_S (240s). A slow BOS then makes a
+        genuinely live batch read as a queue with no live consumer: the next
+        pool task is refused dispatch (it retries every 30s, so that part
+        self-heals) and a sustained case raises a false `pool_starved`.
+        Widening the window is not available — fleet.py's A10 detection bound
+        has 60s of slack left, asserted by tests/test_pool_observability.py.
+
+        Omitting `done_files`/`done_bytes` is the point, not an oversight:
+        `/api/shard-progress` falls back to the row's current values for absent
+        fields, so a retried batch's recorded progress cannot be walked
+        backwards to zero. `speed_mbps` is absent for the reason it should be —
+        during preflight nothing is downloading yet, and the route's own
+        default writes 0.
+
+        Best-effort by design: the write is evidence, not a checkpoint, so a
+        coordinator hiccup must not fail an otherwise healthy batch. Same
+        self-protection progress_fn applies, deliberately not `_post`'s raise.
+        """
+        try:
+            requests.post(
+                f"{_coordinator()}/api/shard-progress",
+                json={"shard_id": batch_id},
+                timeout=5,
+            )
+        except Exception as e:
+            logger.debug(f"Pool batch preflight liveness report failed: {e}")
+
     async def _heartbeat_while_preflight():
         while not preflight_done:
             activity.heartbeat(f"pool batch {batch_index}: preflight (assign/manifest/HEAD sweep)")
-            await asyncio.sleep(30)
+            if batch_is_running:
+                await asyncio.to_thread(_vouch_for_this_batch)
+            await asyncio.sleep(POOL_PREFLIGHT_BEAT_S)
 
     heartbeat_task = asyncio.create_task(_heartbeat_while_preflight())
     try:
@@ -1336,6 +1388,10 @@ async def run_pool_batch(
             raise RuntimeError(f"{server_key}: status=running failed for batch {batch_id}: {status_resp['error']}")
         if status_resp.get("ignored"):
             return {"ignored": True}
+        # From here on the row is `running`, so the beater's writes are the
+        # evidence fleet.py looks for — and the HEAD sweep below is the phase
+        # that used to leave it stale.
+        batch_is_running = True
 
         floor_gb, free_gb, total_gb = await asyncio.to_thread(_pool_disk_floor_gb)
         if min_free_gb is not None:

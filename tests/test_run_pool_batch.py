@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -242,6 +243,13 @@ def _calls_by_path(calls, suffix):
     return [(u, b) for u, b in calls if u.endswith(suffix)]
 
 
+def _liveness_beats(calls):
+    """Preflight liveness writes, told apart from real progress reports by the
+    absence of `done_bytes` — which is exactly what makes them safe to send."""
+    return [b for u, b in _calls_by_path(calls, "/api/shard-progress")
+            if "done_bytes" not in (b or {})]
+
+
 def test_ignored_assign_short_circuits_before_download(pool_batch_env, monkeypatch, tmp_path):
     calls = pool_batch_env
 
@@ -311,6 +319,111 @@ def test_assign_and_running_status_posted_before_download(pool_batch_env):
     assign_body = calls[assign_idx][1]
     expected_batch_id = shard_row_id("t-1", 3)
     assert assign_body == {"shard_id": expected_batch_id, "server_key": "w9"}
+
+
+# ── preflight liveness: the phase that used to write nothing to SQLite ──────
+# A Temporal heartbeat is invisible to SQLite. Between `status=running` and
+# `engine.run()` (batch-list fetch + up to BATCH_MAX_FILES BOS HEADs) nothing
+# used to touch the row, while POOL_BATCH_HEARTBEAT gives that phase 10 minutes
+# and dlm.web.fleet.POOL_LIVE_BATCH_WINDOW_S calls a row stale after 240s — so
+# a slow BOS made a live batch read as a queue with no live consumer.
+
+
+def test_the_head_sweep_keeps_vouching_for_a_live_batch(pool_batch_env, monkeypatch):
+    """The HEAD sweep must write to SQLite while it runs, not just after."""
+    calls = pool_batch_env
+    monkeypatch.setattr(activities, "POOL_PREFLIGHT_BEAT_S", 0.01)
+
+    def slow_head_skip(files, task_input):
+        # Stands in for a slow BOS. Runs in a worker thread (the activity hands
+        # it to asyncio.to_thread), so blocking here does not block the beater.
+        deadline = time.time() + 5
+        while time.time() < deadline and not _liveness_beats(calls):
+            time.sleep(0.01)
+        return files, 0, 0
+
+    monkeypatch.setattr(activities, "_head_skip_filter", slow_head_skip)
+
+    result = _run_activity(activities.run_pool_batch,
+                           _task_input(task_id="t-1"), 3, "k")
+
+    assert result["ignored"] is False
+    beats = _liveness_beats(calls)
+    assert beats, ("the BOS HEAD sweep wrote nothing to SQLite: the row goes "
+                   "stale past POOL_LIVE_BATCH_WINDOW_S and a live batch reads "
+                   "as a dead pool")
+    # `shard_id` alone. /api/shard-progress falls back to the row's current
+    # done_files/done_bytes for absent fields, so a retried batch's recorded
+    # progress cannot be walked back to zero by a liveness write.
+    assert beats[0] == {"shard_id": shard_row_id("t-1", 3)}
+
+    urls = [u for u, _ in calls]
+    running_idx = next(i for i, (u, b) in enumerate(calls)
+                       if u.endswith("/api/shards/status") and b.get("status") == "running")
+    beat_idx = next(i for i, (u, b) in enumerate(calls)
+                    if u.endswith("/api/shard-progress") and "done_bytes" not in b)
+    assert running_idx < beat_idx < urls.index("<engine-start>")
+
+
+def test_no_liveness_beat_before_the_batch_row_is_running(pool_batch_env, monkeypatch):
+    """Vouching early would vouch for the wrong thing.
+
+    Before the assign lands, this worker may still be told to drop the batch;
+    and fleet.py's liveness probe reads running batch rows only, so bumping a
+    still-`pending` row is evidence of nothing.
+    """
+    calls = pool_batch_env
+    monkeypatch.setattr(activities, "POOL_PREFLIGHT_BEAT_S", 0.005)
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url, json))
+        if url.endswith("/api/shards/assign"):
+            time.sleep(0.1)          # ~20 beat intervals to fire in
+        return _FakeResponse({"ok": True})
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    _run_activity(activities.run_pool_batch, _task_input(), 0, "k")
+
+    running_idx = next(i for i, (u, b) in enumerate(calls)
+                       if u.endswith("/api/shards/status") and b.get("status") == "running")
+    assert not [u for u, _ in calls[:running_idx]
+                if u.endswith("/api/shard-progress")]
+
+
+def test_a_failed_liveness_beat_does_not_fail_the_batch(pool_batch_env, monkeypatch):
+    """The write is evidence, not a checkpoint.
+
+    A wedged S1 is a known failure mode; losing a liveness report costs us one
+    stale-row sample, while raising here would kill a batch that is otherwise
+    downloading fine — and burn one of its 3 attempts.
+    """
+    calls = pool_batch_env
+    monkeypatch.setattr(activities, "POOL_PREFLIGHT_BEAT_S", 0.01)
+    attempted = []
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url, json))
+        if url.endswith("/api/shard-progress") and "done_bytes" not in (json or {}):
+            attempted.append(json)
+            raise RuntimeError("S1 wedged")
+        return _FakeResponse({"ok": True})
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    def slow_head_skip(files, task_input):
+        deadline = time.time() + 5
+        while time.time() < deadline and not attempted:
+            time.sleep(0.01)
+        return files, 0, 0
+
+    monkeypatch.setattr(activities, "_head_skip_filter", slow_head_skip)
+
+    result = _run_activity(activities.run_pool_batch, _task_input(), 0, "k")
+
+    assert attempted, "the beat never fired, so this proves nothing"
+    assert result["ignored"] is False
+    assert _FakePipelineEngine.instances, "the batch must still have run"
 
 
 def test_disk_floor_raises_retryable_without_any_status_post(pool_batch_env, monkeypatch):

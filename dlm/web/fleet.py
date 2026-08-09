@@ -100,18 +100,18 @@ POOL_STARVED_SAMPLE_GAP_S = 900
 # reporting. 240s is 16 consecutive missed reports before a live worker stops
 # vouching for its queue.
 #
-# The one phase this does NOT cover is run_pool_batch's preflight: after the
+# The one phase this used to NOT cover is run_pool_batch's preflight: after the
 # assign + status=running POSTs, the batch-list fetch and the BOS HEAD sweep
 # (activities.py `_head_skip_filter`, up to 500 objects) run before
-# PipelineEngine — and therefore before the speed reporter — exists, writing
-# nothing to SQLite. That phase is budgeted by POOL_BATCH_HEARTBEAT (10 min),
-# so a slow BOS can leave a genuinely live batch's row stale here, which reads
-# as a dead fleet: a new pool task is refused (it retries every 30s, so it
-# recovers on its own) and a sustained case can raise a false pool_starved.
-# Raising this window is not the fix — the A10 bound below leaves it no room.
-# The fix is to make the preflight heartbeater POST shard-progress too, so the
-# claim above becomes literally true; that is worker code, hence a worker
-# deploy, hence not folded into this web-only change.
+# PipelineEngine — and therefore before the speed reporter — exists. That phase
+# is budgeted by POOL_BATCH_HEARTBEAT (10 min), so a slow BOS left a genuinely
+# live batch's row stale here, which read as a dead fleet: a new pool task was
+# refused (it retried every 30s, so it recovered on its own) and a sustained
+# case could raise a false pool_starved. Raising this window was never the fix —
+# the A10 bound below leaves it no room. Instead the preflight heartbeater now
+# POSTs /api/shard-progress every POOL_PREFLIGHT_BEAT_S (30s, `shard_id` only,
+# so it cannot walk a retried batch's progress backwards), which makes the claim
+# above literally true for the whole batch lifetime.
 #
 # It is deliberately kept well under one patrol interval, because it delays
 # trigger 1: the first unserved sample cannot land until the rows have gone
