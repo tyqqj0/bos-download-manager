@@ -72,7 +72,39 @@ def _task_for_frontend(t: dict) -> dict:
         # the request at the idle same-source workers. Sharded mode only —
         # a pool task sizes its own batches and leaves this at 0.
         "shard_count": t.get("max_workers", 0) or 0,
+        # The page a human opens to look at (or request access to) the source.
+        # Derived, never stored: the inputs are source/repo_id/type, all of
+        # which are already on the row, and a stored copy would go stale the
+        # moment any of them was corrected. Empty when the row predates
+        # repo_id or names a source we have no URL scheme for.
+        "source_url": _source_url(t),
+        # Why a paused row is paused. NULL on an ordinary operator pause, which
+        # is what lets the dashboard show an approval banner on exactly the
+        # rows that need one, and lets the recheck loop leave the others alone.
+        "hold_reason": t.get("hold_reason"),
+        "hold_detail": t.get("hold_detail"),
+        # The work a resume already skipped because it was on BOS. Sent so the
+        # UI can show progress against the ORIGINAL total: after a re-list
+        # `size_gb` is only the remaining work, so 25/61 batches of a resumed
+        # task rendered as 38.1% when 66.2% of the dataset was actually down.
+        "resume_skipped_gb": t.get("resume_skipped_gb", 0) or 0,
     }
+
+
+def _source_url(t: dict) -> str:
+    """The hub page for a task's repo. See `source_url` above for why derived."""
+    repo_id = (t.get("repo_id") or "").strip()
+    if not repo_id or "/" not in repo_id:
+        return ""
+    source = t.get("source") or ""
+    is_model = (t.get("type") or "dataset") == "model"
+    if source == "hf":
+        return (f"https://huggingface.co/{repo_id}" if is_model
+                else f"https://huggingface.co/datasets/{repo_id}")
+    if source == "modelscope":
+        return (f"https://modelscope.cn/models/{repo_id}" if is_model
+                else f"https://modelscope.cn/datasets/{repo_id}")
+    return ""
 
 
 @router.get("/tasks")
@@ -238,7 +270,12 @@ class AddTaskRequest(BaseModel):
     url_or_repo: str
     category: str = "other"
     type: str = "dataset"
-    priority: str = "P1"
+    # P2, not P1: P1 maps to int 2, which is inside the pool weight-boost band
+    # (fleet.pool_task_weight grants 1.5x the batch window at priority <= 2) and
+    # is preferred by the preempt victim sort. A caller who never mentions
+    # priority is not asking for either, so the default has to sit outside the
+    # band — the same correction the web form got.
+    priority: str = "P2"
     server: Optional[str] = None
     include: Optional[str] = None
     name: Optional[str] = None
@@ -259,8 +296,25 @@ class AddTaskRequest(BaseModel):
 
 @router.post("/tasks")
 async def add_task(req: AddTaskRequest):
-    """Add a new download task — saves to pending, auto_dispatch picks it up."""
+    """Add a new download task — saves to pending, auto_dispatch picks it up.
+
+    Two gates run before anything is stored, in this order:
+
+      1. the parse must yield a real org/name repo (a `collections/` page or a
+         bare `#dataset` used to become a task row and fail at listing);
+      2. for hf sources, an authorised probe of the resolve endpoint must not
+         come back 403 or 404 — see dlm/web/preflight.py for why the repo's
+         own `gated` field cannot answer this.
+
+    A 403 does not refuse the add: the repo is real and wanted, it just needs a
+    human to click Agree. The row is stored `paused` with
+    hold_reason='needs_approval' so the dashboard can show the reason and the
+    30-minute recheck loop can release it once approval lands. Refusing instead
+    would lose the operator's intent and the size estimate they typed.
+    """
     from ..fleet import VALID_DISPATCH_MODES
+    from .. import preflight as pf_mod
+    from ...core.parser import parse_repo
 
     if req.dispatch_mode is not None and req.dispatch_mode not in VALID_DISPATCH_MODES:
         raise HTTPException(
@@ -269,9 +323,39 @@ async def add_task(req: AddTaskRequest):
             f"expected one of {sorted(VALID_DISPATCH_MODES)}",
         )
 
+    # Parsing is pure and cheap, so it happens out here rather than inside the
+    # blocking worker: the preflight below needs its repo_id and source, and
+    # both gates should reject before a DB thread is occupied.
+    parsed = parse_repo(req.url_or_repo)
+    if req.type:
+        parsed["type"] = req.type
+    if req.source:
+        if req.source not in ("hf", "modelscope"):
+            raise HTTPException(
+                400, f"Unknown source: {req.source} (expected hf or modelscope)")
+        parsed["source"] = req.source
+        # An explicit source is not a guess, so a 404 below must not suggest
+        # the caller "try modelscope" when modelscope is what they said.
+        parsed["source_guessed"] = False
+        parsed["error"] = None
+
+    if parsed.get("error"):
+        raise HTTPException(400, parsed["error"])
+    if parsed["source"] == "unknown":
+        raise HTTPException(400, f"Cannot parse source: {req.url_or_repo}")
+
+    pf = await pf_mod.check_repo_access(
+        parsed["repo_id"], parsed["source"], parsed["type"])
+    if pf.outcome == pf_mod.NOT_FOUND:
+        hint = (
+            "；如果它在 ModelScope 上，请显式指定 source=modelscope"
+            if parsed.get("source_guessed") else ""
+        )
+        raise HTTPException(400, f"{pf.detail}{hint}")
+
     def _do():
         from ...core.bos import bos_target
-        from ...core.parser import parse_repo
+        from ...queue import snapshot
         from ...queue.snapshot import get_all_tasks, upsert_task, init_db
         from ..fleet import DEFAULT_DISPATCH_MODE
         import uuid
@@ -279,16 +363,6 @@ async def add_task(req: AddTaskRequest):
         from types import SimpleNamespace
 
         init_db()
-        parsed = parse_repo(req.url_or_repo)
-        if req.type:
-            parsed["type"] = req.type
-        if req.source:
-            if req.source not in ("hf", "modelscope"):
-                return {"error": f"Unknown source: {req.source} (expected hf or modelscope)"}
-            parsed["source"] = req.source
-
-        if parsed["source"] == "unknown":
-            return {"error": f"Cannot parse source: {req.url_or_repo}"}
 
         task_name = req.name or parsed["name"]
         repo_id = parsed["repo_id"]
@@ -302,6 +376,7 @@ async def add_task(req: AddTaskRequest):
         today = datetime.now(timezone.utc).strftime("%Y%m%d")
         task_id = f"t-{today}-{uuid.uuid4().hex[:6]}"
         priority_int = PRIORITY_TO_INT.get(req.priority, 5)
+        needs_approval = pf.outcome == pf_mod.NEEDS_APPROVAL
 
         # Ask bos_target for the prefix rather than re-deriving it. This used to
         # build "auwomo-datasets/raw-data/{category}/{name}/" by hand — a bucket
@@ -332,7 +407,10 @@ async def add_task(req: AddTaskRequest):
             # and /api/queue/resume takes it from paused to pending when the
             # operator is ready. Writing `pending` here (what this did) meant
             # no_dispatch was decorative — the next 30s cycle claimed it.
-            "status": "paused" if req.no_dispatch else "pending",
+            #
+            # A needs-approval row lands here too: dispatching it would recreate
+            # the failure this whole check exists to stop.
+            "status": "paused" if (req.no_dispatch or needs_approval) else "pending",
             "priority": priority_int,
             "size_gb": req.size_gb,
             "downloaded_gb": 0,
@@ -348,7 +426,15 @@ async def add_task(req: AddTaskRequest):
             task_meta["max_workers"] = req.shard_count
 
         upsert_task(task_meta)
-        return {"task": _task_for_frontend(task_meta)}
+
+        payload = _task_for_frontend(task_meta)
+        if needs_approval:
+            stamp = datetime.now(timezone.utc).strftime("%m-%d %H:%M UTC")
+            detail = f"{stamp} 添加时预检：{pf.detail}"
+            snapshot.set_hold(task_id, "needs_approval", detail)
+            payload["hold_reason"] = "needs_approval"
+            payload["hold_detail"] = detail
+        return {"task": payload}
 
     result = await run_blocking(_do)
     if "error" in result:

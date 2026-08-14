@@ -98,6 +98,36 @@ def _the_hosts_free_disk_is_not_a_test_input(monkeypatch):
     monkeypatch.setattr(pipeline, "_disk_free_gb", lambda: 10_000.0)
 
 
+@pytest.fixture(autouse=True)
+def _the_add_time_preflight_never_hits_the_network(monkeypatch):
+    """Keep HuggingFace out of the suite.
+
+    Both add routes now await `preflight.check_repo_access()`, which for an hf
+    source issues a real authorised HEAD to huggingface.co. Every existing test
+    that adds a task would therefore make a network call — and the outcome
+    would depend on whether the machine running pytest happens to have
+    HF_TOKEN exported, which is exactly the host-dependence the disk fixture
+    above exists to eliminate. On S1 it is worse than flaky:
+    scripts/deploy-workers.sh runs `pytest tests/ -q` as its deploy gate, and
+    S1 does have a token, so the gate would spend a network round trip per
+    add test and fail closed whenever HF is unreachable.
+
+    Patched at `probe_hf_repo` rather than `check_repo_access` on purpose: the
+    async wrapper carries the source routing and the thread hand-off, both of
+    which tests should still exercise. This only replaces the socket.
+
+    A test that wants a specific verdict re-patches `probe_hf_repo` itself; the
+    test body runs after this fixture, so its value wins.
+    """
+    from dlm.web import preflight
+
+    monkeypatch.setattr(
+        preflight, "probe_hf_repo",
+        lambda repo_id, dtype="dataset", token=None: preflight.PreflightResult(
+            preflight.UNKNOWN, "preflight disabled in tests"),
+    )
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     """A fresh, isolated SQLite snapshot DB for one test.

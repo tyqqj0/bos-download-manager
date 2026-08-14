@@ -22,6 +22,34 @@
     <span x-text="(dashboard?.alerts?.filter(a => a.severity === 'critical') || []).map(a => a.message).join(' | ')"></span>
 </div>
 
+<!-- Needs-approval holds. Above the nav and outside every view on purpose: a
+     held task is stopped until a human acts, and the one place people look is
+     the dashboard. `去审批` opens the repo page (source_url from the API, not
+     built here — the /datasets/ prefix rule belongs on one side only), and
+     `已审批，继续` is the unconditional release: /api/queue/resume. The half-hourly
+     recheck loop also releases these on its own; the button is for when you
+     know the gate is open and would rather not wait. -->
+<div x-show="heldTasks.length > 0" x-transition
+     class="bg-amber-600/90 text-white px-4 py-2.5 text-sm shadow-lg">
+    <div class="max-w-7xl mx-auto space-y-1.5">
+        <div class="font-semibold flex items-center gap-2">
+            <span>&#x1F512;</span>
+            <span x-text="`${heldTasks.length} 个任务在等仓库授权（已停下，不会继续烧批次）`"></span>
+        </div>
+        <template x-for="t in heldTasks" :key="t.id">
+            <div class="flex flex-wrap items-center gap-2 text-xs bg-black/20 rounded px-2 py-1.5">
+                <span class="font-medium" x-text="t.name"></span>
+                <span class="font-mono text-amber-100" x-text="t.repo_id"></span>
+                <span class="text-amber-100/90 flex-1" x-text="t.hold_detail || '需要在仓库页面点击同意'"></span>
+                <a :href="t.source_url" x-show="t.source_url" target="_blank" rel="noopener"
+                   class="px-2 py-1 bg-white/20 hover:bg-white/30 rounded font-medium">去审批 &#8599;</a>
+                <button @click="resumeTask(t.id)"
+                        class="px-2 py-1 bg-green-700 hover:bg-green-600 rounded font-medium">已审批，继续</button>
+            </div>
+        </template>
+    </div>
+</div>
+
 <!-- Top Nav -->
 <nav class="bg-gray-800 border-b border-gray-700 px-6 py-2.5 flex items-center justify-between">
     <div class="flex items-center gap-6">
@@ -143,11 +171,16 @@
                             </template>
                         </div>
                         <div class="flex items-center gap-3">
+                            <!-- Same whole-dataset ratio as the task table, for the same
+                                 reason: `dl.size_gb` here is the shard/batch aggregate,
+                                 i.e. this round's work only. resume_skipped_gb restores
+                                 what the BOS filter already dropped. -->
                             <div class="flex-1 bg-gray-700 rounded-full h-2">
-                                <div class="gradient-bar h-2 rounded-full progress-bar" :style="`width: ${Math.min(100, dl.progress_pct || 0)}%`"></div>
+                                <div class="gradient-bar h-2 rounded-full progress-bar" :style="`width: ${taskProgressPct(dl)}%`"></div>
                             </div>
-                            <span class="text-xs font-mono text-gray-400 w-28 text-right" x-text="`${formatGB(dl.downloaded_gb)} / ${formatGB(dl.size_gb)}`"></span>
-                            <span class="text-xs font-mono text-gray-300 w-10 text-right" x-text="`${Math.round(dl.progress_pct || 0)}%`"></span>
+                            <span class="text-xs font-mono text-gray-400 w-28 text-right" :title="resumeNote(dl)"
+                                  x-text="`${formatGB(taskDoneGb(dl))} / ${formatGB(taskTotalGb(dl))}`"></span>
+                            <span class="text-xs font-mono text-gray-300 w-10 text-right" x-text="`${Math.round(taskProgressPct(dl))}%`"></span>
                         </div>
                     </div>
                 </template>
@@ -263,9 +296,12 @@
                             </td>
                             <td class="px-3 py-2">
                                 <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium"
-                                      :class="statusClass(t.status)">
-                                    <span x-text="t.status === 'preempted' ? '被抢占' : t.status === 'paused' ? '已暂停' : t.status"></span>
+                                      :class="t.hold_reason === 'needs_approval' ? 'bg-amber-900/60 text-amber-300' : statusClass(t.status)">
+                                    <span x-text="t.hold_reason === 'needs_approval' ? '待授权' : t.status === 'preempted' ? '被抢占' : t.status === 'paused' ? '已暂停' : t.status"></span>
                                 </span>
+                                <div class="text-[10px] text-amber-400/80 mt-0.5 max-w-[220px]"
+                                     x-show="t.hold_reason === 'needs_approval'"
+                                     x-text="t.hold_detail" :title="t.hold_detail"></div>
                             </td>
                             <td class="px-3 py-2 text-gray-400 text-xs">
                                 <span x-text="t.server || '-'"></span>
@@ -276,11 +312,15 @@
                             </td>
                             <td class="px-3 py-2">
                                 <div class="flex items-center gap-2">
-                                    <div class="w-16 bg-gray-700 rounded-full h-1.5" x-show="t.size_gb > 0">
+                                    <!-- taskProgressPct, not downloaded/size: after a resume
+                                         `size_gb` is only what is LEFT, so the raw ratio
+                                         understates a resumed task badly (38% shown for a
+                                         66%-done dataset). See app.js taskProgressPct. -->
+                                    <div class="w-16 bg-gray-700 rounded-full h-1.5" x-show="taskTotalGb(t) > 0">
                                         <div class="bg-blue-500 h-1.5 rounded-full progress-bar"
-                                             :style="`width: ${Math.min(100, (t.downloaded_gb / t.size_gb) * 100)}%`"></div>
+                                             :style="`width: ${taskProgressPct(t)}%`"></div>
                                     </div>
-                                    <span class="text-xs text-gray-400" x-text="formatSize(t)"></span>
+                                    <span class="text-xs text-gray-400" x-text="formatSize(t)" :title="resumeNote(t)"></span>
                                 </div>
                             </td>
                             <td class="px-3 py-2">
@@ -962,9 +1002,12 @@
                 <div>
                     <label class="text-xs text-gray-400">Priority</label>
                     <select x-model="addForm.priority" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm mt-1">
-                        <option value="P0">P0 (Urgent)</option>
-                        <option value="P1" selected>P1 (Normal)</option>
-                        <option value="P2">P2 (Low)</option>
+                        <!-- P0/P1 map to int 0/2, which is inside the pool
+                             weight-boost band (priority <= 2 gets 1.5x the
+                             batch window). P2 is the honest default. -->
+                        <option value="P0">P0 (Urgent · 加权抢占)</option>
+                        <option value="P1">P1 (High · 加权抢占)</option>
+                        <option value="P2">P2 (Normal)</option>
                         <option value="P3">P3 (Background)</option>
                     </select>
                 </div>

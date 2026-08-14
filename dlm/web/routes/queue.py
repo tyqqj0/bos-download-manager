@@ -90,12 +90,32 @@ async def add_to_queue(body: dict):
                           f"expected one of {sorted(VALID_DISPATCH_MODES)}"}
 
     parsed = parse_repo(repo_id)
+    # Same two gates as POST /api/tasks, in the same order and for the same
+    # reasons (see that route's docstring). Both add paths must agree: an
+    # operator who reaches for curl instead of the modal should not be the one
+    # who gets a gated repo chunked into 696 doomed batches.
+    if parsed.get("error"):
+        return {"error": parsed["error"]}
     source = body.get("source", parsed.get("source", "hf"))
+    if source not in ("hf", "modelscope"):
+        return {"error": f"Unknown source: {source} (expected hf or modelscope)"}
     name = body.get("name", parsed.get("name", repo_id.split("/")[-1]))
     task_type = body.get("type", parsed.get("type", "dataset"))
     category = body.get("category", "")
     priority = max(0, min(9, int(body.get("priority", 5))))
     shard_count = int(body.get("shard_count", body.get("split_workers", 0)) or 0)
+
+    from .. import preflight as pf_mod
+
+    pf = await pf_mod.check_repo_access(
+        parsed.get("repo_id", repo_id), source, task_type)
+    if pf.outcome == pf_mod.NOT_FOUND:
+        hint = (
+            "；如果它在 ModelScope 上，请显式指定 source=modelscope"
+            if parsed.get("source_guessed") and not body.get("source") else ""
+        )
+        return {"error": f"{pf.detail}{hint}"}
+    needs_approval = pf.outcome == pf_mod.NEEDS_APPROVAL
 
     task_id = _next_task_id()
 
@@ -118,7 +138,10 @@ async def add_to_queue(body: dict):
         "type": task_type,
         "category": category,
         "bos_path": bos_path,
-        "status": "pending",
+        # A needs-approval repo is stored but never dispatched — see the
+        # /api/tasks docstring. auto_dispatch_pending() claims `pending` only,
+        # so `paused` is the whole mechanism.
+        "status": "paused" if needs_approval else "pending",
         "priority": priority,
         "size_gb": 0,
         "downloaded_gb": 0,
@@ -145,8 +168,18 @@ async def add_to_queue(body: dict):
     def do_save():
         snapshot.init_db()
         snapshot.upsert_task(task_meta)
+        if needs_approval:
+            stamp = time.strftime("%m-%d %H:%M UTC", time.gmtime())
+            snapshot.set_hold(
+                task_id, "needs_approval", f"{stamp} 添加时预检：{pf.detail}")
     await _run_blocking(do_save)
 
+    if needs_approval:
+        return {
+            "ok": True, "task_id": task_id, "name": name, "priority": priority,
+            "status": "paused", "hold_reason": "needs_approval",
+            "hold_detail": pf.detail,
+        }
     # Task saved as "pending" — auto_dispatch will assign to an idle worker
     return {"ok": True, "task_id": task_id, "name": name, "priority": priority}
 
@@ -204,6 +237,15 @@ async def resume_task(body: dict):
     error out. For a sharded task this is a no-op in effect (create_shards
     already deletes-then-recreates unconditionally on its own), so doing it
     here uniformly is safe.
+
+    This is also the "已审批，继续" button behind a needs-approval hold, and it
+    releases the hold UNCONDITIONALLY — it does not re-run the preflight first.
+    That is deliberate: a probe can come back UNKNOWN on an HF hiccup or a
+    token problem, and a button whose effect depends on a flaky measurement is
+    a button that sometimes does nothing with no explanation. The safety net is
+    on the other side instead — if the release was premature, the first batch
+    to be refused reports `access_denied` to /api/missing-files, which puts the
+    task straight back on hold with an updated reason (see dlm/web/hold.py).
     """
     task_id = body.get("task_id", "")
     if not task_id:
@@ -219,14 +261,14 @@ async def resume_task(body: dict):
     if task["status"] not in ("paused", "failed", "preempted"):
         return {"error": f"Cannot resume task in status={task['status']}"}
 
-    def do_update():
-        snapshot.update_task_progress(task_id, status="pending", phase="resuming",
-                                      speed_mbps=0, clear_error=True)
-        snapshot.delete_shards_by_task(task_id)
-    await _run_blocking(do_update)
+    released_hold = task.get("hold_reason")
+
+    from ..hold import release_to_pending
+    await _run_blocking(lambda: release_to_pending(task_id))
 
     # auto_dispatch will pick this up and assign to an idle worker
-    return {"ok": True, "task_id": task_id, "status": "pending"}
+    return {"ok": True, "task_id": task_id, "status": "pending",
+            "released_hold": released_hold}
 
 
 @router.post("/queue/retry")
@@ -498,6 +540,14 @@ async def preempt_for_task(body: dict):
     #    exempt this source from the listing guard.
     def do_claim():
         now_ts = time.time()
+        # Stash the pre-boost priority FIRST (the column is NOT NULL DEFAULT 5,
+        # so orig_priority is always an int). Without this, `priority = 0`
+        # below is permanent: fleet.pool_task_weight keeps granting the row a
+        # 1.5x window share for the rest of its life, and the victim sort
+        # (`-priority`) can never auto-pick it again. Released on the
+        # beneficiary's first truly terminal status — snapshot folds
+        # restore_priority into update_task_progress/complete_task.
+        snapshot.save_priority_before_preempt(urgent_id, int(orig_priority))
         conn = snapshot._conn()
         conn.execute(
             "UPDATE tasks SET status = 'downloading', server = NULL, priority = 0, "
@@ -522,9 +572,14 @@ async def preempt_for_task(body: dict):
                 # *currently* stored rather than the pre-claim value this
                 # capture holds — neither can restore it, so this writes the
                 # UPDATE directly, the same way do_claim above does.
+                # priority_before_preempt is cleared as well: do_claim stashed
+                # it a moment ago, and a stash left behind a reverted boost
+                # would make the NEXT preempt of this task "restore" it to a
+                # priority it never actually had.
                 conn.execute(
                     "UPDATE tasks SET status = ?, priority = ?, claimed_at = ?, "
-                    "coordinator_phase = ?, updated_at = ? WHERE id = ?",
+                    "coordinator_phase = ?, priority_before_preempt = NULL, "
+                    "updated_at = ? WHERE id = ?",
                     (orig_status, orig_priority, orig_claimed_at, orig_phase,
                      time.time(), urgent_id),
                 )

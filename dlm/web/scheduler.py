@@ -34,6 +34,12 @@ RECONCILE_INTERVAL = 300  # 5 minutes
 DISPATCH_INTERVAL = 30  # pending-task dispatch cadence (one sharded task per source per cycle)
 STAGING_GC_INTERVAL = 3600  # decision G — local-disk-only, terminal-tasks-only sweep
 
+# Re-probe needs-approval holds. Half-hourly because the thing being waited on
+# is a human clicking Agree on a repo page: minutes of extra hold cost nothing,
+# and a tighter loop would hammer HuggingFace with authed requests for a task
+# nobody has touched. `hold.RECHECK_LIMIT` bounds the work per pass.
+HOLD_RECHECK_INTERVAL = 1800
+
 # Every stage below must finish or give up. A `try/except` catches a failure
 # but not a hang: one await that never returns stops this `while True` for
 # good, and the process keeps serving HTTP the whole time while nothing is
@@ -49,6 +55,11 @@ STAGE_TIMEOUT = 60
 # dataset and never post an import at all. Still bounded — an unbounded await
 # here is the wedged control plane again.
 TRANSFER_STAGE_TIMEOUT = 600
+
+# The hold recheck is the second exception, for the same reason on a smaller
+# scale: it makes up to hold.RECHECK_LIMIT authed HTTP probes in sequence, each
+# with its own 10s budget, so the honest worst case is just over STAGE_TIMEOUT.
+HOLD_RECHECK_TIMEOUT = 120
 
 
 async def _blocking_stage(loop, fn, name: str, timeout=None, executor=None):
@@ -259,6 +270,10 @@ async def background_scheduler():
     last_reconcile = 0
     last_dispatch = 0
     last_health_verify = 0
+    # Seeded to 0 so the first pass runs right after startup: a web restart is
+    # exactly when a hold may have been sitting unchecked, and the sweep is
+    # cheap when nothing is held (one indexed SELECT that returns no rows).
+    last_hold_recheck = 0
     # Seeded to "now", unlike the stages above, so the first sweep is deferred
     # by a full STAGING_GC_INTERVAL. At 0 the GC fired on the very first pass,
     # ~2s after `systemctl restart dlm-web` — i.e. a restart could delete
@@ -293,6 +308,23 @@ async def background_scheduler():
             # Auto-dispatch pending tasks to idle workers (own 30s cadence —
             # decoupled from the 5-min reconcile so new tasks start promptly)
             if now - last_dispatch > DISPATCH_INTERVAL:
+                # Return preempted victims first, in the same cycle: a
+                # beneficiary that finished between cycles frees its machines
+                # now, and the victim it displaced is the task with the best
+                # claim on them (its staging is still there). Flipping it to
+                # `pending` above the dispatch below means it can be placed
+                # without waiting out another interval.
+                try:
+                    from .reconciler import return_preempted_tasks
+                    preempt_report = await asyncio.wait_for(
+                        return_preempted_tasks(), timeout=STAGE_TIMEOUT)
+                    cache.set("preempt_return_report", preempt_report)
+                    if preempt_report.get("returned"):
+                        logger.info(f"Preempt return: "
+                                    f"{preempt_report['returned']}")
+                except Exception as e:
+                    logger.error(f"Preempt return error: {e}")
+
                 try:
                     from .reconciler import auto_dispatch_pending
                     dispatch_report = await asyncio.wait_for(
@@ -377,6 +409,23 @@ async def background_scheduler():
                     if gc_report.get("errors"):
                         logger.error(f"Staging GC errors: {gc_report['errors']}")
                 last_staging_gc = now
+
+            # Re-probe needs-approval holds and release the ones whose gate has
+            # opened. A coroutine, not a blocking stage: the probe itself moves
+            # to a thread inside preflight.check_repo_access, and the DB writes
+            # go through run_blocking — nothing here belongs on the loop.
+            if now - last_hold_recheck > HOLD_RECHECK_INTERVAL:
+                try:
+                    from .hold import recheck_holds
+                    hold_report = await asyncio.wait_for(
+                        recheck_holds(), timeout=HOLD_RECHECK_TIMEOUT)
+                    cache.set("hold_recheck_report", hold_report)
+                    if hold_report.get("released"):
+                        logger.info(f"Hold recheck released: "
+                                    f"{hold_report['released']}")
+                except Exception as e:
+                    logger.error(f"Hold recheck error: {e}")
+                last_hold_recheck = now
 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")

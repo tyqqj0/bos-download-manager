@@ -380,3 +380,263 @@ def test_target_server_does_not_leak_into_explicit_victim_path(db, monkeypatch):
         "target_server": "totally-unrelated-server",
     }))
     assert out.get("ok") is True, out
+
+
+# ── R11: the boost is a loan, not a gift ────────────────────────────────
+#
+# /queue/preempt writes `priority = 0` on the beneficiary so it wins the
+# window share it was preempting FOR. Nothing used to undo that: the row
+# kept fleet.pool_task_weight's 1.5x share for the rest of its life, and the
+# victim sort (`-priority`) could never auto-pick it again — one operator
+# preempt permanently reshaped the fleet's scheduling. The stash column
+# `priority_before_preempt` is both the undo record and (for R10 below) the
+# marker that says the urgency is still live.
+
+
+def _boost_and_terminate(db, monkeypatch, terminal_status, *, via):
+    """Preempt t-urgent, then take it to `terminal_status` through `via`
+    ('progress' = update_task_progress, 'complete' = complete_task)."""
+    from dlm.web.routes.queue import preempt_for_task
+
+    _stub_cancel(monkeypatch, [])
+    _stub_start(monkeypatch, [])
+    _task(db, "t-urgent", status="pending", mode="pool", priority=6)
+    _task(db, "t-victim", status="downloading", mode="sharded", priority=9)
+    _shard(db, "s-v0", "t-victim", 0, status="running", server="w2")
+
+    out = _call(preempt_for_task({"urgent_task_id": "t-urgent"}))
+    assert out.get("ok") is True, out
+    assert db.get_task("t-urgent")["priority"] == 0
+    assert db.get_task("t-urgent")["priority_before_preempt"] == 6
+
+    if via == "progress":
+        db.update_task_progress("t-urgent", status=terminal_status)
+    else:
+        db.complete_task("t-urgent", status=terminal_status)
+    return db.get_task("t-urgent")
+
+
+@pytest.mark.parametrize("via", ["progress", "complete"])
+@pytest.mark.parametrize("terminal", ["done", "failed", "revoked", "skipped"])
+def test_boost_is_released_on_every_terminal_status(db, monkeypatch, terminal, via):
+    """Both chokepoints, all four statuses. A release wired into only one of
+    them would look correct in whichever test happened to be written."""
+    row = _boost_and_terminate(db, monkeypatch, terminal, via=via)
+
+    assert row["status"] == terminal
+    assert row["priority"] == 6, "the pre-boost priority must come back"
+    assert row["priority_before_preempt"] is None
+
+
+@pytest.mark.parametrize("resumable", ["paused", "preempted"])
+def test_boost_survives_a_resumable_stop(db, monkeypatch, resumable):
+    """`paused`/`preempted` are deliberately absent from the release set even
+    though fleet calls them terminal: they are resumable, and a task that will
+    be resumed is still the urgent one. Dropping its boost mid-flight would
+    make the preempt an operator paid a victim for evaporate."""
+    row = _boost_and_terminate(db, monkeypatch, resumable, via="progress")
+
+    assert row["priority"] == 0
+    assert row["priority_before_preempt"] == 6
+
+
+def test_a_second_preempt_does_not_overwrite_the_stash_with_zero(db, monkeypatch):
+    """The near-miss this pins: stashing unconditionally on every preempt
+    would save the ALREADY-BOOSTED 0 the second time round, and "restoring" to
+    0 makes the boost permanent by a different route."""
+    from dlm.web.routes.queue import preempt_for_task
+
+    _stub_cancel(monkeypatch, [])
+    _stub_start(monkeypatch, [])
+    _task(db, "t-urgent", status="pending", mode="pool", priority=7)
+    _task(db, "t-v1", status="downloading", mode="sharded", priority=9)
+    _shard(db, "s-1", "t-v1", 0, status="running", server="w2")
+    _task(db, "t-v2", status="downloading", mode="sharded", priority=8)
+    _shard(db, "s-2", "t-v2", 0, status="running", server="w3")
+
+    assert _call(preempt_for_task({"urgent_task_id": "t-urgent"})).get("ok")
+    # Second preempt for the same beneficiary, now sitting at priority 0.
+    _call(preempt_for_task({"urgent_task_id": "t-urgent",
+                            "victim_task_id": "t-v2"}))
+
+    assert db.get_task("t-urgent")["priority_before_preempt"] == 7
+    db.complete_task("t-urgent", status="done")
+    assert db.get_task("t-urgent")["priority"] == 7
+
+
+def test_failed_start_clears_the_stash_it_just_wrote(db, monkeypatch):
+    """A stash left behind by a reverted boost would make the NEXT preempt of
+    this task "restore" it to a priority it never actually had."""
+    from dlm.web.routes.queue import preempt_for_task
+
+    _stub_cancel(monkeypatch, [])
+    _stub_start(monkeypatch, [], raises=RuntimeError("workflow start failed"))
+    _task(db, "t-urgent", status="paused", mode="pool", priority=5)
+    _task(db, "t-victim", status="downloading", mode="sharded", priority=6)
+    _shard(db, "s-v0", "t-victim", 0, status="running", server="w6")
+
+    out = _call(preempt_for_task({"urgent_task_id": "t-urgent",
+                                  "victim_task_id": "t-victim"}))
+    assert "error" in out
+
+    row = db.get_task("t-urgent")
+    assert row["priority"] == 5
+    assert row["priority_before_preempt"] is None
+
+
+def test_restore_priority_is_a_no_op_without_a_stash(db):
+    """Every terminal write in the system calls through this, so the ordinary
+    case — a task that was never a beneficiary — must not touch priority."""
+    _task(db, "t-plain", status="downloading", priority=5)
+    assert db.restore_priority("t-plain") is None
+    assert db.get_task("t-plain")["priority"] == 5
+
+
+# ── R10: the victim comes back on its own ───────────────────────────────
+
+
+def _preempted(db, task_id, *, source="hf", updated_at=None):
+    _task(db, task_id, status="preempted", mode="pool", source=source)
+    if updated_at is not None:
+        conn = db._conn()
+        conn.execute("UPDATE tasks SET updated_at=? WHERE id=?",
+                     (updated_at, task_id))
+        conn.commit()
+
+
+def _beneficiary(db, task_id, *, status="downloading", source="hf", stash=5):
+    _task(db, task_id, status=status, mode="pool", source=source, priority=0)
+    conn = db._conn()
+    conn.execute("UPDATE tasks SET priority_before_preempt=? WHERE id=?",
+                 (stash, task_id))
+    conn.commit()
+
+
+def test_victim_is_held_while_its_beneficiary_is_still_running(db):
+    from dlm.web.reconciler import return_preempted_tasks
+
+    _beneficiary(db, "t-urgent", status="downloading")
+    _preempted(db, "t-victim")
+
+    report = _call(return_preempted_tasks())
+
+    assert report["returned"] == []
+    assert report["still_held"] == ["t-victim"]
+    assert db.get_task("t-victim")["status"] == "preempted"
+
+
+def test_victim_returns_once_the_stash_is_cleared(db):
+    """The gate is the ratchet column, so "is the urgency over" and "has the
+    boost been undone" are the same question — and the second is answered by
+    the terminal write itself, in its own transaction."""
+    from dlm.web.reconciler import return_preempted_tasks
+
+    _beneficiary(db, "t-urgent", status="downloading")
+    _preempted(db, "t-victim")
+    db.complete_task("t-urgent", status="done")
+
+    report = _call(return_preempted_tasks())
+
+    assert report["returned"] == ["t-victim"]
+    row = db.get_task("t-victim")
+    assert row["status"] == "pending", "pending, so every admission gate applies"
+    assert row["phase"] == "resuming"
+
+
+def test_a_beneficiary_still_queued_also_counts_as_live(db):
+    """`pending` is in the gate as well as `downloading`: a beneficiary the
+    dispatcher has not placed yet has not stopped needing the capacity, and
+    returning the victim first would let it take the machines back."""
+    from dlm.web.reconciler import return_preempted_tasks
+
+    _beneficiary(db, "t-urgent", status="pending")
+    _preempted(db, "t-victim")
+
+    assert _call(return_preempted_tasks())["returned"] == []
+
+
+def test_an_hf_beneficiary_does_not_hold_a_modelscope_victim(db):
+    """The two never compete for the same machines — HF tasks dispatch to the
+    HK fleet, ModelScope to Beijing. A global gate would park BJ work behind
+    HK work indefinitely."""
+    from dlm.web.reconciler import return_preempted_tasks
+
+    _beneficiary(db, "t-urgent", status="downloading", source="hf")
+    _preempted(db, "t-ms-victim", source="modelscope")
+    _preempted(db, "t-hf-victim", source="hf")
+
+    report = _call(return_preempted_tasks())
+
+    assert report["returned"] == ["t-ms-victim"]
+    assert report["still_held"] == ["t-hf-victim"]
+
+
+def test_source_aliases_share_one_queue_and_one_gate(db):
+    """/api/queue/add does not validate `source`, so a task really can be
+    stored as `huggingface` and really does share pool-hf with the `hf` tasks.
+    Bucketing by the raw string would ask about a subset."""
+    from dlm.web.reconciler import return_preempted_tasks
+
+    _beneficiary(db, "t-urgent", status="downloading", source="huggingface")
+    _preempted(db, "t-victim", source="hf")
+
+    assert _call(return_preempted_tasks())["still_held"] == ["t-victim"]
+
+
+def test_max_hold_returns_a_victim_whose_beneficiary_wedged(db, monkeypatch):
+    """A beneficiary whose row never leaves `downloading` (dead coordinator,
+    pool tasks do not self-heal) would hold its victim for ever. Returning
+    early is cheap: auto_dispatch_pending only ever places work on genuinely
+    idle workers, so if the beneficiary is really still running there is
+    nothing free for the victim to take."""
+    import time as _time
+
+    from dlm.web import reconciler
+
+    _beneficiary(db, "t-wedged", status="downloading")
+    _preempted(db, "t-victim", updated_at=_time.time() - 2 * 86400)
+
+    assert _call(reconciler.return_preempted_tasks())["returned"] == ["t-victim"]
+
+    # …and the backstop is a backstop, not the mechanism: inside the window
+    # the same row stays put.
+    _preempted(db, "t-fresh", updated_at=_time.time() - 60)
+    assert _call(reconciler.return_preempted_tasks())["still_held"] == ["t-fresh"]
+
+
+def test_return_drops_stale_batch_rows(db):
+    """chunk_filelist recomputes batch boundaries on the next dispatch and
+    create_pool_batches_in_db refuses a request whose row set disagrees with
+    what is on file — stale rows would make the very next dispatch error out."""
+    from dlm.web.reconciler import return_preempted_tasks
+
+    _preempted(db, "t-victim")
+    _shard(db, "b-0", "t-victim", 0, status="running", server="w1")
+    _shard(db, "b-1", "t-victim", 1, status="pending")
+
+    assert _call(return_preempted_tasks())["returned"] == ["t-victim"]
+    assert db.get_shards_by_task("t-victim") == []
+
+
+def test_paused_tasks_are_never_returned(db):
+    """`paused` is operator intent — including a needs-approval hold. Handing
+    one back to the fleet would restart the batch-burning this platform spent
+    a release learning to stop."""
+    from dlm.web.reconciler import return_preempted_tasks
+
+    _task(db, "t-paused", status="paused", mode="pool")
+    db.set_hold("t-paused", "needs_approval", "waiting on a human")
+
+    report = _call(return_preempted_tasks())
+
+    assert report == {"returned": [], "still_held": []}
+    row = db.get_task("t-paused")
+    assert row["status"] == "paused"
+    assert row["hold_reason"] == "needs_approval"
+
+
+def test_nothing_preempted_is_a_cheap_no_op(db):
+    from dlm.web.reconciler import return_preempted_tasks
+
+    _task(db, "t-running", status="downloading", mode="pool")
+    assert _call(return_preempted_tasks()) == {"returned": [], "still_held": []}

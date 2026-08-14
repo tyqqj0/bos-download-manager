@@ -1,9 +1,11 @@
 """Servers API — Celery worker status."""
 
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException
 
+from ...temporal.models import FAIL_ACCESS_DENIED
 from ..fleet import TERMINAL_STATUSES
 from . import run_blocking
 
@@ -255,6 +257,14 @@ async def report_missing_files(body: dict):
     consistency choice rather than an oversight — a lone authenticated
     endpoint here would break the uniform worker contract without closing
     the surface.
+
+    This is also where a gate that closed (or an add-time hold released too
+    early) is caught: a report containing `access_denied` means a batch was
+    refused by HuggingFace with our token attached, so the task goes straight
+    back on hold. It has to be here rather than on /api/task-progress because
+    this is the only worker→S1 write that carries a failure *reason* — and
+    `run_pool_batch` posts it unconditionally, before the tolerance decision,
+    so the very first refused batch triggers it instead of the 20th.
     """
     def _do():
         from ...queue.snapshot import init_db, get_task, record_missing_files
@@ -287,7 +297,28 @@ async def report_missing_files(body: dict):
         total = record_missing_files(task_id, rows)
         return {"ok": True, "recorded": len(rows), "task_missing_total": total}
 
-    return await run_blocking(_do)
+    result = await run_blocking(_do)
+
+    # The archive is recorded either way — the hold is on top of it, never
+    # instead of it, so a failure to hold still leaves the evidence. Skipped
+    # when _do refused the report ("error") or dropped it as a zombie
+    # ("ignored"): holding a task on the strength of a report we just declined
+    # to record would be a hold with nothing behind it.
+    if "error" in result or "ignored" in result:
+        return result
+
+    denied = sum(1 for f in (body.get("files") or [])
+                 if isinstance(f, dict) and f.get("reason") == FAIL_ACCESS_DENIED)
+    if denied:
+        from ..hold import hold_for_approval
+        stamp = time.strftime("%m-%d %H:%M UTC", time.gmtime())
+        result["held_for_approval"] = await hold_for_approval(
+            body.get("task_id"),
+            f"{stamp} 下载中被拒：批次 {body.get('batch_index')} 有 {denied} "
+            f"个文件返回 403（已认证但未获授权）。请在仓库页面点击同意后再继续",
+        )
+
+    return result
 
 
 @router.post("/events")

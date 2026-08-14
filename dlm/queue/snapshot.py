@@ -234,6 +234,35 @@ def init_db():
         # 0/0 = never measured (every row armed before the dispatcher existed).
         ("transfer_bos_bytes", "INTEGER", "0"),
         ("transfer_bos_objects", "INTEGER", "0"),
+        # ── hold bookkeeping (why a paused task is paused) ───────────────────
+        # `status='paused'` alone cannot distinguish "an operator pressed pause"
+        # from "the add-time preflight found this repo needs HF approval", and
+        # the two want opposite treatment: the first must stay put until a human
+        # says otherwise, the second should re-probe and release itself. Without
+        # a machine-readable reason the recheck loop would have to re-probe every
+        # paused task, which turns an operator's deliberate pause into something
+        # the scheduler undoes behind their back.
+        #
+        # `hold_reason` is the discriminator ('needs_approval' today, NULL for
+        # every ordinary pause). `hold_detail` is the human sentence shown on the
+        # row, including the FIRST time we saw the denial — deliberately not
+        # overwritten by later probes, so "blocked since 08-14 06:12" stays
+        # readable. `hold_checked_at` is the recheck loop's own bookkeeping and
+        # the only field a failed re-probe touches.
+        ("hold_reason", "TEXT", "NULL"),
+        ("hold_detail", "TEXT", "NULL"),
+        ("hold_checked_at", "REAL", "0"),
+        # The priority a preempt beneficiary had BEFORE /queue/preempt rewrote it
+        # to 0. The claim sets priority=0 so the urgent task outranks everything;
+        # what it never did was put the value back once that task finished, which
+        # made the boost permanent (measured: two ratchets in the live DB). The
+        # consequences are both silent — a priority-0 row can never be
+        # auto-picked as a victim again (the victim sort is `-priority`), and
+        # fleet.pool_task_weight grants priority<=2 a 1.5x window share forever.
+        # NULL means "never preempt-boosted", which is what restore_priority
+        # keys off; it is cleared back to NULL on restore so a second boost
+        # cannot inherit the first one's saved value.
+        ("priority_before_preempt", "INTEGER", "NULL"),
     ]:
         try:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {coltype} DEFAULT {default}")
@@ -295,6 +324,127 @@ def set_dispatch_prefix(task_id: str, prefix: str):
         (prefix, time.time(), task_id),
     )
     conn.commit()
+
+
+def set_hold(task_id: str, reason: str, detail: str):
+    """Record WHY a task is held. Deliberately does not touch `status`.
+
+    Status stays the caller's job because the two callers need different
+    guards: the add path INSERTs a brand-new row already `paused`, while the
+    mid-run denial catcher has to move a `downloading` row back to `paused`
+    only if it hasn't since been revoked. Writing status here as well would
+    make this a second, competing status writer over the same rows.
+
+    `detail` always overwrites: every caller that reaches here has news
+    ("blocked at add time", "released then denied again"). A re-probe that
+    merely re-confirms the same denial must call touch_hold_check() instead,
+    so the first-seen timestamp in the sentence stays put.
+    """
+    conn = _conn()
+    now = time.time()
+    conn.execute(
+        "UPDATE tasks SET hold_reason = ?, hold_detail = ?, hold_checked_at = ?, "
+        "updated_at = ? WHERE id = ?",
+        (reason, detail, now, now, task_id),
+    )
+    conn.commit()
+
+
+def clear_hold(task_id: str):
+    """Drop the hold marker. Called when the block is genuinely gone —
+    a successful re-probe, or an operator pressing "already approved".
+    Leaves status alone for the same reason set_hold does."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE tasks SET hold_reason = NULL, hold_detail = NULL, "
+        "hold_checked_at = 0, updated_at = ? WHERE id = ?",
+        (time.time(), task_id),
+    )
+    conn.commit()
+
+
+def touch_hold_check(task_id: str):
+    """Stamp "we re-probed and it is still blocked" — the ONLY field a failed
+    re-probe writes. Notably not `updated_at`: a 30-minute loop bumping that on
+    every held task would make each one look freshly active to anything sorting
+    or alerting on staleness."""
+    conn = _conn()
+    conn.execute(
+        "UPDATE tasks SET hold_checked_at = ? WHERE id = ?",
+        (time.time(), task_id),
+    )
+    conn.commit()
+
+
+def get_held_tasks(reason: str, limit: int = 50) -> list:
+    """Paused tasks held for `reason`, oldest-checked first.
+
+    Ordering by hold_checked_at makes the recheck loop's per-cycle cap fair:
+    with 40 held tasks and a cap of 20, the 20 that waited longest go first and
+    the other 20 lead the next cycle, instead of the tail never being probed.
+    """
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE status = 'paused' AND hold_reason = ? "
+        "ORDER BY COALESCE(hold_checked_at, 0) ASC LIMIT ?",
+        (reason, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_priority_before_preempt(task_id: str, priority: int):
+    """Stash a preempt beneficiary's pre-boost priority.
+
+    Guarded with `IS NULL` so a task boosted twice keeps the ORIGINAL value
+    rather than saving the 0 the first boost wrote — otherwise the second
+    restore would "restore" it to 0 and the ratchet survives the fix.
+    """
+    conn = _conn()
+    conn.execute(
+        "UPDATE tasks SET priority_before_preempt = ? "
+        "WHERE id = ? AND priority_before_preempt IS NULL",
+        (priority, task_id),
+    )
+    conn.commit()
+
+
+def restore_priority(task_id: str, conn=None) -> Optional[int]:
+    """Undo a preempt boost. Returns the restored priority, or None if this
+    task was never boosted (the overwhelmingly common case — every terminal
+    transition calls this, and almost no task has ever been preempted).
+
+    Clears the saved value so a later boost starts from a clean slate.
+
+    `conn` folds the restore into the CALLER's open transaction and skips the
+    commit — that is how update_task_progress and complete_task undo the boost
+    in the same commit that writes the terminal status. Committing separately
+    would leave a window where a crash strands a finished task at priority 0
+    for ever, which is the exact ratchet this function exists to remove.
+    """
+    own_conn = conn is None
+    conn = conn or _conn()
+    row = conn.execute(
+        "SELECT priority_before_preempt FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or row["priority_before_preempt"] is None:
+        return None
+    original = int(row["priority_before_preempt"])
+    conn.execute(
+        "UPDATE tasks SET priority = ?, priority_before_preempt = NULL, "
+        "updated_at = ? WHERE id = ?",
+        (original, time.time(), task_id),
+    )
+    if own_conn:
+        conn.commit()
+    return original
+
+
+# The statuses that end a run for good, and so end the urgency a preempt boost
+# was granted for. `paused` and `preempted` are deliberately ABSENT even though
+# fleet calls them terminal: they are resumable, and a task that will be
+# resumed is still the urgent one — dropping its boost mid-flight would make
+# the preempt an operator paid a victim for evaporate.
+PRIORITY_BOOST_RELEASE_STATUSES = ("done", "failed", "revoked", "skipped")
 
 
 def upsert_task(task: dict):
@@ -401,6 +551,8 @@ def update_task_progress(task_id: str, progress_pct: float = None,
 
     vals.append(task_id)
     conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
+    if status in PRIORITY_BOOST_RELEASE_STATUSES:
+        restore_priority(task_id, conn=conn)
     conn.commit()
 
 
@@ -433,6 +585,8 @@ def complete_task(task_id: str, status: str = "done", phase: Optional[str] = Non
         f"speed_mbps = 0, phase = ?{error_sql} WHERE id = ?",
         (status, completed_at, now, phase, task_id),
     )
+    if status in PRIORITY_BOOST_RELEASE_STATUSES:
+        restore_priority(task_id, conn=conn)
     conn.commit()
 
 
@@ -551,16 +705,21 @@ def get_dashboard_summary() -> dict:
     cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
     has_upload_speed = "upload_speed_mbps" in cols
 
+    # resume_skipped_gb rides along in both branches: the UI adds it to both
+    # terms of the progress ratio, because after a resume `size_gb` is only the
+    # work that was LEFT and the bar would otherwise understate the dataset by
+    # however much was already on BOS (assembly101: 38.1% shown, 66.2% true).
     if has_upload_speed:
         active = conn.execute(
             "SELECT id, name, server, progress_pct, downloaded_gb, size_gb, "
-            "speed_mbps, upload_speed_mbps, phase FROM tasks WHERE status = 'downloading' "
+            "resume_skipped_gb, speed_mbps, upload_speed_mbps, phase "
+            "FROM tasks WHERE status = 'downloading' "
             "ORDER BY updated_at DESC"
         ).fetchall()
     else:
         active = conn.execute(
             "SELECT id, name, server, progress_pct, downloaded_gb, size_gb, "
-            "speed_mbps, phase FROM tasks WHERE status = 'downloading' "
+            "resume_skipped_gb, speed_mbps, phase FROM tasks WHERE status = 'downloading' "
             "ORDER BY updated_at DESC"
         ).fetchall()
 

@@ -595,6 +595,86 @@ def reclaim_orphaned_shards(running_ids, now: float | None = None) -> list[dict]
     return reclaimed
 
 
+# How long a preempt may keep its victim down when the beneficiary never
+# reaches a terminal status. The gate below is normally exact — a live
+# beneficiary is marked by its own `priority_before_preempt`, cleared by
+# snapshot.restore_priority on the first terminal write — so this backstop only
+# fires when a beneficiary is wedged (a coordinator that dies without reporting
+# leaves its row `downloading` indefinitely). Returning the victim then costs
+# nothing: it goes back to `pending`, and auto_dispatch_pending only ever places
+# work on workers that are genuinely idle.
+PREEMPT_MAX_HOLD_S = 86400  # 24h
+
+
+async def return_preempted_tasks() -> dict:
+    """Return `preempted` victims to `pending` once their beneficiary is done.
+
+    A preempt is involuntary and was always meant to be temporary, but nothing
+    undid it: every victim sat `preempted` until a human noticed and resumed it
+    by hand, so the fleet quietly lost a worker's worth of work per preempt.
+    (`paused` is the opposite — operator intent — and is never touched here.)
+
+    "The beneficiary still needs the capacity" is read straight off the ratchet
+    column: /queue/preempt stashes the beneficiary's pre-boost priority in
+    `priority_before_preempt`, and snapshot.restore_priority clears it on the
+    first terminal status. A non-NULL stash on a live row therefore IS an
+    in-flight preempt, and it disappears exactly when the urgency ends — no
+    second bookkeeping table, nothing to leak.
+
+    Scoped per pool queue source: an HF beneficiary must not hold a ModelScope
+    victim down, since the two never compete for the same machines.
+
+    The flip is to `pending`, not `downloading` — the victim re-enters through
+    auto_dispatch_pending and faces every admission gate (idle worker, disk
+    floor, listing guard, pool concurrency cap) like any other queued task. Its
+    staging survives (fleet.GC_REMOVABLE_STATUSES excludes both states), so it
+    resumes rather than re-downloads.
+    """
+    from ..queue.snapshot import _conn, get_tasks_by_status, init_db
+    from .fleet import pool_queue_source
+    from .hold import release_to_pending
+
+    init_db()
+    report: dict = {"returned": [], "still_held": []}
+
+    try:
+        victims = get_tasks_by_status("preempted")
+        if not victims:
+            return report
+
+        conn = _conn()
+        rows = conn.execute(
+            "SELECT source FROM tasks WHERE priority_before_preempt IS NOT NULL "
+            "AND status IN ('downloading', 'pending')"
+        ).fetchall()
+        busy_sources = {pool_queue_source(r["source"] or "hf") for r in rows}
+
+        now = time.time()
+        for victim in victims:
+            source = pool_queue_source(victim.get("source") or "hf")
+            # `updated_at` is the preempt timestamp: nothing writes a
+            # `preempted` row afterwards (progress reports refuse terminal
+            # statuses, zero_stale_speeds only touches `downloading`).
+            held_for = now - (victim.get("updated_at") or 0)
+            if source in busy_sources and held_for < PREEMPT_MAX_HOLD_S:
+                report["still_held"].append(victim.get("name") or victim["id"])
+                continue
+
+            if not release_to_pending(victim["id"], expect_status="preempted"):
+                continue  # someone resumed or re-dispatched it this cycle
+            report["returned"].append(victim.get("name") or victim["id"])
+            logger.info(
+                f"Reconciler: returned preempted task {victim.get('name')} to "
+                f"pending after {held_for / 60:.0f}min "
+                f"({'beneficiary finished' if source not in busy_sources else 'max hold reached'})"
+            )
+    except Exception as e:
+        report["errors"] = [f"Preempt return error: {e}"]
+        logger.error(f"Preempt return error: {e}")
+
+    return report
+
+
 async def auto_dispatch_pending() -> dict:
     """Auto-dispatch pending tasks to idle workers.
 

@@ -20,7 +20,7 @@ function app() {
         // — never hardcode a literal mode here, that just moves the bug that
         // let the UI defeat a DLM_DEFAULT_DISPATCH_MODE flip (see submitAdd
         // and defaultDispatchMode below).
-        addForm: { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: '', shard_count: 0, no_dispatch: false, parsed: null, error: '' },
+        addForm: { url: '', category: 'other', priority: 'P2', type: 'dataset', dispatch_mode: '', shard_count: 0, no_dispatch: false, parsed: null, error: '' },
         // Populated from /api/dashboard's default_dispatch_mode (fetchDashboard)
         // so the add-form select can show the live server default instead of
         // a client-side guess.
@@ -85,6 +85,14 @@ function app() {
             // this whole view read from `{}` unnoticed.
             return Object.entries(this.dashboard.servers || {})
                 .map(([key, srv]) => ({ key, ...srv }));
+        },
+
+        // Tasks stopped waiting on a human to click Agree on a gated repo page.
+        // Drives the banner at the top of every view, not just the Tasks table:
+        // the whole point of the hold is that somebody notices it, and the
+        // dashboard is where people actually look.
+        get heldTasks() {
+            return this.tasks.filter(t => t.hold_reason === 'needs_approval');
         },
 
         get filteredTasks() {
@@ -183,7 +191,13 @@ function app() {
                 });
                 const data = await res.json();
                 if (data.ok) {
-                    this.showToast('任务已恢复', 'success');
+                    // A released hold is a different event from a plain resume
+                    // and deserves to say so: the operator just asserted the
+                    // gate is open, and if they were wrong the task will come
+                    // straight back here with a new hold reason.
+                    this.showToast(data.released_hold
+                        ? '已放行，任务重新排队（若仍被拒会自动再次挂起）'
+                        : '任务已恢复', 'success');
                     await this.fetchTasks();
                 } else {
                     this.showToast(data.error || '恢复失败', 'error');
@@ -296,7 +310,7 @@ function app() {
                         `Added: ${data.task?.name || 'task'}${paused ? ' (paused)' : ''}`,
                         'success');
                     this.showAddModal = false;
-                    this.addForm = { url: '', category: 'other', priority: 'P1', type: 'dataset', dispatch_mode: '', shard_count: 0, no_dispatch: false, parsed: null, error: '' };
+                    this.addForm = { url: '', category: 'other', priority: 'P2', type: 'dataset', dispatch_mode: '', shard_count: 0, no_dispatch: false, parsed: null, error: '' };
                     await this.fetchTasks();
                 } else {
                     const data = await res.json();
@@ -491,9 +505,45 @@ function app() {
 
         formatSize(t) {
             if (t.status === 'done') return t.downloaded_gb > 0 ? this.formatGB(t.downloaded_gb) : (t.size_gb > 0 ? this.formatGB(t.size_gb) : '-');
-            if (t.size_gb > 0) return `${this.formatGB(t.downloaded_gb || 0)}/${this.formatGB(t.size_gb)}`;
+            const total = this.taskTotalGb(t);
+            if (total > 0) return `${this.formatGB(this.taskDoneGb(t))}/${this.formatGB(total)}`;
             if (t.downloaded_gb > 0) return `${this.formatGB(t.downloaded_gb)}/?`;
             return '-';
+        },
+
+        // ── Progress against the WHOLE dataset, not just this round ──────────
+        //
+        // A resumed task's `size_gb` is only what was left after the BOS resume
+        // filter ran, and the bytes it dropped live in `resume_skipped_gb`. So
+        // `downloaded_gb / size_gb` answers "how far through this round" while
+        // the bar claims to answer "how far through the dataset" — assembly101
+        // showed 38.1% when it was 66.2% done, which reads as a task in trouble
+        // rather than one two thirds finished.
+        //
+        // Both terms get the same addend, so the pct is exact rather than a
+        // reweighting: (done + already-there) / (remaining + already-there).
+        // `|| 0` throughout, because a row written before the column existed
+        // has it NULL, and NaN in a width is a bar that vanishes.
+        taskTotalGb(t) {
+            return (t.size_gb || 0) + (t.resume_skipped_gb || 0);
+        },
+
+        taskDoneGb(t) {
+            return (t.downloaded_gb || 0) + (t.resume_skipped_gb || 0);
+        },
+
+        taskProgressPct(t) {
+            const total = this.taskTotalGb(t);
+            if (!(total > 0)) return 0;
+            return Math.min(100, (this.taskDoneGb(t) / total) * 100);
+        },
+
+        // A resumed task carries a second, quieter fact worth surfacing: how
+        // much of it was already on BOS before this round started. Empty string
+        // when there is nothing to say, so the caller can bind it directly.
+        resumeNote(t) {
+            if (!(t.resume_skipped_gb > 0)) return '';
+            return `含续传已有 ${this.formatGB(t.resume_skipped_gb)}`;
         },
 
         formatAlert(al) {
@@ -787,7 +837,7 @@ function app() {
                         url_or_repo: this.storageAddUrl,
                         category: this.storageAddCategory,
                         type: this.storageAddType,
-                        priority: 'P1',
+                        priority: 'P2',
                     }),
                 });
                 if (res.ok) {
