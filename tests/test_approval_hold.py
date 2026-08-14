@@ -824,3 +824,30 @@ def test_priority_labels_match_what_the_ints_actually_do():
     assert "P2 (Normal)" in html
     assert "priority: 'P1'" not in js, "the form default must sit outside the band"
     assert js.count("priority: 'P2'") == 3
+
+
+def test_the_frontend_mapper_passes_the_hold_through(db):
+    """`_task_for_frontend` is a whitelist, so a field it omits is invisible to
+    the banner no matter what SQLite holds — and it is the only shape
+    GET /api/tasks ever returns."""
+    from dlm.web.routes.tasks import _task_for_frontend
+
+    _task(db, "t-1", status="paused")
+    db.set_hold("t-1", "needs_approval", "点同意")
+    conn = db._conn()
+    conn.execute("UPDATE tasks SET resume_skipped_gb=42.0 WHERE id='t-1'")
+    conn.commit()
+
+    payload = _task_for_frontend(db.get_task("t-1"))
+
+    assert payload["hold_reason"] == "needs_approval"
+    assert payload["hold_detail"] == "点同意"
+    assert payload["resume_skipped_gb"] == 42.0
+
+
+def test_an_ordinary_pause_carries_no_hold(db):
+    """The banner's whole selectivity rests on this being NULL."""
+    from dlm.web.routes.tasks import _task_for_frontend
+
+    _task(db, "t-1", status="paused")
+    assert _task_for_frontend(db.get_task("t-1"))["hold_reason"] is None
