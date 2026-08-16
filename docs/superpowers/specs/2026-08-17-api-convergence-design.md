@@ -2,7 +2,7 @@
 
 **日期**: 2026-08-17
 **分支**: `feat/architecture-upgrade`
-**状态**: 待评审
+**状态**: 已评审(sonnet fact-check),已按结论修订
 **后续项目**: 飞书登录(项目二)——本项目是它的前置条件
 
 ---
@@ -25,8 +25,9 @@ DLM 的 HTTP 面有 **61 条生效路由**,其中 **41 条是写操作**。这�
   > who gets a gated repo chunked into 696 doomed batches.
 
   "both add paths must agree" 是一句祈祷,不是一个机制。
-- **人机不分**。16 台 worker 回调的 12 个写接口,和运维点按钮的 29 个写接口,
-  混在同一批文件里、同一批 `@router.post` 里,没有任何标记区分。
+- **人机不分**。16 台 worker 回调的 14 个写接口,和运维点按钮的 27 个写接口,
+  混在同一批文件里、同一批 `@router.post` 里,没有任何标记区分。其中 3 条**两边
+  都在调**,而这件事今天没有任何地方写下来(见 §3.1.1)。
 - **死接口留着**。`GET /api/queue`、`/api/queue/pending`、`/api/queue/active`、
   `POST /api/queue/reorder`、`POST /api/queue/jump` 零调用者。
 
@@ -47,11 +48,11 @@ DLM 的 HTTP 面有 **61 条生效路由**,其中 **41 条是写操作**。这�
 
 | 边界 | 理由 |
 |---|---|
-| **机器面 12 个写接口 + 3 个读接口的路径、HTTP 方法、请求体、响应体一字不改** | 16 台 worker 跑的是旧代码。改任何一处都要全机群部署,违反 CLAUDE.md 的"No mixed code versions",而且当前有 3 个 pool 任务在下载 |
+| **机器面 18 条(14 写 + 4 读)的路径、HTTP 方法、请求体、响应体一字不改** | 16 台 worker 跑的是旧代码。改任何一处都要全机群部署,违反 CLAUDE.md 的"No mixed code versions",而且当前有 3 个 pool 任务在下载。其中 3 条是双面路由,见 §3.1.1 |
 | `workflows.py` 保持确定性 | 正在运行的 workflow 靠 replay 恢复 |
 | activity 调用传全部声明参数 | 少传一个 → temporalio 丢弃全部类型标注 → dataclass 变 dict → 死在 `.name`。已由 `tests/test_activity_arity.py` 把关 |
 | SQLite 是唯一状态源 | `dlm/queue/snapshot.py` |
-| 696 个既有测试全绿 | 回归底线 |
+| **978 个既有测试全绿** | 回归底线。CLAUDE.md 里写的 "696 tests" 是过期数字 |
 | 不改任何下载/上传/搬运业务逻辑 | 本项目只动 HTTP 层的形状 |
 
 **本项目不需要部署 worker。** 这是一条验收标准,不是巧合:如果某个实现需要动
@@ -64,7 +65,7 @@ worker,那个实现就是错的。
 61 条路由分三类。权威快照:`/tmp/dlm-api-converge/routes-live.txt`
 (生成方式见 §6.1)。
 
-### 3.1 机器面(15 条,冻结)
+### 3.1 机器面(18 条,冻结)
 
 调用方在 `dlm/temporal/activities.py`、`dlm/temporal/__main__.py`、
 `dlm/temporal/event_buffer.py`、`dlm/sidecar/monitor.py`、
@@ -73,27 +74,59 @@ worker,那个实现就是错的。
 写(12):
 
 ```
-POST   /api/task-progress
-POST   /api/worker-heartbeat
-POST   /api/shard-progress
-POST   /api/shards/create
-POST   /api/shards/status
-POST   /api/shards/assign
-POST   /api/shards/resume-info
-POST   /api/shards/aggregate
-POST   /api/pool/batches/create
-POST   /api/pool/batches/release
-POST   /api/missing-files
-POST   /api/events
+POST   /api/task-progress          activities.py:389,498
+POST   /api/worker-heartbeat       temporal/__main__.py:212, sidecar/monitor.py:169
+POST   /api/shard-progress         activities.py:377,791,1360,1459,1565
+POST   /api/shards/create          activities.py:721
+POST   /api/shards/status          activities.py:778,1385,1576,1672
+POST   /api/shards/assign          activities.py:858,1377
+POST   /api/shards/resume-info     activities.py:825
+POST   /api/shards/aggregate       activities.py:846
+POST   /api/pool/batches/create    activities.py:1619
+POST   /api/pool/batches/release   activities.py:1703
+POST   /api/missing-files          activities.py:677
+POST   /api/events                 temporal/event_buffer.py:187,212
 ```
 
 读(3):
 
 ```
-GET    /api/shards/idle-workers
-GET    /api/pool/alive-workers
-GET    /api/pool/window
+GET    /api/shards/idle-workers    activities.py:808
+GET    /api/pool/alive-workers     activities.py:884
+GET    /api/pool/window            activities.py:1684
 ```
+
+### 3.1.1 双面路由(3 条)——本 spec 第一版漏掉的东西
+
+以下 3 条**同时**有 worker 调用和人类调用。第一版把它们划成纯人面,是错的:
+
+```
+POST   /api/tasks/{id}/missing-limit    activities.py:1766   (+ 无人类调用者)
+GET    /api/tasks/{id}/missing-files    activities.py:1786   (+ 运维 curl 查缺件)
+DELETE /api/tasks/{id}/missing-files    activities.py:1875   (+ 运维手工清理)
+```
+
+`activities.py:1783` 的注释亲口说明了双面性:"The endpoint returns everything
+when no limit is given — that is for operators."
+`docs/design/pool-cutover-plan.md:96` 也写着 `GET .../missing-files` 是"人和仪表盘查"。
+
+**所以机器面实际是 18 条(14 写 + 4 读),不是 15 条。**
+
+这 3 条本项目**不改名**(§3.2 里它们是"不变"),所以项目一不会打断机群。但三个后果
+必须写清楚:
+
+1. **P0 的机器面冻结常量必须是 18,不是 15。** 按 15 写,这 3 条就不受任何机械保护,
+   下一个人改名它们时测试全绿。
+2. **§4.1 的"'谁可以调'变成文件的属性"对这 3 条不成立。** 它们留在 `tasks.py`
+   而 worker 在调,是 `internal.py` 这个抽象的真实例外,不是可以忽略的边角。
+3. **这是项目二的一个真问题,不是本项目的。** 项目二若在人面挂一个统一的
+   `Depends(require_user)`,会把 `POST missing-limit` 和 `DELETE missing-files`
+   一起挡掉,**16 台 worker 的缺件复核 activity 会开始 401**。项目二必须对这 3 条
+   做双向鉴权(人类会话 **或** worker 凭证),或者给 worker 另开一组 `/api/internal/...`
+   路径——但后者要改 worker 调用点,需要全机群部署,所以本项目不做。
+
+把这 3 条精确地命名出来,就是本项目能为项目二做的最有价值的事:把一个会在生产
+上炸的惊喜,变成一个写在纸上的、有测试钉住的已知问题。
 
 ### 3.2 人面写操作(现状 → 目标)
 
@@ -111,8 +144,8 @@ GET    /api/pool/window
 | `POST /api/queue/reorder` | — | **删**(零调用者) |
 | `POST /api/queue/jump` | — | **删**(零调用者) |
 | `POST /api/tasks/batch` | `POST /api/tasks/bulk` | 改名 + 别名。"batch" 在本仓库指 pool 批次,这里指"批量操作任务",撞词 |
-| `POST /api/tasks/{id}/missing-limit` | 不变 | |
-| `DELETE /api/tasks/{id}/missing-files` | 不变 | |
+| `POST /api/tasks/{id}/missing-limit` | 不变 | **双面**,见 §3.1.1 |
+| `DELETE /api/tasks/{id}/missing-files` | 不变 | **双面**,见 §3.1.1 |
 | `POST /api/parse` | 不变 | 无副作用的解析 |
 | `POST /api/sync` | 不变 | |
 | `POST /api/storage/register` | 不变 | 第二个创建入口,但语义不同(登记 BOS 已有数据,`status=done`) |
@@ -130,13 +163,18 @@ GET    /api/pool/window
 | `GET /api/queue` | **删**(零调用者) |
 | `GET /api/queue/pending` | **删**(零调用者) |
 | `GET /api/queue/active` | **删**(零调用者) |
-| `GET /api/tasks`、`/api/tasks/{id}`、`/api/tasks/{id}/shards`、`/api/tasks/{id}/missing-files` | 不变 |
+| `GET /api/tasks`、`/api/tasks/{id}`、`/api/tasks/{id}/shards` | 不变 |
+| `GET /api/tasks/{id}/missing-files` | 不变(**双面**,见 §3.1.1) |
 | `GET /api/dashboard`、`/api/doctor`、`/api/doctor/staging-gc`、`/api/servers*`、`/api/storage/*`、`/api/transfer`、`/api/workflows` | 不变 |
 
-**注意路由注册顺序是有载荷的**:`dlm/web/app.py:48-55` 先 include `queue_router`
-再 include `tasks_router`,而 `GET /tasks/{task_id}/shards` 定义在
-`queue.py:619`。也就是说 `/api/tasks/*` 的解析当前横跨两个 router。收敛后
-`/tasks/{id}/shards` 必须搬到 tasks router,让 `/api/tasks/*` 只有一个归属。
+**路由注册顺序**:`dlm/web/app.py:48-49` 先 include `queue_router` 再 include
+`tasks_router`,而 `GET /tasks/{task_id}/shards` 定义在 `queue.py:619`。也就是说
+`/api/tasks/*` 的解析当前横跨两个 router。
+
+这里不存在遮挡风险(`{task_id}` 只匹配单个 `[^/]+` 段,`/tasks/{task_id}` 不可能
+吃掉 `/tasks/{task_id}/shards`)——本 spec 第一版说"顺序是有载荷的"是夸大了。搬它的
+理由是归属清晰:收敛后 `/api/tasks/*` 应该只有一个 router 负责,否则项目二挂门禁时
+要在两个文件里找齐。
 
 ---
 
@@ -166,13 +204,18 @@ DELETE /api/tasks/{id}/missing-files
 
 | 文件 | 职责 |
 |---|---|
-| `dlm/web/routes/internal.py` | **新增**。机器面 15 条,原样搬入。"谁可以调这个接口"变成文件的属性,不再是需要逐条推断的事实 |
-| `dlm/web/routes/tasks.py` | 人面任务操作,全部 |
+| `dlm/web/routes/internal.py` | **新增**。**只有**机器调的 15 条(§3.1 的 12 写 + 3 读),原样搬入。"谁可以调这个接口"变成文件的属性 |
+| `dlm/web/routes/tasks.py` | 人面任务操作,全部;外加 §3.1.1 的 3 条双面路由 |
 | `dlm/web/routes/queue.py` | **保留但只剩别名层**(P3 之后)。见 §4.2 |
 | 其余 router | 不动 |
 
-"谁可以调"从一个需要 grep 全仓库才能回答的问题,变成一个看文件名就能回答的问题。
-这正是项目二挂门禁的地方。
+对 §3.1 的 15 条来说,"谁可以调"从一个需要 grep 全仓库才能回答的问题,变成一个看
+文件名就能回答的问题。
+
+**但这个抽象有 3 个已知例外**——§3.1.1 的双面路由留在 `tasks.py`,因为把它们搬进
+`internal.py` 并不能改变"人类也在调"这个事实,而改路径要动 worker、要全机群部署。
+所以 `internal.py` 的准确含义是"**只有**机器调的接口",不是"机器调的全部接口"。
+项目二不能把"人面 = 除 internal.py 之外的一切"当作门禁规则,必须显式处理这 3 条。
 
 ### 4.2 别名层是必须的,不是保守
 
@@ -189,9 +232,35 @@ CLAUDE.md、`docs/runbooks/`、`skills/dlm/SKILL.md` 里有大量 curl 命令,�
 | `/api/queue/retry` | 2 | 3 | 0 | 0 |
 | `/api/tasks/{id}/skip` | 3 | 1 | 2 | 1 |
 
-别名的形式:**薄委派**——旧路径的 handler 只做一件事,记一条
-`logger.warning("deprecated path %s, use %s")` 然后调用新 handler 的函数体。
-不复制业务逻辑。旧路径的行为因此天然与新路径一致。
+#### 别名的实现方式(不是随便委派)
+
+**朴素做法有个会毁掉项目二的坑:** 如果旧 handler 直接调用新 handler 这个*被装饰的
+函数*,FastAPI 注入的东西全部绕过——`Request`、以及**项目二要加的
+`Depends(require_user)`**。那样别名就成了一条通往同一段业务逻辑的**免鉴权通道**。
+这不是理论风险:项目一的产物如果长这样,项目二挂上门禁那天就有一个现成的后门。
+
+**规定的做法:**
+
+1. 业务逻辑提取成一个**普通 async 函数**(不带任何 `@router` 装饰),放在
+   `tasks.py`,签名用明确的 Python 参数,不接受 FastAPI 注入对象。
+2. 新路径和旧别名**各自都是注册在人面 router 上的真路由**,各自声明自己的参数,
+   两者都调用第 1 步那个普通函数。
+3. 因此两条路由都挂在同一个 router 上,项目二给这个 router 加依赖时,**别名和正路
+   一起被覆盖**,不存在绕过。
+4. 旧别名的 handler 体内多做一件事:`logger.warning("deprecated path %s, use %s")`。
+
+#### 签名与响应形状
+
+- 旧 handler 大多从 `body: dict` 里取 `task_id`(如 `body["task_id"]`),新路径用
+  路径参数 `task_id: str`。别名必须自己做这个适配,这是机械但必须写出来的代码。
+- **别名返回新形状,不保留旧形状。** 明确记下一处已知的字段丢失:
+  `queue.retry_task` 现在返回 `{ok, task_id, status, cleared_shard_rows, note}`,
+  而 `tasks.retry_task` 返回 `{status, message, ...}`。走别名的 `/api/queue/retry`
+  调用者会拿不到 `cleared_shard_rows` 和 `note`。可以接受,因为 `/queue/retry` 的
+  前端调用者是 0;但"薄别名 ⇒ 行为天然一致"这句话对响应体不成立,所以在这里说清。
+- **归属方向要理清:** 今天是 `tasks.py:445` 的 `/tasks/{id}/retry` 委派给
+  `queue.retry_task`。P3 之后必须反过来——逻辑搬到 `tasks.py` 的普通函数里,
+  `queue.py` 只剩别名。**先搬逻辑,再挂别名**,不要留下互相委派。
 
 别名的移除是 **P5,本项目不做**,留给用户在确认没有脚本还在打旧路径之后决定。
 
@@ -237,20 +306,60 @@ CLAUDE.md、`docs/runbooks/`、`skills/dlm/SKILL.md` 里有大量 curl 命令,�
 
 ### 5.3 合并两个 handler 时的行为分歧
 
-以 `/api/tasks` 的行为为准(它是所有人实际在用的那个,因此对用户是 no-op):
+以 `/api/tasks` 的行为为准(它是所有人实际在用的那个,因此对用户是 no-op)——
+**但有一处例外,`/api/tasks` 才是错的那一边,必须修,见 5.3.1。**
 
 | 分歧点 | `/queue/add` | `/api/tasks` | 取 |
 |---|---|---|---|
 | 重复检查是否排除 `done` | 排除(`queue.py:159`) | 不排除(`tasks.py:371`) | `/api/tasks`。重跑一个 done 任务的正路是 `POST /api/tasks/{id}/retry` |
-| `no_dispatch` | 无 | 有 | 有 |
-| `category` 默认值 | `""` | `"other"` | `"other"` |
-| `size_gb` | 0 | 取自请求体 | 取自请求体 |
+| `no_dispatch` | 无 | 有(`:283`/`:413`) | 有 |
+| `category` 默认值 | `""`(`queue.py:104`) | `"other"`(`tasks.py:271`) | `"other"` |
+| `size_gb` | 硬编码 0(`queue.py:146`) | 取自请求体(`tasks.py:415`) | 取自请求体 |
+| `type` 推断 | 尊重推断(`queue.py:103`) | **总是覆盖成 `"dataset"`** | **修 `/api/tasks`**,见 5.3.1 |
+| `priority` 入参 | int 0-9 夹紧(`queue.py:105`) | 字符串 `"P0".."P3"` 过 `PRIORITY_TO_INT`(`tasks.py:378`) | `/api/tasks`。**但这影响文档,见 §5.5** |
+| `max_workers` | 总是写(0 = auto,`queue.py:150`) | 仅当 `shard_count > 0` 才写,否则留 NULL(`tasks.py:425-426`) | `/api/tasks` |
+| 成功响应体 | `{ok, task_id}`(`queue.py:184`) | `{task: ...}`(`tasks.py:437`) | `/api/tasks` |
+
+#### 5.3.1 `/api/tasks` 会把推断出来的 `type` 冲掉(要修)
+
+`AddTaskRequest.type` 的默认值是 `"dataset"`(`tasks.py:271`),而合并逻辑是
+`if req.type: parsed["type"] = req.type`(`tasks.py:330-331`)。`"dataset"` 恒为真,
+所以 **`parse_repo` 推断出来的 type 永远被覆盖**。`/queue/add` 写的是
+`body.get("type", parsed.get("type", "dataset"))`(`queue.py:103`),尊重推断。
+
+为什么这不是小事:`bos_target`(`dlm/core/bos.py:15-30`)用 `type == "model"` 决定
+桶——model 进 `auwomo-model-open` 且前缀是 `{name}/`,否则进 `auwomo-data` 且前缀是
+`{category}/{name}/`。一个被误判成 dataset 的模型会**上传到数据集桶的错误前缀下**。
+
+现在没炸,是因为两个真实调用方都显式传了 `type`:前端 `app.js:285`、
+CLI `dlm/commands/add.py` 的 body。**但 P4 恰好会造出触发它的路径**——CLAUDE.md 的
+curl 例子不带 `type`,把它从 `/queue/add` 改指到 `/api/tasks` 之后,照着例子加一个
+无前缀的 HF 模型 URL(`parser.py` 的 `_parse_hf_url` 推断为 `"model"`),就会静默
+落到数据集桶里。
+
+**处置:把 `AddTaskRequest.type` 的默认值改成 `None`**(含义:没说就用推断)。前端和
+CLI 都显式传值,所以对它们零影响。这必须在 P4 改文档**之前或同时**落地,否则文档
+改完的那一刻就埋下一个误投桶的坑。
+
+删掉 `/queue/add` 会移除当前唯一正确处理 type 推断的路径,所以这个修复不是可选的。
 
 ### 5.4 错误形状统一(小范围)
 
 `/queue/add` 和 `/storage/register` 在出错时返回 `{"error": ...}` 且 HTTP 200;
 `/api/tasks` 抛 `HTTPException(400)`。删掉 `/queue/add` 顺手消掉一半。
 `/storage/register` 改成 400 属于行为变更,**本项目不做**,记为待办。
+
+### 5.5 `priority` 的入参语义变了,文档必须跟着改
+
+CLAUDE.md 里的建任务例子是
+`curl -X POST .../api/queue/add -d '{..., "priority":0, "shard_count":6}'`——
+`priority` 是 int。`/api/tasks` 收的是字符串 `"P0".."P3"`
+(`PRIORITY_TO_INT = {"P0":0,"P1":2,"P2":5,"P3":7}`,`tasks.py:19`)。
+
+所以 P4 改文档时,不能只把路径从 `/api/queue/add` 换成 `/api/tasks`,还必须把
+`"priority":0` 换成 `"priority":"P0"`。一个只换路径的机械替换会产出一条**看起来
+对、实际把优先级设错**的文档命令。P4 的验收要显式检查这一点。
+
 
 ---
 
@@ -265,9 +374,12 @@ CLAUDE.md、`docs/runbooks/`、`skills/dlm/SKILL.md` 里有大量 curl 命令,�
 - 用 `create_app().openapi()['paths']` 枚举(**不用 `app.routes`**,见 §6.1)
 - 一份期望清单常量,包含全部 61 条及其平面归属
 - 断言 1:生效路由集合 == 期望集合(新增/改名/挪动不同步更新即红)
-- 断言 2:机器面 15 条的 `(method, path)` 逐条存在——这是"不用部署 worker"
-  这条验收标准的机械化形式
-- 断言 3:同一 `(method, path)` 不得注册两次
+- 断言 2:机器面 **18** 条的 `(method, path)` 逐条存在——这是"不用部署 worker"
+  这条验收标准的机械化形式。这份清单必须**手写**,不能从期望清单推导,否则把一条
+  机器面路由的 plane 悄悄改成 `human` 再改名就能全绿放行
+- 断言 3:同一 `(method, path)` 不得注册两次。**注意 `openapi()['paths']` 查不出
+  重复**(它是以 path 为键的 dict,第二次注册被静默吞掉),查重必须走
+  `<module>.router.routes`
 
 **这一阶段不改任何 `dlm/` 下的代码。**
 
@@ -281,20 +393,24 @@ CLAUDE.md、`docs/runbooks/`、`skills/dlm/SKILL.md` 里有大量 curl 命令,�
 
 删:`GET /api/queue`、`/api/queue/pending`、`/api/queue/active`、
 `POST /api/queue/reorder`、`POST /api/queue/jump`、`POST /api/queue/add`。
-按 §5.3 确认 `/api/tasks` 保持行为。更新 P0 的期望清单。
+按 §5.3 确认 `/api/tasks` 保持行为,并按 §5.3.1 修掉 `type` 覆盖
+(这是删 `/queue/add` 的附带义务,不是可选项)。更新 P0 的期望清单。
 
 ### P2 — 拆 router
 
-机器面 15 条搬入 `dlm/web/routes/internal.py`,**路径/方法/请求体/响应体
-一字不改**。`app.py` 注册新 router。P0 的断言 2 保证这一步没动到机器面。
+**只有**机器调的 15 条搬入 `dlm/web/routes/internal.py`,**路径/方法/请求体/响应体
+一字不改**。§3.1.1 的 3 条双面路由留在 `tasks.py`。`app.py` 注册新 router。
+P0 的断言 2 保证这一步没动到机器面(18 条全部,包括留在 `tasks.py` 的那 3 条)。
 
 `GET /tasks/{task_id}/shards` 从 `queue.py:619` 搬到 `tasks.py`,消掉
 `/api/tasks/*` 横跨两个 router 的状况。
 
 ### P3 — 改名 + 薄别名
 
-按 §3.2 建立新路径,旧路径降级为记 warning 的薄委派(§4.2)。每条新路径都要有
-测试证明它和旧路径行为一致。
+按 §3.2 建立新路径,旧路径降级为记 warning 的薄委派。**别名的实现必须按 §4.2 的
+规定做**(业务逻辑提取成普通函数,新路径与别名各自是注册在同一个人面 router 上的
+真路由)——直接调用被装饰的 handler 会绕过 FastAPI 注入,那样别名就是项目二的一个
+免鉴权后门。每条新路径都要有测试证明它和旧路径行为一致。
 
 ### P4 — 客户端/文档/skill 切换
 
@@ -320,11 +436,35 @@ CLAUDE.md、`docs/runbooks/`、`skills/dlm/SKILL.md` 里有大量 curl 命令,�
 5. **人面路径统一到 `/api/tasks` 资源族**,旧路径以薄委派 + warning 存在。
 6. **前端与 CLI 全部走新路径**,仓库内 grep 不到它们引用旧路径。
 7. **CLAUDE.md、`docs/runbooks/`、`skills/dlm/SKILL.md` 的 curl 已更新。**
-8. **696 个既有测试全绿**,新增覆盖:清单测试、路径引用测试、每条改名路径的
+8. **978 个既有测试全绿**,新增覆盖:清单测试、路径引用测试、每条改名路径的
    行为一致性测试。
-9. **人面写操作可以用一个 `Depends` 覆盖**——即项目二不需要再逐条挂装饰器。
-   这一条由 §4.1 的文件划分满足,评审时按"人面写路由是否全部在 tasks router
-   或明确列出的其他人面 router 上"来验。
+9. **人面写操作的门禁点数量收敛到"每个人面 router 一个 `Depends`"**,项目二不需要
+   逐条路由挂装饰器。
+
+   这一条第一版写的是"一个 `Depends`",**那是夸大的**。人面写操作分布在 7 个 router
+   里:`tasks.py`(任务操作 + `/parse`)、`queue.py`(`POST /sync`)、`servers.py`(ping /
+   cleanup)、`storage.py`(register / juicefs move)、`doctor.py`(`POST /doctor`)、
+   `transfer.py`(4 条)、`workflows.py`(cancel-all / delete)。§4.1 只把机器面搬进
+   `internal.py` 并把任务操作归拢到 `tasks.py`,storage / doctor / servers / transfer /
+   workflows 明确"不动",所以一个 `Depends` 覆盖不到它们。
+
+   **本条的准确含义(两种实现都算通过,项目二选一即可):**
+   - **每个人面 router 挂一个 router 级 `Depends`(约 6 个挂点)**,或者
+   - **一个 app 级全局依赖 + 一份显式的机器面豁免清单**(清单即 §3.1 的 18 条)。
+
+   验收时按这个来验:**每一条人面写路由,都必须能被"它所在的 router"或"全局依赖 +
+   豁免清单"这两种机制之一无遗漏地覆盖**;不存在任何一条写路由需要单独挂装饰器
+   才能被门禁到。P0 的清单测试提供枚举依据。
+
+   **已知例外必须显式处理:** §3.1.1 的 3 条双面路由(`POST /api/tasks/{id}/missing-limit`、
+   `GET`/`DELETE /api/tasks/{id}/missing-files`)住在人面文件里但 worker 在调,套上
+   纯人类门禁会让 16 台 worker 401。本项目只负责把它们命名出来并用测试钉住;
+   怎么鉴权是项目二的事。
+
+10. **`AddTaskRequest.type` 不再覆盖 `parse_repo` 的推断**(§5.3.1),且有测试证明
+    一个不带 `type` 的模型 URL 会被存成 `type="model"`。这一条是删掉 `/queue/add` 的
+    附带义务:那是当前唯一正确处理推断的路径。
+
 
 ---
 
@@ -332,11 +472,20 @@ CLAUDE.md、`docs/runbooks/`、`skills/dlm/SKILL.md` 里有大量 curl 命令,�
 
 - 任何登录/鉴权代码(项目二)
 - `owner_open_id` / `owner_name` 列(项目二)
+- **§3.1.1 那 3 条双面路由的鉴权方案**(项目二)。本项目只负责把它们命名出来、
+  用测试钉住、写清楚后果
 - 搬运子系统的接口(`/api/transfer/*`)
 - `/storage/register` 的错误形状改造(记为待办)
 - 移除别名(P5)
 - `~/.dlm/servers.yaml` 只有 12 条、缺 bj5-bj9 的漂移(独立 bug,单独开)
 - 任何下载/上传/搬运业务逻辑
+
+**注意这几条虽然是"清理",但在范围内**,因为它们是本项目动作的直接后果,
+不做就会留下一个比现在更糟的状态:
+
+- `AddTaskRequest.type` 的覆盖 bug(§5.3.1)——删 `/queue/add` 会移除唯一正确的路径
+- CLAUDE.md 建任务 curl 的 `priority` 从 int 改成 `"P0"`(§5.5)——只换路径会产出
+  一条静默设错优先级的文档命令
 
 ---
 
