@@ -13,6 +13,7 @@ Run: python3 -m pytest tests/test_missing_files.py -q
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 
 import pytest
 from fastapi import HTTPException
@@ -935,7 +936,16 @@ def test_a_negative_scan_cap_is_refused_at_import(monkeypatch):
 
 
 def _finished(db, task_id="t-mf", status="done", count=0, limit=0,
-             completed_at="2026-08-08T00:00:00+00:00"):
+             completed_at=None):
+    # `completed_at=None` means "just now", computed at call time. It used to be
+    # the literal 2026-08-08, which made every caller that wants a FRESH finish
+    # a time bomb: MISSING_ALERT_WINDOW_S is 7 days, so on 2026-08-15 the seven
+    # tests relying on this default started failing with no code change. The
+    # tests that want a STALE finish pass an explicit old stamp — keep it that
+    # way; a fixed date can only ever be right for a week.
+    if completed_at is None:
+        completed_at = (_dt.datetime.now(_dt.timezone.utc)
+                        .isoformat(timespec="seconds"))
     _task(db, task_id, status=status)
     conn = db._conn()
     conn.execute(
