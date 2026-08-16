@@ -8,3 +8,6 @@ build/
 docs/*-feishu.md
 CLAUDE.md
 venv/
+
+# superpowers SDD scratch (progress ledger, briefs, review packages)
+.superpowers/
