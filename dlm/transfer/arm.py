@@ -109,12 +109,12 @@ def band_ratio(bos_bytes: int, dispatched_bytes: int):
         f"{dispatched_bytes} dispatched; refusing to transfer")
 
 
-def _shard_verdict(task_id: str):
+def _shard_verdict(shards):
     """`(ok, detail)` for gate 4. Pool batches and sharded shards share the
     `shards` table, so this needs no per-mode branch — and `release_pool_batches`
     returning non-done rows to `pending` is what makes a cancelled pool task
-    fail this gate on its own."""
-    shards = snapshot.get_shards_by_task(task_id)
+    fail this gate on its own. Takes the already-fetched rows, so the caller
+    queries the table once instead of once per helper."""
     if not shards:
         return False, "0 shard rows — nothing proves what was downloaded"
     not_done = [s for s in shards if s.get("status") != "done"]
@@ -124,9 +124,32 @@ def _shard_verdict(task_id: str):
     return True, f"{len(shards)} shard rows all done"
 
 
-def dispatched_bytes(task_id: str) -> int:
-    return sum(int(s.get("total_bytes") or 0)
-               for s in snapshot.get_shards_by_task(task_id))
+def dispatched_bytes(shards) -> int:
+    return sum(int(s.get("total_bytes") or 0) for s in shards)
+
+
+def _predates_shard_bookkeeping(task, shards) -> bool:
+    """True when a gate-4 failure is the era's fault, not the task's.
+
+    `dispatch_prefix` is the era marker: it is written once at dispatch time by
+    `dlm/web/temporal_client._record_dispatch_prefix` and nowhere else, so every
+    modern task carries it and every pre-shard-bookkeeping task does not.
+    Measured against the production database on 2026-08-19, the `done` rows
+    split:
+
+        dispatch_prefix | shard rows | count
+        NULL/empty      | 0          | 66
+        NULL/empty      | some       | 11
+        written         | some       | 25
+
+    There is no `done` row with a written prefix and zero shard rows — which is
+    what makes this two-era test safe. "0 shard rows" can only mean "this row
+    was never dispatched under the bookkeeping" when the prefix is empty too; a
+    written prefix with 0 shard rows is a modern task whose bookkeeping was
+    deleted, and that must keep failing the gate. So this requires BOTH an empty
+    prefix AND zero shard rows before declaring the era to blame.
+    """
+    return not shards and not task.get("dispatch_prefix")
 
 
 def _write(task_id: str, status: str, error, prefix=None, nbytes=0):
@@ -137,6 +160,24 @@ def _write(task_id: str, status: str, error, prefix=None, nbytes=0):
         "transfer_prefix = COALESCE(?, transfer_prefix), transfer_bytes = ?, "
         "transfer_armed_at = ?, updated_at = ? WHERE id = ?",
         (status, error, prefix, nbytes, now, now, task_id),
+    )
+    conn.commit()
+
+
+def _clear_blocked(task_id: str):
+    """Undo a `blocked` verdict that the era produced, not the task.
+
+    Only reachable for rows `_predates_shard_bookkeeping` has already judged to
+    predate shard accounting — the same gate that wrote `blocked` is the gate
+    clearing it, so the write is idempotent: a second call writes NULL over
+    NULL. Touches only the two transfer columns; `transfer_armed_at` is left
+    alone because the row was never genuinely armed.
+    """
+    conn = snapshot._conn()
+    conn.execute(
+        "UPDATE tasks SET transfer_status = NULL, transfer_error = NULL, "
+        "updated_at = ? WHERE id = ?",
+        (time.time(), task_id),
     )
     conn.commit()
 
@@ -194,13 +235,37 @@ def maybe_arm_transfer(task_id: str, manual: bool = False) -> dict:
         _write(task_id, "blocked", reason)
         return {"armed": False, "status": "blocked", "reason": reason}
 
-    # Gate 4 — the shard rows account for the whole task.
-    ok, detail = _shard_verdict(task_id)
+    # Gate 4 — the shard rows account for the whole task. Fetched once and
+    # handed to both the verdict and the byte count, so this gate does not
+    # re-query the same rows a second time (it used to: `_shard_verdict` and
+    # `dispatched_bytes` each read them).
+    shards = snapshot.get_shards_by_task(task_id)
+    ok, detail = _shard_verdict(shards)
     if not ok:
+        if _predates_shard_bookkeeping(task, shards):
+            # The same reasoning gate 3 already applies to a NULL
+            # dispatch_prefix: "rejecting on absence would block every
+            # pre-existing task for a fact we never recorded". A `done` that
+            # finished before shard rows existed is unprovable, not failed — so
+            # the automatic channel refuses to arm it WITHOUT writing
+            # `blocked`, which would be a permanent CRITICAL no documented
+            # action can clear. If an older sweep already wrote `blocked` on
+            # such a row, clear it back to un-armed so the existing
+            # `POST /api/transfer/{id}/retry` can retire the alert.
+            if task.get("transfer_status") == "blocked":
+                _clear_blocked(task_id)
+            reason = (
+                "0 shard rows and no dispatch_prefix — this task predates "
+                "shard bookkeeping, so the automatic channel cannot prove "
+                "what was downloaded. Reconcile with "
+                "scripts/reconcile_transfers.py against BOS, then post "
+                "through the scripts/transfer_import.py manual lane."
+            )
+            return {"armed": False, "status": None, "reason": reason}
         _write(task_id, "blocked", detail)
         return {"armed": False, "status": "blocked", "reason": detail}
 
-    nbytes = dispatched_bytes(task_id)
+    nbytes = dispatched_bytes(shards)
     _write(task_id, "ready", None, prefix=plan.source, nbytes=nbytes)
     logger.info(f"transfer armed: {task_id} ({task.get('name')}) "
                 f"{plan.source} -> {plan.target}, {detail}, {nbytes} bytes")

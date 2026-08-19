@@ -691,7 +691,10 @@ def test_one_bad_row_does_not_stop_the_others(db, monkeypatch):
 
 # --- the four alerts ---------------------------------------------------------
 
-def test_blocked_raises_a_critical_alert_naming_the_retry_route(db):
+def test_zero_shard_rows_block_names_redispatch_not_transfer_retry(db):
+    """The one blocked cause a transfer retry can never clear. The alert must
+    not promise it — instead it names the re-dispatch (which runs a new round
+    and rewrites shard bookkeeping) and the read-only reconcile + manual lane."""
     from dlm.web.alerts import CRITICAL, check_alerts
     _task(db, "t-1")
     _transfer(db, "t-1", transfer_status="blocked",
@@ -699,9 +702,27 @@ def test_blocked_raises_a_critical_alert_naming_the_retry_route(db):
 
     alerts = {a["type"]: a for a in check_alerts(db.get_all_tasks(), [])}
 
+    message = alerts["transfer_blocked"]["message"]
     assert alerts["transfer_blocked"]["severity"] == CRITICAL
-    assert "0 shard rows" in alerts["transfer_blocked"]["message"]
-    assert "/api/transfer/t-1/retry" in alerts["transfer_blocked"]["message"]
+    assert "0 shard rows" in message
+    assert "/api/transfer/t-1/retry" not in message
+    assert "/api/queue/retry" in message
+    assert "reconcile_transfers.py" in message
+
+
+def test_other_blocked_causes_still_name_the_transfer_retry(db):
+    """prefix drift and the other blocked causes ARE fixable by re-arming, so
+    the original retry remedy stays for every cause except 0 shard rows."""
+    from dlm.web.alerts import CRITICAL, check_alerts
+    _task(db, "t-1")
+    _transfer(db, "t-1", transfer_status="blocked",
+              transfer_error="prefix drift: dispatched to 'x' but resolves to 'y'")
+
+    alerts = {a["type"]: a for a in check_alerts(db.get_all_tasks(), [])}
+
+    message = alerts["transfer_blocked"]["message"]
+    assert alerts["transfer_blocked"]["severity"] == CRITICAL
+    assert "/api/transfer/t-1/retry" in message
 
 
 @pytest.mark.parametrize("status", ["short", "failed"])

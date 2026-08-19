@@ -231,12 +231,54 @@ def test_the_same_key_shape_under_a_different_bucket_is_drift(db):
 # ── gate 4: the shard rows account for the task ───────────────────────────
 
 
-def test_zero_shard_rows_is_blocked(db):
-    """`PhysicalAI-Robotics-Locomanipulation`'s shape: done, 0 shard rows,
-    208.4/232.6 GB. Nothing proves what was downloaded, so nothing may move."""
+def test_a_legacy_done_row_skips_instead_of_blocking(db):
+    """A `done` from before shard rows existed (0 rows, no dispatch_prefix) is
+    unprovable, not failed. Writing `blocked` here would invent a CRITICAL no
+    documented action can clear — the retry re-runs this same gate — so the
+    automatic channel refuses to arm WITHOUT writing anything."""
     _task(db)
+    assert db.get_task("t-1")["dispatch_prefix"] is None
+    result = maybe_arm_transfer("t-1")
+    assert result["armed"] is False
+    assert result["status"] is None
+    assert "predates shard bookkeeping" in result["reason"]
+    assert "reconcile_transfers.py" in result["reason"]
+    row = db.get_task("t-1")
+    assert row["transfer_status"] is None
+    assert row["transfer_error"] is None
+
+
+def test_a_legacy_blocked_row_is_cleared_back_to_unarmed(db):
+    """The rows a batch trigger wrote `blocked` on 2026-08-19 can be retired
+    with the already-documented `POST /api/transfer/{id}/retry`: the manual
+    path re-runs gate 4, sees the era, and clears the false verdict. The clear
+    is idempotent — a second call writes NULL over NULL."""
+    _task(db)
+    arm_mod._write("t-1", "blocked",
+                   "0 shard rows — nothing proves what was downloaded")
+    assert db.get_task("t-1")["transfer_status"] == "blocked"
+
+    result = maybe_arm_transfer("t-1", manual=True)
+    assert result["armed"] is False
+    assert result["status"] is None
+    assert db.get_task("t-1")["transfer_status"] is None
+    assert db.get_task("t-1")["transfer_error"] is None
+
+    again = maybe_arm_transfer("t-1", manual=True)
+    assert again["armed"] is False
+    assert db.get_task("t-1")["transfer_status"] is None
+    assert db.get_task("t-1")["transfer_error"] is None
+
+
+def test_a_modern_zero_shard_row_with_a_prefix_is_still_blocked(db):
+    """The regression guard: `dispatch_prefix` is written at dispatch, so a
+    modern task always has it. 0 shard rows WITH a prefix means the bookkeeping
+    was deleted — that must keep failing the gate, not slip into the legacy
+    skip, or a false `done` would become transferrable."""
+    _task(db, dispatch_prefix=f"{DATA_BUCKET}/other/molmobot-data/")
     result = maybe_arm_transfer("t-1")
     assert result["status"] == "blocked"
+    assert db.get_task("t-1")["transfer_status"] == "blocked"
     assert "0 shard rows" in db.get_task("t-1")["transfer_error"]
 
 
@@ -422,13 +464,17 @@ def test_retry_re_arms_one_blocked_row(armable):
     assert armable.get_task("t-1")["transfer_status"] == "ready"
 
 
-def test_retry_on_an_ungateable_task_returns_the_reason(db):
+def test_retry_on_a_legacy_row_skips_and_reports_why(db):
+    """A legacy `done` has no shard bookkeeping, so a manual retry cannot re-arm
+    it — but it also must not write `blocked` again. The route reports the era
+    as the reason and leaves the row un-armed."""
     from dlm.web.routes import transfer as transfer_routes
 
     _task(db)
     result = asyncio.run(transfer_routes.retry_transfer("t-1"))
     assert "0 shard rows" in result["error"]
-    assert result["transfer_status"] == "blocked"
+    assert result["transfer_status"] is None
+    assert db.get_task("t-1")["transfer_status"] is None
 
 
 def test_retry_on_an_unknown_task(db):

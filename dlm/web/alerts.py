@@ -405,11 +405,16 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
     #   stalled — armed but never posted (below). The one failure the far side
     #     cannot see, since from their side nothing ever arrived.
     #
-    # No shelf life on any: the reason is on the row, and they clear the
-    # moment a human retries (`POST /api/transfer/{id}/retry`) or the row is
-    # revoked. `transfer_error` already carries the specific cause, including
-    # prefix drift, so a separate alert type per cause would only re-key the
-    # same string.
+    # No shelf life on any: the reason is on the row, and most clear the moment
+    # a human retries (`POST /api/transfer/{id}/retry`) or the row is revoked.
+    # The one exception is a blocked row whose cause is "0 shard rows": a
+    # transfer retry can NEVER clear it, because re-arming re-runs the same
+    # gate and nothing in that path restores the missing bookkeeping. Its
+    # remedy is a re-dispatch or a read-only reconcile, which is why the
+    # blocked message below branches on the cause instead of promising a retry
+    # that cannot work. `transfer_error` already carries the specific cause,
+    # including prefix drift, so a separate alert type per cause would only
+    # re-key the same string.
     for t in tasks:
         tstatus = t.get("transfer_status")
         if tstatus not in ("blocked", "short", "failed"):
@@ -418,16 +423,28 @@ def check_alerts(tasks: list, workers: list) -> list[dict]:
         name = t.get("name") or task_id
         reason = t.get("transfer_error") or "(no reason recorded)"
         if tstatus == "blocked":
+            if reason.startswith("0 shard rows"):
+                message = (
+                    f"Transfer of {name} is BLOCKED and will not start on its "
+                    f"own: {reason}. A transfer retry cannot clear this — the "
+                    f"shard bookkeeping is gone, so re-dispatch the task "
+                    f"(POST /api/queue/retry) to run a new round that rewrites "
+                    f"it, or reconcile BOS against the source read-only with "
+                    f"scripts/reconcile_transfers.py and post through the "
+                    f"manual lane."
+                )
+            else:
+                message = (
+                    f"Transfer of {name} is BLOCKED and will not start on its "
+                    f"own: {reason}. Fix the cause, then POST "
+                    f"/api/transfer/{task_id}/retry."
+                )
             new_alerts[f"transfer_blocked:{task_id}"] = {
                 "severity": CRITICAL,
                 "type": "transfer_blocked",
                 "task_id": task_id,
                 "task_name": t.get("name", ""),
-                "message": (
-                    f"Transfer of {name} is BLOCKED and will not start on its "
-                    f"own: {reason}. Fix the cause, then POST "
-                    f"/api/transfer/{task_id}/retry."
-                ),
+                "message": message,
             }
         else:
             new_alerts[f"transfer_{tstatus}:{task_id}"] = {
