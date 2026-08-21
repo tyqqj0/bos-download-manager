@@ -95,11 +95,35 @@ def plan_from_mapping(entry) -> TransferPlan:
     An explicit `src` in the entry OVERRIDES the derived BOS prefix. That is not
     a safety valve, it is the normal case for first-generation datasets: BOS
     holds DL3DV-ALL-4K under `datasets/DL3DV-ALL-4K/` while its category is
-    `multimodal`, so source and derived prefix legitimately differ. The
-    destination is always derived — only the source can be overridden.
+    `multimodal`, so source and derived prefix legitimately differ.
+
+    `bucket` and `root` override the two ends that `plan_transfer` can only
+    derive as one of two fixed pairs. They exist because a third bucket turned
+    up: `auwomo-data-processed` (measured 2026-08-21 — top-level prefixes
+    `world-model/`, `foundry/`, `meta-filter/`) belongs under
+    `/auwomo-datasets/processed-data/`, and neither end of that is expressible
+    as `type=dataset` or `type=model`. `root` is shaped with `category` exactly
+    the way `plan_transfer` shapes the built-in roots, so a category still
+    becomes a directory level rather than silently vanishing.
+
+    All three overrides are reachable ONLY from a manifest. `sqlite3.Row` has no
+    `.get`, so the `hasattr` guard leaves every automatic caller (`arm.py`,
+    `dispatch.py` — both pass Rows) structurally unable to reach them, and there
+    are no such columns to read anyway. That is the same distinction `src`
+    already relied on, and it is what stops a hand-written one-off entry from
+    being able to redirect the automatic dispatcher.
     """
     plan = plan_transfer(_AttrView(entry))
-    src = entry.get("src") if hasattr(entry, "get") else None
+    if not hasattr(entry, "get"):
+        return plan
+    src = entry.get("src")
     if src and src != plan.prefix:
         plan = replace(plan, prefix=src)
+    bucket = entry.get("bucket")
+    if bucket:
+        plan = replace(plan, bucket=bucket)
+    root = entry.get("root")
+    if root:
+        category = entry.get("category") or ""
+        plan = replace(plan, parent=f"{root}/{category}" if category else root)
     return plan

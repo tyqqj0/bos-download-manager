@@ -98,6 +98,70 @@ def test_mapping_without_type_is_a_dataset():
     assert plan_from_mapping({"name": "n", "category": "other"}).bucket == DATA_BUCKET
 
 
+def test_bucket_and_root_overrides_address_a_third_bucket():
+    # auwomo-data-processed is neither of the two buckets bos_target knows, and
+    # /auwomo-datasets/processed-data is neither of the two roots. Measured
+    # 2026-08-21: that bucket's top level is world-model/ foundry/ meta-filter/,
+    # and processed-data existed but was empty, so the category segment is what
+    # keeps the three apart once the other two arrive.
+    p = plan_from_mapping({
+        "name": "world_model_3_10_20260813_080327",
+        "category": "world-model",
+        "src": "world-model/world_model_3_10_20260813_080327/",
+        "bucket": "auwomo-data-processed",
+        "root": "/727a2f92-30c/auwomo-datasets/processed-data",
+    })
+    assert p.bucket == "auwomo-data-processed"
+    assert p.prefix == "world-model/world_model_3_10_20260813_080327/"
+    assert p.source == ("auwomo-data-processed/"
+                        "world-model/world_model_3_10_20260813_080327/")
+    assert p.target == ("/727a2f92-30c/auwomo-datasets/processed-data/"
+                        "world-model/world_model_3_10_20260813_080327")
+
+
+def test_root_override_without_category_emits_no_empty_segment():
+    p = plan_from_mapping({
+        "name": "Flat",
+        "root": "/727a2f92-30c/auwomo-datasets/processed-data",
+    })
+    assert p.target == "/727a2f92-30c/auwomo-datasets/processed-data/Flat"
+
+
+def test_overrides_are_independent_of_each_other():
+    # bucket alone must not disturb the derived destination, and root alone must
+    # not disturb the derived bucket — otherwise a one-off entry that only needs
+    # one end would silently move the other.
+    only_bucket = plan_from_mapping({
+        "name": "n", "category": "other", "bucket": "auwomo-data-processed"})
+    assert only_bucket.bucket == "auwomo-data-processed"
+    assert only_bucket.target == f"{DATASET_ROOT}/other/n"
+
+    only_root = plan_from_mapping({
+        "name": "n", "category": "other", "root": "/some/root"})
+    assert only_root.bucket == DATA_BUCKET
+    assert only_root.target == "/some/root/other/n"
+
+
+def test_a_row_without_get_cannot_reach_the_overrides():
+    # The automatic dispatcher passes sqlite3.Row, which has no .get — that is
+    # the whole reason a manifest-only override cannot redirect it. Pinned here
+    # because the guard is the safety property, not an implementation detail.
+    import sqlite3
+
+    assert not hasattr(sqlite3.Row, "get")
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT 'n' AS name, 'other' AS category, 'dataset' AS type"
+    ).fetchone()
+    conn.close()
+
+    p = plan_from_mapping(row)
+    assert p.bucket == DATA_BUCKET
+    assert p.target == f"{DATASET_ROOT}/other/n"
+
+
 def test_mapping_accepts_a_sqlite_row_shape():
     class Row(dict):
         """sqlite3.Row-like: no .get is the point of _AttrView, but a real Row

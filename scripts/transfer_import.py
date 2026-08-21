@@ -28,6 +28,11 @@ Safety contract (the whole point of this script):
     `dlm.transfer.targets`, the same module the automatic dispatcher uses. A
     manifest item with `"type": "model"` therefore reads `auwomo-model-open`
     and lands under `/auwomo-model/{category}/{name}`.
+  - A manifest item may also carry `"bucket"` and `"root"` to address a bucket
+    or destination root that is neither of the two built-in pairs (see
+    `docs/runbooks/transfer-processed-bucket.md`). Those two keys are readable
+    only from a manifest — a `sqlite3.Row` has no `.get`, so the automatic
+    dispatcher cannot be redirected by them.
   - Source prefixes MUST end with "/" — review evidence: all 672 prior
     imports in the D-Robotics async history use trailing-slash sources, and
     a slash-less prefix would also match sibling prefixes (manipulation/
